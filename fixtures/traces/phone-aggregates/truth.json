@@ -1,0 +1,14 @@
+{
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2026-01-01T00:10:00Z"
+  },
+  "intervals": [],
+  "coverage": [],
+  "aggregates": [
+    {
+      "label": "Synthetic Phone \u2014 Reader",
+      "seconds_estimated": 900
+    }
+  ]
+}

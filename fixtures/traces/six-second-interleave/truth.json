@@ -1,0 +1,28 @@
+{
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2026-01-01T00:10:00Z"
+  },
+  "intervals": [
+    {
+      "kind": "focus",
+      "label": "Editor",
+      "start": "2026-01-01T00:00:00Z",
+      "end": "2026-01-01T00:01:00Z"
+    },
+    {
+      "kind": "focus",
+      "label": "Browser",
+      "start": "2026-01-01T00:01:00Z",
+      "end": "2026-01-01T00:01:06Z"
+    },
+    {
+      "kind": "focus",
+      "label": "Editor",
+      "start": "2026-01-01T00:01:06Z",
+      "end": "2026-01-01T00:02:00Z"
+    }
+  ],
+  "coverage": [],
+  "aggregates": []
+}

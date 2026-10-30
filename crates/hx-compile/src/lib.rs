@@ -100,19 +100,26 @@ pub const COMPILER_VERSION: &str = concat!("hx-compile/", env!("CARGO_PKG_VERSIO
 
 /// Compile observations into a timeline for `window`.
 pub fn compile(observations: &[Observation], window: Interval) -> Timeline {
-    let _ = observations;
-    Timeline {
-        window,
-        compiler_version: COMPILER_VERSION.into(),
-        lanes: vec![],
-        points: vec![],
-        coverage: vec![],
-        aggregates: vec![],
-    }
+    compiler::compile(observations, window)
 }
 
 /// Union of observed foreground exposure per lane, for durations in the API.
 pub fn exposure_by_label(timeline: &Timeline, lane_kind: &str) -> Vec<(String, chrono::Duration)> {
-    let _ = (timeline, lane_kind);
-    vec![]
+    use std::collections::BTreeMap;
+    let mut labels: BTreeMap<String, Vec<Interval>> = BTreeMap::new();
+    for lane in &timeline.lanes {
+        if lane.id.kind == lane_kind {
+            for span in &lane.intervals {
+                if let Some(interval) = span.interval.intersect(&timeline.window) {
+                    labels.entry(span.label.clone()).or_default().push(interval);
+                }
+            }
+        }
+    }
+    labels
+        .into_iter()
+        .map(|(label, spans)| (label, hx_schema::union_len(&spans)))
+        .collect()
 }
+
+mod compiler;
