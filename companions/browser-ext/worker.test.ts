@@ -9,10 +9,11 @@ test("worker correlates focus, SPA navigation and visibility; exclusions never r
   let tab:any={id:1,windowId:2,url:"https://example.test/one",title:"Synthetic",active:true,incognito:false};
   let focused=true;
   let idle="active";
+  let nativeAck=false;
   const onMessage=hook(),onFocusChanged=hook(),onHistoryStateUpdated=hook(),onActivated=hook(),onUpdated=hook(),onStateChanged=hook(),onRemoved=hook();
   const chromeMock:any={
     storage:{local:{get:async()=>structuredClone(state),set:async(v:any)=>{writes.push(structuredClone(v)); state={...state,...structuredClone(v)};}},onChanged:hook()},
-    runtime:{onMessage,sendNativeMessage:async()=>{throw new Error("test host unavailable");}},
+    runtime:{onMessage,sendNativeMessage:async()=>({ok:nativeAck})},
     tabs:{get:async()=>({...tab}),query:async()=>[{...tab}],sendMessage:async()=>{},onActivated,onUpdated,onRemoved},
     windows:{getLastFocused:async()=>({id:2,focused}),onFocusChanged},
     idle:{queryState:async()=>idle,onStateChanged},
@@ -62,4 +63,8 @@ test("worker correlates focus, SPA navigation and visibility; exclusions never r
   expect(JSON.stringify(writes)).not.toContain("private-fixture");
   expect(JSON.stringify(writes)).not.toContain("Excluded synthetic title");
   expect(JSON.stringify(writes)).not.toContain("Never stored while locked");
+  expect(state.outbox.length).toBeGreaterThan(0);
+  nativeAck=true; chromeMock.alarms.onAlarm.fire({name:"retry"});
+  await until(()=>state.outbox.length===0);
+
 });
