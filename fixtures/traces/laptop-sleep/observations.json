@@ -1,0 +1,75 @@
+[
+  {
+    "id": 1,
+    "received_at": "2026-01-01T00:00:05Z",
+    "envelope": {
+      "envelope_version": 1,
+      "observation_id": "00000000000000000000000001",
+      "connector_instance": "synthetic:desktop",
+      "source_key": "1",
+      "revision": "0",
+      "operation": "observe",
+      "kind": "focus.span",
+      "schema_version": 1,
+      "time": {
+        "source_start": "2026-01-01T00:00:00Z",
+        "observed_at": "2026-01-01T00:00:00Z",
+        "resolution_ms": 1000
+      },
+      "device": "synthetic-desktop",
+      "payload": {
+        "app_bundle_id": "test.editor",
+        "app_name": "Editor"
+      }
+    }
+  },
+  {
+    "id": 2,
+    "received_at": "2026-01-01T00:00:35Z",
+    "envelope": {
+      "envelope_version": 1,
+      "observation_id": "00000000000000000000000002",
+      "connector_instance": "synthetic:desktop",
+      "source_key": "2",
+      "revision": "0",
+      "operation": "observe",
+      "kind": "presence.span",
+      "schema_version": 1,
+      "time": {
+        "source_start": "2026-01-01T00:00:30Z",
+        "observed_at": "2026-01-01T00:00:30Z",
+        "resolution_ms": 1000,
+        "source_end": "2026-01-01T00:05:00Z"
+      },
+      "device": "synthetic-desktop",
+      "payload": {
+        "state": "device_asleep"
+      }
+    }
+  },
+  {
+    "id": 3,
+    "received_at": "2026-01-01T00:05:05Z",
+    "envelope": {
+      "envelope_version": 1,
+      "observation_id": "00000000000000000000000003",
+      "connector_instance": "synthetic:desktop",
+      "source_key": "3",
+      "revision": "0",
+      "operation": "observe",
+      "kind": "focus.span",
+      "schema_version": 1,
+      "time": {
+        "source_start": "2026-01-01T00:05:00Z",
+        "observed_at": "2026-01-01T00:05:00Z",
+        "resolution_ms": 1000,
+        "source_end": "2026-01-01T00:06:00Z"
+      },
+      "device": "synthetic-desktop",
+      "payload": {
+        "app_bundle_id": "test.editor",
+        "app_name": "Editor"
+      }
+    }
+  }
+]
