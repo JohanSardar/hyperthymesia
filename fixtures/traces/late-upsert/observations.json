@@ -1,0 +1,54 @@
+[
+  {
+    "id": 2,
+    "received_at": "2026-01-01T00:00:05Z",
+    "envelope": {
+      "envelope_version": 1,
+      "observation_id": "00000000000000000000000002",
+      "connector_instance": "synthetic:desktop",
+      "source_key": "mutable",
+      "revision": "new",
+      "operation": "upsert",
+      "kind": "focus.span",
+      "schema_version": 1,
+      "time": {
+        "source_start": "2026-01-01T00:00:00Z",
+        "observed_at": "2026-01-01T00:02:00Z",
+        "resolution_ms": 1000,
+        "source_end": "2026-01-01T00:01:30Z"
+      },
+      "device": "synthetic-desktop",
+      "payload": {
+        "app_bundle_id": "test.editor",
+        "app_name": "Editor"
+      },
+      "sequence": 2
+    }
+  },
+  {
+    "id": 1,
+    "received_at": "2026-01-01T00:00:05Z",
+    "envelope": {
+      "envelope_version": 1,
+      "observation_id": "00000000000000000000000001",
+      "connector_instance": "synthetic:desktop",
+      "source_key": "mutable",
+      "revision": "old",
+      "operation": "upsert",
+      "kind": "focus.span",
+      "schema_version": 1,
+      "time": {
+        "source_start": "2026-01-01T00:00:00Z",
+        "observed_at": "2026-01-01T00:00:00Z",
+        "resolution_ms": 1000,
+        "source_end": "2026-01-01T00:01:00Z"
+      },
+      "device": "synthetic-desktop",
+      "payload": {
+        "app_bundle_id": "test.editor",
+        "app_name": "Editor"
+      },
+      "sequence": 1
+    }
+  }
+]

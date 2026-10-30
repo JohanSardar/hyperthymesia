@@ -1,0 +1,65 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  HX_TEST_DATABASE_URL: postgres://hx:hx@localhost:55432/hx
+
+jobs:
+  rust-linux:
+    name: Rust (Linux, server side)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: hx
+          POSTGRES_PASSWORD: hx
+          POSTGRES_DB: hx
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hx" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app -- -D warnings
+      - name: test
+        run: cargo test --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+
+  rust-macos:
+    name: Rust (macOS, capture agent)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy -p hx-macos-sys -p hx-agent -p hx-agent-app --all-targets -- -D warnings
+      - name: test
+        run: cargo test -p hx-macos-sys -p hx-agent -p hx-agent-app
+
+  companions:
+    name: Companions (bun)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: test each companion that has a package.json
+        run: |
+          for d in companions/*/; do
+            if [ -f "$d/package.json" ]; then
+              (cd "$d" && bun install --frozen-lockfile 2>/dev/null || bun install) && (cd "$d" && bun test)
+            fi
+          done

@@ -4,8 +4,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 publish.workspace = true
-
 [lints]
 workspace = true
-
 [dependencies]
+hx-agent.workspace = true
+hx-macos-sys.workspace = true
+anyhow.workspace = true
