@@ -109,6 +109,8 @@ impl Store {
             rejected: vec![],
         };
         let mut tx = self.pool.begin().await?;
+        let mut affected = std::collections::BTreeMap::new();
+        let mut normalize_windows = std::collections::BTreeMap::new();
         for e in batch.envelopes {
             let error = if !token.has("ingest") {
                 Some("ingest scope required".into())
@@ -145,15 +147,11 @@ impl Store {
                 sqlx::query("WITH added AS (INSERT INTO event_blobs VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING sha256) UPDATE blobs SET refcount=refcount+1 WHERE sha256 IN (SELECT sha256 FROM added)")
                     .bind(id).bind(&b.sha256).execute(&mut *tx).await?;
             }
-            sqlx::query("INSERT INTO jobs(output_key,kind,payload) VALUES($1,'normalize',$2) ON CONFLICT DO NOTHING")
-                .bind(format!("normalize:{id}")).bind(json!({"event_id":id})).execute(&mut *tx).await?;
+            normalize_windows.insert(window_at(start).start, window_at(start));
             let mut window = window_at(start);
             let end = e.time.source_end.unwrap_or(start) + Duration::minutes(30);
             loop {
-                let generation: i64 = sqlx::query_scalar("INSERT INTO windows(start_at,end_at) VALUES($1,$2) ON CONFLICT(start_at) DO UPDATE SET generation=windows.generation+1,dirty=true RETURNING generation")
-                    .bind(window.start).bind(window.end).fetch_one(&mut *tx).await?;
-                sqlx::query("INSERT INTO jobs(output_key,kind,payload) VALUES($1,'compile',$2) ON CONFLICT DO NOTHING")
-                    .bind(format!("compile:{}:{generation}",window.start)).bind(json!({"window":window,"generation":generation})).execute(&mut *tx).await?;
+                affected.insert(window.start, window);
                 window = window_at(window.end);
                 if window.start >= end {
                     break;
@@ -161,6 +159,14 @@ impl Store {
             }
             sqlx::query("INSERT INTO watermarks(connector_instance,observed_through,sequence) VALUES($1,$2,$3::text::numeric) ON CONFLICT(connector_instance) DO UPDATE SET observed_through=greatest(watermarks.observed_through,EXCLUDED.observed_through),sequence=greatest(watermarks.sequence,EXCLUDED.sequence)")
                 .bind(e.connector_instance.as_str()).bind(e.time.observed_at).bind(e.sequence.map(|n| n.to_string())).execute(&mut *tx).await?;
+        }
+        for window in affected.values() {
+            let generation: i64 = sqlx::query_scalar("INSERT INTO windows(start_at,end_at) VALUES($1,$2) ON CONFLICT(start_at) DO UPDATE SET generation=windows.generation+1,dirty=true RETURNING generation")
+                .bind(window.start).bind(window.end).fetch_one(&mut *tx).await?;
+            request_window_job(&mut tx, "compile", *window, generation).await?;
+            if normalize_windows.contains_key(&window.start) {
+                request_window_job(&mut tx, "normalize", *window, generation).await?;
+            }
         }
         tx.commit().await?;
         Ok(ack)
@@ -170,35 +176,63 @@ impl Store {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        let e: Envelope = serde_json::from_value(v)?;
-        let failure = if hx_schema::kinds::is_core(e.kind.as_str()) && e.schema_version != 1 {
-            Some(format!(
-                "unsupported core schema_version {}",
-                e.schema_version
-            ))
-        } else {
-            CorePayload::decode(e.kind.as_str(), &e.payload)
-                .and_then(Result::err)
-                .map(|e| e.to_string())
-        };
-        if let Some(err) = failure {
-            sqlx::query("INSERT INTO quarantine(event_id,reason) VALUES($1,$2) ON CONFLICT(event_id) DO UPDATE SET reason=EXCLUDED.reason")
-                .bind(id).bind(err.to_string()).execute(&self.pool).await?;
-            return Ok(());
-        }
-        let text = match e.kind.as_str() {
-            "text.snapshot" | "agent.message" => {
-                e.payload["text"].as_str().unwrap_or("").to_owned()
+        self.normalize_values(vec![(id, v)]).await
+    }
+    /// Bounded chunks keep retries idempotent and avoid one database round trip per event.
+    pub async fn normalize_window(&self, window: Interval) -> Result<()> {
+        loop {
+            let rows = sqlx::query("SELECT id,envelope FROM events e WHERE source_start >= $1 AND source_start < $2 AND NOT EXISTS(SELECT 1 FROM normalized n WHERE n.event_id=e.id) AND NOT EXISTS(SELECT 1 FROM quarantine q WHERE q.event_id=e.id) ORDER BY id LIMIT 512")
+                .bind(window.start).bind(window.end).fetch_all(&self.pool).await?;
+            if rows.is_empty() {
+                return Ok(());
             }
-            "web.visit" => format!(
-                "{} {}",
-                e.payload["title"].as_str().unwrap_or(""),
-                e.payload["url"].as_str().unwrap_or("")
-            ),
-            _ => String::new(),
-        };
-        sqlx::query("INSERT INTO normalized(event_id,normalizer_version,payload,search_text) VALUES($1,'normalize/v1',$2,$3) ON CONFLICT DO NOTHING")
-            .bind(id).bind(&e.payload).bind(text).execute(&self.pool).await?;
+            self.normalize_values(
+                rows.into_iter()
+                    .map(|r| (r.get("id"), r.get("envelope")))
+                    .collect(),
+            )
+            .await?;
+        }
+    }
+    async fn normalize_values(&self, values: Vec<(i64, Value)>) -> Result<()> {
+        let mut normalized = Vec::new();
+        let mut quarantined = Vec::new();
+        for (id, v) in values {
+            let e: Envelope = serde_json::from_value(v)?;
+            let failure = if hx_schema::kinds::is_core(e.kind.as_str()) && e.schema_version != 1 {
+                Some(format!(
+                    "unsupported core schema_version {}",
+                    e.schema_version
+                ))
+            } else {
+                CorePayload::decode(e.kind.as_str(), &e.payload)
+                    .and_then(Result::err)
+                    .map(|e| e.to_string())
+            };
+            if failure.is_some() {
+                quarantined
+                    .push(json!({"event_id":id,"reason":"invalid or unsupported core payload"}));
+                continue;
+            }
+            let text = match e.kind.as_str() {
+                "text.snapshot" | "agent.message" => {
+                    e.payload["text"].as_str().unwrap_or("").to_owned()
+                }
+                "web.visit" => format!(
+                    "{} {}",
+                    e.payload["title"].as_str().unwrap_or(""),
+                    e.payload["url"].as_str().unwrap_or("")
+                ),
+                _ => String::new(),
+            };
+            normalized.push(json!({"event_id":id,"payload":e.payload,"search_text":text}));
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO normalized(event_id,normalizer_version,payload,search_text) SELECT event_id,'normalize/v1',payload,search_text FROM jsonb_to_recordset($1) AS x(event_id bigint,payload jsonb,search_text text) ON CONFLICT DO NOTHING")
+            .bind(json!(normalized)).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO quarantine(event_id,reason) SELECT event_id,reason FROM jsonb_to_recordset($1) AS x(event_id bigint,reason text) ON CONFLICT(event_id) DO UPDATE SET reason=EXCLUDED.reason")
+            .bind(json!(quarantined)).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
     pub async fn observations(
@@ -402,4 +436,17 @@ impl Store {
         let value:Option<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',e.id,'envelope',e.envelope,'sensitivity',e.sensitivity,'blobs',coalesce((SELECT jsonb_agg(jsonb_build_object('sha256',b.sha256,'evidence_expired',b.evidence_expired)) FROM event_blobs eb JOIN blobs b USING(sha256) WHERE eb.event_id=e.id),'[]'::jsonb)) FROM events e WHERE id=$1").bind(id).fetch_optional(&self.pool).await?;
         Ok(value)
     }
+}
+
+/// Update a single durable work slot without stealing an in-flight lease.
+/// A completion observes the request counter and requeues if input changed under it.
+pub async fn request_window_job(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: &str,
+    window: Interval,
+    generation: i64,
+) -> Result<()> {
+    sqlx::query("INSERT INTO jobs(output_key,kind,payload) VALUES($1,$2,$3) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,request_version=jobs.request_version+1,state=CASE WHEN jobs.state='running' THEN 'running' ELSE 'ready' END,attempts=CASE WHEN jobs.state='running' THEN jobs.attempts ELSE 0 END,available_at=now(),last_error=NULL WHERE (jobs.payload->>'generation')::bigint < (EXCLUDED.payload->>'generation')::bigint")
+        .bind(format!("{kind}:{}",window.start)).bind(kind).bind(json!({"window":window,"generation":generation})).execute(&mut **tx).await?;
+    Ok(())
 }
