@@ -1,0 +1,3 @@
+{"event_id":"h_e1","event_type":"message.updated","occurred_at":"2000-01-01T00:00:00Z","payload":{"id":"h_m1","role":"assistant","text":"xxxxxxxx","threadId":"h_t1"},"sequence":1}
+{"event_id":"h_e2","event_type":"message.updated","occurred_at":"2000-01-01T00:00:01Z","payload":{"id":"h_m1","role":"assistant","text":"xxxxxxxxxxxxxxxx","threadId":"h_t1"},"sequence":2}
+{"event_id":"h_e3","event_type":"message.deleted","occurred_at":"2000-01-01T00:00:02Z","payload":{"id":"h_m1","threadId":"h_t1"},"sequence":3}

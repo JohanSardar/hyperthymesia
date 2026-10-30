@@ -9,3 +9,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+hx-connector-sdk.workspace = true
+hx-schema.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "hx-connector-t3code"
+path = "src/main.rs"

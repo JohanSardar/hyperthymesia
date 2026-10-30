@@ -9,3 +9,18 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+hx-schema.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+ulid.workspace = true
+clap = { workspace = true, features = ["env"] }
+reqwest = { workspace = true, features = ["blocking"] }
+zstd.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
+fs2 = "0.4"
+
+[dev-dependencies]
+regex = "1"
