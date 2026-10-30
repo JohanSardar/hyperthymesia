@@ -1003,3 +1003,318 @@ async fn canonical_pointer_never_moves_backwards_on_retry() {
     assert_eq!(canonical, newer.0);
     f.close().await;
 }
+
+#[tokio::test]
+async fn synthetic_day_burst() {
+    synthetic_burst(false).await;
+}
+
+#[tokio::test]
+#[ignore = "known quadratic open-browser-transition cost in hx-compile; run separately in release"]
+async fn synthetic_browser_point_stress() {
+    synthetic_burst(true).await;
+}
+
+async fn synthetic_burst(browser_points: bool) {
+    let f = Fixture::new().await;
+    let started = std::time::Instant::now();
+    for chunk in 0..40 {
+        let events = (chunk * 500..(chunk + 1) * 500)
+            .map(|i| {
+                let mut e = event(&format!("burst-{i}"), 0);
+                e.time =
+                    ObservationTime::point(e.time.observed_at + Duration::milliseconds(i * 4320));
+                if !browser_points {
+                    e.kind = Kind::new("agent.message");
+                    e.payload = json!({"provider":"synthetic","thread_id":format!("thread-{}",i/100),"role":"assistant","text":"Synthetic activity."});
+                }
+                e
+            })
+            .collect();
+        assert_eq!(ingest(&f.store, events).await.accepted, 500);
+    }
+    let ingested = started.elapsed();
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind='compile' AND state IN ('ready','running')",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    eprintln!("burst ingest={ingested:?}, live compile={live}");
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: hx_server::processing::StubProvider,
+    };
+    assert!(live <= 7);
+    let mut normalized_compiled = None;
+    while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
+        if normalized_compiled.is_none() {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM jobs WHERE kind IN ('normalize','compile') AND state!='done'",
+            )
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+            if pending == 0 {
+                normalized_compiled = Some(started.elapsed());
+            }
+        }
+    }
+    assert_eq!(count(&f.store, "normalized").await, 20_000);
+    let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state!='done'")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(unfinished, 0);
+    let canonical: i64 = sqlx::query_scalar("SELECT count(*) FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE r.input_generation=w.generation").fetch_one(&f.store.pool).await.unwrap();
+    assert_eq!(canonical, 7);
+    eprintln!("normalize+compile={normalized_compiled:?}");
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM windows WHERE compiled_generation IS DISTINCT FROM generation",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(stale, 0);
+    eprintln!(
+        "burst total={:?}, processing={:?}",
+        started.elapsed(),
+        started.elapsed() - ingested
+    );
+    assert!(started.elapsed().as_secs_f64() < 60.0);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn coalesced_work_keeps_leases_and_requeues_new_input() {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("first", 8)]).await;
+    let first = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    assert_eq!(first.kind, "normalize");
+    ingest(&f.store, vec![event("late", 8)]).await;
+    assert!(
+        hx_jobs::heartbeat(&f.store.pool, &first, 120)
+            .await
+            .unwrap()
+    );
+    assert!(hx_jobs::finish(&f.store.pool, &first, None).await.unwrap());
+    let next = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    assert_eq!(first.id, next.id);
+    assert_ne!(first.owner, next.owner);
+    assert!(!hx_jobs::finish(&f.store.pool, &first, None).await.unwrap());
+    assert!(
+        !hx_jobs::defer(&f.store.pool, &first, &hx_jobs::Deferred::InputChanged)
+            .await
+            .unwrap()
+    );
+    // A newer request survives a crashed worker even on its last allowed attempt.
+    sqlx::query("UPDATE jobs SET max_attempts=1 WHERE id=$1")
+        .bind(next.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    ingest(&f.store, vec![event("newest", 8)]).await;
+    sqlx::query("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE id=$1")
+        .bind(next.id)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let newest = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    assert_eq!(newest.id, first.id);
+    assert_eq!(newest.attempts, 1);
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: hx_server::processing::StubProvider,
+    };
+    hx_jobs::Handler::handle(&runner, &newest).await.unwrap();
+    hx_jobs::finish(&f.store.pool, &newest, None).await.unwrap();
+    assert_eq!(count(&f.store, "normalized").await, 3);
+    // Reopen a completed slot rather than append a second live job.
+    ingest(&f.store, vec![event("after-done", 8)]).await;
+    assert_eq!(
+        hx_jobs::claim(&f.store.pool, 120)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        first.id
+    );
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind='compile' AND state IN ('ready','running')",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn pending_overlap_defers_interpretation_without_spending_attempts() {
+    let f = Fixture::new().await;
+    let w = hx_store::window_at(event("target", 8).time.observed_at);
+    let mut e = event("overlap", 7);
+    e.time = ObservationTime::point(e.time.observed_at + Duration::minutes(45));
+    ingest(&f.store, vec![e]).await;
+    // Isolate the interpreter first so the actual overlap readiness guard is exercised.
+    sqlx::query("UPDATE jobs SET available_at=now()+interval '1 hour'")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let mut tx = f.store.pool.begin().await.unwrap();
+    hx_jobs::enqueue(
+        &mut tx,
+        "pending-interpret",
+        "interpret",
+        json!({"window":w}),
+        false,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query("UPDATE jobs SET max_attempts=1 WHERE output_key='pending-interpret'")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: hx_server::processing::StubProvider,
+    };
+    for _ in 0..7 {
+        assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+        let row = sqlx::query(
+            "SELECT state,attempts,last_error FROM jobs WHERE output_key='pending-interpret'",
+        )
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("state"), "ready");
+        assert_eq!(row.get::<i32, _>("attempts"), 0);
+        assert_eq!(row.get::<String, _>("last_error"), "normalization pending");
+        sqlx::query("UPDATE jobs SET available_at=now() WHERE output_key='pending-interpret'")
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+    }
+    f.store
+        .normalize_window(hx_store::window_at(event("overlap", 7).time.observed_at))
+        .await
+        .unwrap();
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM jobs WHERE output_key='pending-interpret'")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "done");
+    let canonical: Option<i64> =
+        sqlx::query_scalar("SELECT canonical_revision FROM windows WHERE start_at=$1")
+            .bind(w.start)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert!(canonical.is_some());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn job_errors_are_bounded_and_do_not_persist_payload_text() {
+    struct Failing;
+    impl hx_jobs::Handler for Failing {
+        async fn handle(&self, _: &hx_jobs::Job) -> anyhow::Result<()> {
+            Err(
+                serde_json::from_str::<u64>("\"SYNTHETIC_PRIVATE_SENTINEL\"")
+                    .unwrap_err()
+                    .into(),
+            )
+        }
+    }
+    let f = Fixture::new().await;
+    let mut tx = f.store.pool.begin().await.unwrap();
+    hx_jobs::enqueue(&mut tx, "error", "test", json!({}), false, Utc::now())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(hx_jobs::run_one(&f.store.pool, &Failing).await.is_err());
+    let error: String = sqlx::query_scalar("SELECT last_error FROM jobs")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(error, "invalid job or derived JSON");
+    assert!(error.len() < 128);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn migration_supersedes_legacy_backlog_and_preserves_work() {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("legacy", 8)]).await;
+    sqlx::query("DELETE FROM jobs")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    let w = hx_store::window_at(event("legacy", 8).time.observed_at);
+    let id: i64 = sqlx::query_scalar("SELECT id FROM events")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let mut tx = f.store.pool.begin().await.unwrap();
+    for generation in 1..=10 {
+        hx_jobs::enqueue(
+            &mut tx,
+            &format!("compile:{}:{generation}", w.start),
+            "compile",
+            json!({"window":w,"generation":generation}),
+            false,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+    hx_jobs::enqueue(
+        &mut tx,
+        &format!("normalize:{id}"),
+        "normalize",
+        json!({"event_id":id}),
+        false,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let old = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    sqlx::query("ALTER TABLE jobs DROP COLUMN request_version, DROP COLUMN leased_version")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../hx-store/migrations/0004_coalesced_work.sql"
+    ))
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
+    assert!(!hx_jobs::finish(&f.store.pool, &old, None).await.unwrap());
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind='compile' AND state IN ('ready','running')",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1);
+    ingest(&f.store, vec![event("after-upgrade", 8)]).await;
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind='compile' AND state IN ('ready','running')",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1);
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: hx_server::processing::StubProvider,
+    };
+    while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {}
+    assert_eq!(count(&f.store, "normalized").await, 2);
+    f.close().await;
+}
