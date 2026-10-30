@@ -56,7 +56,7 @@ pub fn parse(
             "provider":"t3code", "thread_id":thread, "thread_title":context["title"],
             "turn_id":payload["turnId"].as_str().or_else(|| payload["providerTurnId"].as_str()).or_else(|| payload["runId"].as_str()),
             "role":role, "text":payload["text"].as_str().unwrap_or(if message { "" } else { event_type }),
-            "cwd":context["cwd"], "model":context["model"], "event_type":event_type,
+            "cwd":payload["cwd"].as_str().or_else(||context["cwd"].as_str()), "model":payload["model"].as_str().or_else(||context["model"].as_str()), "event_type":event_type, "context_provenance":"current_projection",
             "native_event_id":event_id,"native":payload,
         }),
         timestamp(&json!(at)),
@@ -66,18 +66,12 @@ pub fn parse(
     if event_type.ends_with(".deleted") {
         e.operation = Operation::Delete;
     }
-    link(
-        &mut e,
-        "session",
-        context["session"].as_str().unwrap_or_default(),
-    );
-    if context["session"].is_null() {
-        link(
-            &mut e,
-            "session",
-            payload["providerSessionId"].as_str().unwrap_or_default(),
-        );
-    }
+    let session = payload["nativeThreadRef"]["nativeId"]
+        .as_str()
+        .or_else(|| payload["providerSessionId"].as_str())
+        .or_else(|| context["session"].as_str())
+        .unwrap_or_default();
+    link(&mut e, "session", session);
     Some(e)
 }
 
@@ -129,8 +123,10 @@ pub fn scan(req: &Request, state: &Value) -> Result<Scan> {
             context["title"] = json!(title); context["cwd"] = json!(cwd);
             context["model"] = model.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or_default()["model"].clone();
         }
-        if let Ok(session) = db.query_row("SELECT COALESCE(provider_session_id,json_extract(payload_json,'$.nativeThreadRef.nativeId')) FROM orchestration_v2_projection_provider_threads WHERE thread_id=? LIMIT 1", [thread], |r| r.get::<_,Option<String>>(0)) { context["session"] = json!(session); }
-        if context["session"].is_null() && let Ok(session) = db.query_row("SELECT COALESCE(provider_thread_id,provider_session_id) FROM projection_thread_sessions WHERE thread_id=?", [thread], |r| r.get::<_,Option<String>>(0)) { context["session"] = json!(session); }
+        // A thread may switch providers. Never attach an arbitrary current session to old events.
+        if let Some(provider_thread)=payload["providerThreadId"].as_str() {
+            if let Ok(session)=db.query_row("SELECT COALESCE(json_extract(payload_json,'$.nativeThreadRef.nativeId'),provider_session_id) FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id=?",[provider_thread],|r|r.get::<_,Option<String>>(0)){context["session"]=json!(session);}
+        } else if let Ok(session)=db.query_row("SELECT COALESCE(json_extract(payload_json,'$.nativeThreadRef.nativeId'),provider_session_id) FROM orchestration_v2_projection_provider_threads WHERE thread_id=? GROUP BY thread_id HAVING COUNT(DISTINCT COALESCE(json_extract(payload_json,'$.nativeThreadRef.nativeId'),provider_session_id))=1",[thread],|r|r.get::<_,Option<String>>(0)){context["session"]=json!(session);}
         if let Some(e) = parse(req, seq as u64, &id, &typ, &at, &payload, &context)
             && sdk::after_since(req, &e)
         {
@@ -238,5 +234,19 @@ mod tests {
         assert!(b.complete);
         assert_eq!(a.envelopes[0].source_key, b.envelopes[0].source_key);
         assert!(scan(&r, &b.next).unwrap().envelopes.is_empty());
+    }
+    #[test]
+    fn event_native_session_takes_precedence_over_current_projection() {
+        let e = parse(
+            &req(),
+            1,
+            "h_e",
+            "provider-thread.updated",
+            "2000-01-01T00:00:00Z",
+            &json!({"id":"h_p","nativeThreadRef":{"nativeId":"h_native"}}),
+            &json!({"session":"h_current"}),
+        )
+        .unwrap();
+        assert_eq!(e.links[0].target, "h_native");
     }
 }
