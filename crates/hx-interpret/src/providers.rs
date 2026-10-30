@@ -18,7 +18,6 @@ impl Provider for ClaudeCliProvider {
         let mut child = tokio::process::Command::new("claude")
             .args([
                 "-p",
-                "--bare",
                 "--no-session-persistence",
                 "--output-format",
                 "json",
@@ -34,6 +33,9 @@ impl Provider for ClaudeCliProvider {
                 "--permission-prompts",
                 "none",
             ])
+            // `--bare` would require ANTHROPIC_API_KEY and refuse subscription auth.
+            // An empty cwd keeps project CLAUDE.md files out of the interpreter context.
+            .current_dir(std::env::temp_dir())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
