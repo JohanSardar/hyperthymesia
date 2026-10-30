@@ -466,3 +466,37 @@ fn browser_without_private_window_signal_is_not_persisted() {
     assert!(!persist(&mut out, &p, Some(&focus), false, &e, &[]).unwrap());
     assert_eq!(out.stats().unwrap().0, 0);
 }
+
+#[test]
+fn shared_blob_eviction_preserves_every_affected_observation_in_loss_records() {
+    let (_dir, mut out) = db();
+    let (first, blob) = media(b"shared");
+    let (second, _) = media(b"shared");
+    out.enqueue(&first, std::slice::from_ref(&blob)).unwrap();
+    out.enqueue(&second, std::slice::from_ref(&blob)).unwrap();
+    let (replacement, bytes) = media(b"newdata");
+    out.enqueue(&replacement, &[bytes]).unwrap();
+    let batch = out.batch().unwrap().unwrap();
+    let losses: Vec<_> = batch
+        .envelopes
+        .iter()
+        .filter(|e| e.kind.as_str() == "collector.health")
+        .collect();
+    assert_eq!(losses.len(), 2);
+    for original in [&first, &second] {
+        assert!(losses.iter().any(|e| {
+            e.payload["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&original.observation_id.to_string())
+        }));
+    }
+    assert!(out.blob(&blob.0.sha256).unwrap().is_none());
+}
+#[test]
+fn unreferenced_blob_is_rejected_without_consuming_either_budget() {
+    let (_dir, mut out) = db();
+    let (_, blob) = media(b"extra");
+    assert!(out.enqueue(&event(), &[blob]).is_err());
+    assert_eq!(out.stats().unwrap(), (0, 0, 0));
+}
