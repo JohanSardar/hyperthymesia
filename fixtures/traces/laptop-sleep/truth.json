@@ -1,0 +1,28 @@
+{
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2026-01-01T00:10:00Z"
+  },
+  "intervals": [
+    {
+      "kind": "focus",
+      "label": "Editor",
+      "start": "2026-01-01T00:00:00Z",
+      "end": "2026-01-01T00:00:30Z"
+    },
+    {
+      "kind": "presence",
+      "label": "device_asleep",
+      "start": "2026-01-01T00:00:30Z",
+      "end": "2026-01-01T00:05:00Z"
+    },
+    {
+      "kind": "focus",
+      "label": "Editor",
+      "start": "2026-01-01T00:05:00Z",
+      "end": "2026-01-01T00:06:00Z"
+    }
+  ],
+  "coverage": [],
+  "aggregates": []
+}

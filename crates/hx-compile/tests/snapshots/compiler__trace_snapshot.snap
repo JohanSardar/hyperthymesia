@@ -1,0 +1,103 @@
+---
+source: crates/hx-compile/tests/compiler.rs
+expression: "compile(&observations, truth.window)"
+---
+{
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2026-01-01T00:10:00Z"
+  },
+  "compiler_version": "hx-compile/0.1.0",
+  "lanes": [
+    {
+      "id": {
+        "key": "device:synthetic-desktop",
+        "kind": "focus"
+      },
+      "intervals": [
+        {
+          "interval": {
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-01-01T00:01:00Z"
+          },
+          "label": "Editor",
+          "attrs": {
+            "app_bundle_id": "test.editor",
+            "app_name": "Editor",
+            "duration": {
+              "basis": "wall_clock",
+              "nanos": 60000000000,
+              "resolution_ms": 1000
+            }
+          },
+          "evidence": [
+            1
+          ],
+          "uncertain_edges": false
+        },
+        {
+          "interval": {
+            "start": "2026-01-01T00:01:00Z",
+            "end": "2026-01-01T00:01:06Z"
+          },
+          "label": "Browser",
+          "attrs": {
+            "app_bundle_id": "test.browser",
+            "app_name": "Browser",
+            "duration": {
+              "basis": "wall_clock",
+              "nanos": 6000000000,
+              "resolution_ms": 1000
+            }
+          },
+          "evidence": [
+            2
+          ],
+          "uncertain_edges": false
+        },
+        {
+          "interval": {
+            "start": "2026-01-01T00:01:06Z",
+            "end": "2026-01-01T00:02:00Z"
+          },
+          "label": "Editor",
+          "attrs": {
+            "app_bundle_id": "test.editor",
+            "app_name": "Editor",
+            "duration": {
+              "basis": "wall_clock",
+              "nanos": 54000000000,
+              "resolution_ms": 1000
+            }
+          },
+          "evidence": [
+            3
+          ],
+          "uncertain_edges": false
+        }
+      ]
+    }
+  ],
+  "points": [],
+  "coverage": [
+    {
+      "lane_key": "device:synthetic-desktop",
+      "interval": {
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-01-01T00:03:00Z"
+      },
+      "state": "observed",
+      "reason": "synthetic:desktop[focus]:evidence"
+    },
+    {
+      "lane_key": "device:synthetic-desktop",
+      "interval": {
+        "start": "2026-01-01T00:03:00Z",
+        "end": "2026-01-01T00:10:00Z"
+      },
+      "state": "unknown",
+      "reason": "synthetic:desktop[focus]:collector gap"
+    }
+  ],
+  "aggregates": []
+}
