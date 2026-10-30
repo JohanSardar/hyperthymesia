@@ -59,6 +59,12 @@ pub fn parse(
     if sub == "task_started" {
         ctx["turn"] = p["turn_id"].clone();
     }
+    if req
+        .since
+        .is_some_and(|since| timestamp(&v["timestamp"]).is_some_and(|at| at < since))
+    {
+        return None;
+    }
     let session = ctx["session"].as_str().unwrap_or(fallback);
     let id = p["id"]
         .as_str()
@@ -94,17 +100,32 @@ pub fn parse(
     Some(e)
 }
 
-fn t3_thread(db: &sdk::rusqlite::Connection, session: &str) -> Option<String> {
+fn t3_threads(db: &sdk::rusqlite::Connection) -> std::collections::BTreeMap<String, String> {
+    let mut threads = std::collections::BTreeMap::new();
+    // Read each projection once: JSON-expression OR lookups otherwise scan the
+    // provider table again for every rollout file.
     for query in [
-        "SELECT thread_id FROM orchestration_v2_projection_provider_threads WHERE provider_session_id=?1 OR json_extract(payload_json,'$.nativeThreadRef.nativeId')=?1 LIMIT 1",
-        "SELECT thread_id FROM projection_thread_sessions WHERE provider_session_id=?1 OR provider_thread_id=?1 LIMIT 1",
-        "SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id=?1 LIMIT 1",
+        "SELECT thread_id,provider_session_id,json_extract(payload_json,'$.nativeThreadRef.nativeId') FROM orchestration_v2_projection_provider_threads",
+        "SELECT thread_id,provider_session_id,provider_thread_id FROM projection_thread_sessions",
+        "SELECT thread_id,provider_session_id,NULL FROM orchestration_v2_projection_provider_session_bindings",
     ] {
-        if let Ok(thread) = db.query_row(query, [session], |r| r.get::<_, String>(0)) {
-            return Some(thread);
+        if let Ok(mut stmt) = db.prepare(query)
+            && let Ok(rows) = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+        {
+            for (thread, session, native) in rows.flatten() {
+                for id in [session, native].into_iter().flatten() {
+                    threads.entry(id).or_insert_with(|| thread.clone());
+                }
+            }
         }
     }
-    None
+    threads
 }
 pub fn scan(req: &Request, state: &Value) -> Result<Scan> {
     let root = Path::new(&req.source);
@@ -129,7 +150,7 @@ pub fn scan(req: &Request, state: &Value) -> Result<Scan> {
     };
     let t3_path = sdk::home().join(".t3/userdata/statev2.sqlite");
     let t3 = if t3_path.exists() {
-        Some(sdk::readonly(&t3_path)?)
+        Some(t3_threads(&sdk::readonly(&t3_path)?))
     } else {
         None
     };
@@ -143,55 +164,57 @@ pub fn scan(req: &Request, state: &Value) -> Result<Scan> {
         }
         let key = path.to_string_lossy().to_string();
         let old = positions.get(&key).cloned().unwrap_or_default();
-        let (lines, mut cursor, complete) =
-            sdk::tail(&path, &old, req.limit - out.envelopes.len())?;
+        let mut saved = old;
+        if !saved.context.is_object() {
+            saved.context = json!({});
+        }
+        let (cursor, complete) = sdk::tail_each(
+            &path,
+            &saved,
+            req.limit - out.envelopes.len(),
+            |line, context, generation| {
+                let v = line.value;
+                if v["type"] == "session_meta" {
+                    let session = v["payload"]["session_id"]
+                        .as_str()
+                        .or_else(|| v["payload"]["id"].as_str())
+                        .unwrap_or_default();
+                    if let Some(db) = &threads
+                        && let Ok((title, cwd, model)) = db.query_row(
+                            "SELECT title,cwd,model FROM threads WHERE id=?",
+                            [session],
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, Option<String>>(2)?,
+                                ))
+                            },
+                        )
+                    {
+                        context["title"] = json!(title);
+                        context["cwd"] = json!(cwd);
+                        context["model"] = json!(model);
+                    }
+                    if let Some(threads) = &t3
+                        && let Some(thread) = threads.get(session)
+                    {
+                        context["t3_thread"] = json!(thread);
+                    }
+                }
+                if let Some(e) = parse(req, &v, context, &format!("{}:{}", generation, line.offset))
+                    && sdk::after_since(req, &e)
+                {
+                    out.push(e);
+                    return Ok(true);
+                }
+                Ok(false)
+            },
+        )?;
         out.complete &= complete;
-        if !cursor.context.is_object() {
-            cursor.context = json!({});
-        }
-        for line in lines {
-            let v = line.value;
-            if v["type"] == "session_meta" {
-                let session = v["payload"]["session_id"]
-                    .as_str()
-                    .or_else(|| v["payload"]["id"].as_str())
-                    .unwrap_or_default();
-                if let Some(db) = &threads
-                    && let Ok((title, cwd, model)) = db.query_row(
-                        "SELECT title,cwd,model FROM threads WHERE id=?",
-                        [session],
-                        |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, String>(1)?,
-                                r.get::<_, Option<String>>(2)?,
-                            ))
-                        },
-                    )
-                {
-                    cursor.context["title"] = json!(title);
-                    cursor.context["cwd"] = json!(cwd);
-                    cursor.context["model"] = json!(model);
-                }
-                if let Some(db) = &t3
-                    && let Some(thread) = t3_thread(db, session)
-                {
-                    cursor.context["t3_thread"] = json!(thread);
-                }
-            }
-            if let Some(e) = parse(
-                req,
-                &v,
-                &mut cursor.context,
-                &format!("{}:{}", cursor.generation, line.offset),
-            ) && sdk::after_since(req, &e)
-            {
-                out.push(e);
-            }
-        }
         positions.insert(key, cursor);
     }
-    out.next = serde_json::to_value(positions)?;
+    out.next = sdk::compact_tail_state(&positions)?;
     Ok(out)
 }
 
@@ -215,6 +238,50 @@ mod tests {
             .map(|s| serde_json::from_str(s).unwrap())
             .collect()
     }
+    #[test]
+    fn excluded_records_still_update_context_and_timestamps_need_not_be_ordered() {
+        let mut req = req();
+        req.since = Some("2000-01-02T00:00:00Z".parse().unwrap());
+        let mut context = json!({});
+        assert!(
+            parse(
+                &req,
+                &json!({"type":"session_meta","payload":{"id":"h_session"}}),
+                &mut context,
+                "h_fallback"
+            )
+            .is_none()
+        );
+        assert!(parse(&req, &json!({"timestamp":"2000-01-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"h_turn"}}), &mut context, "h_fallback").is_none());
+        for (at, expected) in [
+            ("2000-01-02T00:00:00Z", true),
+            ("2000-01-01T00:00:00Z", false),
+            ("unknown", true),
+        ] {
+            let e = parse(
+                &req,
+                &json!({"timestamp":at,"type":"response_item","payload":{"type":"message","id":"h_message"}}),
+                &mut context,
+                "h_fallback",
+            );
+            assert_eq!(e.is_some(), expected);
+            if let Some(e) = e {
+                assert_eq!(e.payload["thread_id"], "h_session");
+                assert_eq!(e.payload["turn_id"], "h_turn");
+            }
+        }
+    }
+
+    #[test]
+    fn provider_thread_map_retains_projection_precedence_and_both_native_ids() {
+        let db = sdk::rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE orchestration_v2_projection_provider_threads(thread_id TEXT,provider_session_id TEXT,payload_json TEXT); INSERT INTO orchestration_v2_projection_provider_threads VALUES('h_current','h_session','{\"nativeThreadRef\":{\"nativeId\":\"h_native\"}}'); CREATE TABLE projection_thread_sessions(thread_id TEXT,provider_session_id TEXT,provider_thread_id TEXT); INSERT INTO projection_thread_sessions VALUES('h_legacy','h_session','h_provider');").unwrap();
+        let map = t3_threads(&db);
+        assert_eq!(map["h_session"], "h_current");
+        assert_eq!(map["h_native"], "h_current");
+        assert_eq!(map["h_provider"], "h_legacy");
+    }
+
     #[test]
     fn fixtures_validate_replay_and_updates() {
         let run = || {
