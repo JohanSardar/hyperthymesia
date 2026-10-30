@@ -48,6 +48,13 @@ test("worker correlates focus, SPA navigation and visibility; exclusions never r
   const count=state.outbox.filter((e:any)=>e.kind==="text.snapshot").length;
   await message({type:"snapshot",url:tab.url,pageVisible:true,text:"Never stored while locked",truncated:false});
   expect(state.outbox.filter((e:any)=>e.kind==="text.snapshot")).toHaveLength(count);
+  // Visibility changes while locked must remain available on unlock.
+  await message({type:"visibility",url:tab.url,pageVisible:false});
+  await message({type:"visibility",url:tab.url,pageVisible:true});
+  expect(state.visits[1].page).toBe(true);
+  idle="active"; onStateChanged.fire("active");
+  await until(()=>state.visits[1].current.payload.visible===true);
+
   tab.url="https://chase.com/private-fixture"; tab.title="Excluded synthetic title";
   onHistoryStateUpdated.fire({frameId:0,tabId:1,url:tab.url});
   await until(()=>!state.visits[1]);
