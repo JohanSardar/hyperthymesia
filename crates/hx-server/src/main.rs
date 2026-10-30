@@ -108,9 +108,9 @@ async fn main() -> Result<()> {
                 let mut schedule = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     tokio::select! {
-                        _=schedule.tick()=>{if processing::schedule(&runner.store).await.is_err(){tracing::error!("scheduler failed");}},
+                        _=schedule.tick()=>{if let Err(e)=processing::schedule(&runner.store).await{tracing::error!("scheduler failed: {e:#}");}},
                         _=tokio::time::sleep(std::time::Duration::from_millis(200))=>{
-                            if hx_jobs::run_one(&runner.store.pool,&runner).await.is_err(){tracing::error!("processing failed");}
+                            if let Err(e)=hx_jobs::run_one(&runner.store.pool,&runner).await{tracing::error!("processing failed: {e:#}");}
                         }
                     }
                 }
