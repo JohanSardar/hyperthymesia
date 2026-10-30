@@ -161,6 +161,9 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
             task.goal = None;
         }
     }
+    if !failures.is_empty() {
+        failures.push(CheckFailure { item: "prose".into(), reason: "regenerated summary/episode prose from retained claims; cleared task descriptions and goals".into() });
+    }
     value.check_failures.extend(failures.clone());
     failures
 }

@@ -59,6 +59,9 @@ pub fn build_packet(
     entities: &[String],
     open_tasks: &[Task],
 ) -> Packet {
+    // Hash the full immutable inputs, including data omitted by the bounded projection.
+    // Only the digest crosses the prompt boundary, never these private inputs.
+    let canonical_inputs = serde_json::json!({"timeline": timeline, "evidence": evidence, "entities": entities, "open_tasks": open_tasks, "prompt_version": PROMPT_VERSION});
     let mut evidence: Vec<_> = evidence
         .iter()
         .filter(|e| e.kind.starts_with("normal:") || e.kind.starts_with("sensitive:"))
@@ -186,9 +189,8 @@ pub fn build_packet(
         input_digest: String::new(),
     };
     // serde_json's ordered object maps give stable key order, including nested attrs.
-    let inputs = serde_json::json!({"timeline": timeline, "evidence": packet.evidence, "entities": packet.entities, "open_tasks": packet.open_tasks, "prompt_version": PROMPT_VERSION});
     packet.input_digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&inputs).expect("inputs serialize"),
+        serde_json::to_vec(&canonical_inputs).expect("inputs serialize"),
     ));
     packet
 }
