@@ -144,7 +144,7 @@ impl Outbox {
                 let old: Envelope = serde_json::from_slice(&json)?;
                 let payload = hx_schema::kinds::CorePayload::CollectorHealth(
                     hx_schema::kinds::CollectorHealth {
-                        collector: "outbox.media".into(),
+                        collector: "media".into(),
                         status: hx_schema::kinds::CollectorStatus::Failed,
                         last_sequence: old.sequence,
                         last_observed_at: Some(old.time.observed_at),

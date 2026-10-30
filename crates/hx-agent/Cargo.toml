@@ -23,3 +23,4 @@ regex = "1"
 [dev-dependencies]
 tempfile.workspace = true
 axum.workspace = true
+hx-compile.workspace = true
