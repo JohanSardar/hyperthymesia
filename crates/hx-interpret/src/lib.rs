@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub struct EvidenceItem {
     pub id: EvidenceId,
     pub at: DateTime<Utc>,
+    /// `normal:<kind>` or `sensitive:<kind>`. Any other prefix is dropped from the packet.
     pub kind: String,
     /// Redacted, size-capped text the model may read.
     pub text: String,

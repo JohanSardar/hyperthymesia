@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
                 processing::interpret_window(
                     &store,
                     w,
-                    &processing::coordinator_provider(ProviderConfig::Stub),
+                    &processing::coordinator_provider(ProviderConfig::from_env()),
                 )
                 .await?;
             }
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(listen).await?;
             let runner = Runner {
                 store: store.clone(),
-                provider: processing::coordinator_provider(ProviderConfig::Stub),
+                provider: processing::coordinator_provider(ProviderConfig::from_env()),
             };
             let worker = tokio::spawn(async move {
                 let mut schedule = tokio::time::interval(std::time::Duration::from_secs(60));

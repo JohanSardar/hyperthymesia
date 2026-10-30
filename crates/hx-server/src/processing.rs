@@ -10,11 +10,47 @@ use sqlx::Row;
 
 pub enum ProviderConfig {
     Stub,
+    ClaudeCli { model: String },
 }
-/// Coordinator integration point for hx-interpret's real provider configurations.
-pub fn coordinator_provider(config: ProviderConfig) -> StubProvider {
+impl ProviderConfig {
+    /// `HX_PROVIDER=claude` selects the `claude -p` CLI (model from `HX_MODEL`); anything else is the stub.
+    pub fn from_env() -> Self {
+        match std::env::var("HX_PROVIDER").as_deref() {
+            Ok("claude") => Self::ClaudeCli {
+                model: std::env::var("HX_MODEL").unwrap_or_else(|_| "sonnet".into()),
+            },
+            _ => Self::Stub,
+        }
+    }
+}
+pub enum AnyProvider {
+    Stub(StubProvider),
+    ClaudeCli(hx_interpret::providers::ClaudeCliProvider),
+}
+impl Provider for AnyProvider {
+    fn name(&self) -> String {
+        match self {
+            Self::Stub(p) => p.name(),
+            Self::ClaudeCli(p) => p.name(),
+        }
+    }
+    async fn complete(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> Result<String, hx_interpret::InterpretError> {
+        match self {
+            Self::Stub(p) => p.complete(system, user).await,
+            Self::ClaudeCli(p) => p.complete(system, user).await,
+        }
+    }
+}
+pub fn coordinator_provider(config: ProviderConfig) -> AnyProvider {
     match config {
-        ProviderConfig::Stub => StubProvider,
+        ProviderConfig::Stub => AnyProvider::Stub(StubProvider),
+        ProviderConfig::ClaudeCli { model } => {
+            AnyProvider::ClaudeCli(hx_interpret::providers::ClaudeCliProvider { model })
+        }
     }
 }
 pub struct StubProvider;
@@ -126,7 +162,7 @@ pub async fn prepare_input(
         .map(|o| EvidenceItem {
             id: o.id,
             at: o.envelope.time.observed_at,
-            kind: o.envelope.kind.to_string(),
+            kind: format!("normal:{}", o.envelope.kind),
             text: o.envelope.payload.to_string().chars().take(4096).collect(),
             self_generated: self_generated(&o.envelope),
         })
