@@ -258,6 +258,13 @@ fn caps_unicode_evidence_and_preserves_interleaving() {
         .collect();
     let capped = build_packet(&timeline, &evidence, &[], &[]);
     assert_eq!(capped.evidence.len(), 128);
+    let mut changed = evidence.clone();
+    changed[199].text.push_str("changed outside the projection");
+    assert_ne!(
+        capped.input_digest,
+        build_packet(&timeline, &changed, &[], &[]).input_digest
+    );
+
     assert!(capped.evidence.iter().all(|e| e.text.len() <= 2048));
     let r = response("success");
     let mut result = Interpretation {
