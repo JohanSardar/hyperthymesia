@@ -139,9 +139,17 @@ pub fn run_cli(
     let source = cli
         .source
         .unwrap_or_else(|| default_source.replace('~', &home().to_string_lossy()));
-    let instance = cli
-        .instance
-        .unwrap_or_else(|| format!("{name}:{}", &hx_schema::sha256_hex(source.as_bytes())[..16]));
+    let instance = cli.instance.unwrap_or_else(|| {
+        let host = std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout)
+            .unwrap_or_default();
+        let mut identity = host;
+        identity.extend_from_slice(source.as_bytes());
+        format!("{name}:{}", &hx_schema::sha256_hex(&identity)[..16])
+    });
     ensure!(
         instance
             .bytes()
@@ -235,6 +243,7 @@ fn private_open(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     Ok(OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
@@ -364,17 +373,30 @@ pub fn agent(
     mut payload: Value,
     at: Option<DateTime<Utc>>,
 ) -> Envelope {
-    let text = payload["text"].as_str().unwrap_or_default();
-    if text.len() > TEXT_CAP {
-        let mut end = TEXT_CAP;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let capped = text[..end].to_owned();
-        payload["text"] = json!(capped);
+    if cap_text(&mut payload) {
         payload["text_truncated"] = json!(true);
     }
     envelope(req, key, revision, "agent.message", payload, at)
+}
+/// Bound every string in retained agent/tool provenance, without cutting UTF-8.
+fn cap_text(value: &mut Value) -> bool {
+    match value {
+        Value::String(s) if s.len() > TEXT_CAP => {
+            let mut end = TEXT_CAP;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            true
+        }
+        Value::Array(a) => a
+            .iter_mut()
+            .fold(false, |truncated, v| cap_text(v) | truncated),
+        Value::Object(o) => o
+            .values_mut()
+            .fold(false, |truncated, v| cap_text(v) | truncated),
+        _ => false,
+    }
 }
 pub fn string(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or_default().into()
@@ -471,7 +493,10 @@ pub fn tail(
         Box::new(file)
     };
     let mut prefix = vec![];
-    reader.by_ref().take(saved.offset.min(64)).read_to_end(&mut prefix)?;
+    reader
+        .by_ref()
+        .take(saved.offset.min(64))
+        .read_to_end(&mut prefix)?;
     let got = prefix.len();
     let valid = saved.generation == generation
         && (saved.offset == 0
@@ -490,7 +515,10 @@ pub fn tail(
     let file = File::open(path)?;
     let reader: Box<dyn Read> = if compressed {
         let mut r = zstd::stream::read::Decoder::new(file)?;
-        std::io::copy(&mut r.by_ref().take(cursor.offset), &mut std::io::sink())?;
+        let skipped = std::io::copy(&mut r.by_ref().take(cursor.offset), &mut std::io::sink())?;
+        if skipped != cursor.offset {
+            return tail(path, &TailCursor::default(), budget);
+        }
         Box::new(r)
     } else {
         let mut r = file;

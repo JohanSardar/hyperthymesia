@@ -194,3 +194,23 @@ fn tool_text_is_bounded_and_sensitive() {
     assert_eq!(e.payload["text_truncated"], true);
     assert_eq!(e.sensitivity, hx_schema::Sensitivity::Sensitive);
 }
+
+#[test]
+fn readonly_sqlite_sees_wal_and_refuses_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.sqlite");
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE evidence(n INTEGER); INSERT INTO evidence VALUES(7);").unwrap();
+    let reader = readonly(&path).unwrap();
+    assert_eq!(
+        reader
+            .query_row("SELECT n FROM evidence", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    assert!(
+        reader
+            .execute("INSERT INTO evidence VALUES(8)", [])
+            .is_err()
+    );
+}
