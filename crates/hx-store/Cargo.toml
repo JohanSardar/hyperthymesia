@@ -9,3 +9,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+hx-schema.workspace = true
+hx-compile.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+ulid.workspace = true
