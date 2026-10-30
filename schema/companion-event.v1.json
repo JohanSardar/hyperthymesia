@@ -1,0 +1,68 @@
+{
+  "$defs": {
+    "Sensitivity": {
+      "description": "Disclosure class. Unknown data is `Restricted`; a producer label can only\nnarrow disclosure, never grant it (the server applies its own rules).",
+      "enum": [
+        "normal",
+        "sensitive",
+        "restricted"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What a companion (browser extension, shell hook, editor extension) sends to the\nlocal agent socket as one NDJSON line. The agent wraps it into an [`Envelope`]\nwith its own identity, sequence, clocks and capture policy.",
+  "properties": {
+    "companion": {
+      "description": "`browser`, `shell`, `editor`.",
+      "type": "string"
+    },
+    "ended_at": {
+      "default": null,
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "type": "string"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "payload": true,
+    "revision": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sensitivity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Sensitivity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "source_key": {
+      "description": "Stable native identity, e.g. `tab:12:nav:5` or `shell:<pid>:<n>`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "companion",
+    "kind",
+    "source_key",
+    "occurred_at",
+    "payload"
+  ],
+  "title": "CompanionEvent",
+  "type": "object"
+}

@@ -1,0 +1,6 @@
+ts	phase	decision	why	evidence	result
+2026-10-30T21:42:54Z	frame	read the whole design and checked this Mac before planning anything	need the real starting point, not assumptions	docs/DESIGN.md; rustc/cargo missing; docker+colima ok; Xcode 26.4.1; Apple Development identity present; macOS 26.5.2; 28 GB free	found 5 blockers
+2026-10-30T21:42:54Z	frame	scoped this run to Gate A and Gate B, not all four gates	the full design is weeks of work; two gates is what one supervised run can prove	docs/PLAYBOOK.md	waiting on checkpoint
+2026-10-30T21:45:52Z	frame	user overrode the 2-gate scope; building the whole design in one run	user asked for the entire design in 1-2 hours	user message 2026-10-30	scope = all of DESIGN.md
+2026-10-30T21:45:52Z	frame	skipped architect/arena on the contract	the contract was already settled in two Astra rounds; a second bakeoff over a settled design is over-engineering	docs/review/astra-round2.md	decided
+2026-10-30T21:45:52Z	frame	ad-hoc code signing, local git only	real identity can pop a keychain prompt; pushing is outward-facing and not authorized	CLAUDE.md no-prompt rule	decided

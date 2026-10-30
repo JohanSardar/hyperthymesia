@@ -1,0 +1,354 @@
+{
+  "$defs": {
+    "BlobRef": {
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the blob bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sha256",
+        "media_type",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "BootId": {
+      "description": "One boot session of a device. Monotonic clocks are only comparable within a boot.",
+      "type": "string"
+    },
+    "ClockDomain": {
+      "oneOf": [
+        {
+          "const": "mach_continuous",
+          "description": "`mach_continuous_time`: advances during sleep.",
+          "type": "string"
+        },
+        {
+          "const": "mach_absolute",
+          "description": "`mach_absolute_time`: stops during sleep.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A source-specific monotonic counter.",
+          "type": "string"
+        }
+      ]
+    },
+    "Completeness": {
+      "enum": [
+        "complete",
+        "partial",
+        "truncated",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "ConnectorInstance": {
+      "description": "e.g. `macos-agent:mbp-main`, `t3code:mbp-main:statev2`.",
+      "type": "string"
+    },
+    "Coverage": {
+      "properties": {
+        "completeness": {
+          "$ref": "#/$defs/Completeness"
+        },
+        "scope": {
+          "description": "What this observation claims to cover, e.g. `focused_window` or `backfill:2026-10-30`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "completeness"
+      ],
+      "type": "object"
+    },
+    "Envelope": {
+      "properties": {
+        "actor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "blobs": {
+          "items": {
+            "$ref": "#/$defs/BlobRef"
+          },
+          "type": "array"
+        },
+        "connector_instance": {
+          "$ref": "#/$defs/ConnectorInstance",
+          "description": "Installation/account/stream that produced it. Authenticated by the server."
+        },
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Coverage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "device": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "envelope_version": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "description": "Namespaced kind, e.g. `focus.span`. See [`kinds`].",
+          "type": "string"
+        },
+        "links": {
+          "items": {
+            "$ref": "#/$defs/Link"
+          },
+          "type": "array"
+        },
+        "observation_id": {
+          "$ref": "#/$defs/ObservationId",
+          "description": "Immutable identity of this observation, persisted by the producer before upload."
+        },
+        "operation": {
+          "$ref": "#/$defs/Operation"
+        },
+        "payload": true,
+        "resource": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "Source revision or content digest. Append-only sources use `\"0\"`.",
+          "type": "string"
+        },
+        "schema_version": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/Sensitivity",
+          "default": "restricted"
+        },
+        "sequence": {
+          "description": "Producer sequence number, monotonically increasing per connector instance.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source_key": {
+          "description": "Native identity of the source object or event.",
+          "type": "string"
+        },
+        "subject": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time": {
+          "$ref": "#/$defs/ObservationTime"
+        }
+      },
+      "required": [
+        "envelope_version",
+        "observation_id",
+        "connector_instance",
+        "source_key",
+        "revision",
+        "operation",
+        "kind",
+        "schema_version",
+        "time",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "Link": {
+      "properties": {
+        "rel": {
+          "description": "Relationship name, e.g. `session`, `parent`, `caused_by`, `same_as`.",
+          "type": "string"
+        },
+        "target": {
+          "description": "Target identity, usually a `source_key` of another observation.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rel",
+        "target"
+      ],
+      "type": "object"
+    },
+    "MonoStamp": {
+      "properties": {
+        "boot_id": {
+          "$ref": "#/$defs/BootId"
+        },
+        "domain": {
+          "$ref": "#/$defs/ClockDomain"
+        },
+        "nanos": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "domain",
+        "boot_id",
+        "nanos"
+      ],
+      "type": "object"
+    },
+    "ObservationId": {
+      "type": "string"
+    },
+    "ObservationTime": {
+      "properties": {
+        "calibration": {
+          "description": "Id of the latest clock-calibration observation for this device, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mono_end": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MonoStamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mono_start": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MonoStamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed_at": {
+          "description": "When the producer collected it.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "resolution_ms": {
+          "description": "Resolution of the source timestamps, in milliseconds (1000 for whole seconds).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_end": {
+          "description": "End of a span; `None` for point events or open spans.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_start": {
+          "description": "When the event happened according to the source. `None` if the source has no time.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "utc_offset_min": {
+          "description": "UTC offset of the device at capture, in minutes. Needed for civil days.",
+          "format": "int16",
+          "maximum": 32767,
+          "minimum": -32768,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "resolution_ms",
+        "observed_at"
+      ],
+      "type": "object"
+    },
+    "Operation": {
+      "oneOf": [
+        {
+          "const": "observe",
+          "description": "A new immutable observation.",
+          "type": "string"
+        },
+        {
+          "const": "upsert",
+          "description": "A new revision of a mutable source object.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "The source object was deleted at the source.",
+          "type": "string"
+        }
+      ]
+    },
+    "Sensitivity": {
+      "description": "Disclosure class. Unknown data is `Restricted`; a producer label can only\nnarrow disclosure, never grant it (the server applies its own rules).",
+      "enum": [
+        "normal",
+        "sensitive",
+        "restricted"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One upload from a producer. Idempotent: replaying a batch is a no-op.",
+  "properties": {
+    "batch_id": {
+      "type": "string"
+    },
+    "envelopes": {
+      "items": {
+        "$ref": "#/$defs/Envelope"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "batch_id",
+    "envelopes"
+  ],
+  "title": "UploadBatch",
+  "type": "object"
+}

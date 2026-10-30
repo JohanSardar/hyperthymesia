@@ -1,0 +1,53 @@
+{
+  "$defs": {
+    "ObservationId": {
+      "type": "string"
+    },
+    "Rejected": {
+      "properties": {
+        "observation_id": {
+          "$ref": "#/$defs/ObservationId"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "observation_id",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "accepted": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "batch_id": {
+      "type": "string"
+    },
+    "duplicates": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "rejected": {
+      "description": "Envelopes rejected at the boundary, with the reason. Never silently dropped.",
+      "items": {
+        "$ref": "#/$defs/Rejected"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "batch_id",
+    "accepted",
+    "duplicates",
+    "rejected"
+  ],
+  "title": "UploadAck",
+  "type": "object"
+}

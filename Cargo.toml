@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "connectors/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "UNLICENSED"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+hx-schema = { path = "crates/hx-schema" }
+hx-store = { path = "crates/hx-store" }
+hx-jobs = { path = "crates/hx-jobs" }
+hx-visual = { path = "crates/hx-visual" }
+hx-compile = { path = "crates/hx-compile" }
+hx-interpret = { path = "crates/hx-interpret" }
+hx-connector-sdk = { path = "crates/hx-connector-sdk" }
+hx-macos-sys = { path = "crates/hx-macos-sys" }
+hx-agent = { path = "crates/hx-agent" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ulid = { version = "3", features = ["serde"] }
+schemars = { version = "1", features = ["chrono04"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "json", "chrono", "macros", "migrate"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+maud = { version = "0.27", features = ["axum"] }
+zstd = "0.13"
+sha2 = "0.10"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"
+insta = { version = "1", features = ["json"] }
+tempfile = "3"
+
+[profile.dev]
+debug = "line-tables-only"
