@@ -90,25 +90,32 @@ pub fn scan(req: &Request, state: &Value) -> Result<Scan> {
     };
     let mut out = Scan::new(state.clone());
     let mut stmt = db.prepare("SELECT sequence,event_id,event_type,occurred_at,payload_json,stream_id,application_event_version FROM orchestration_events WHERE sequence > ? ORDER BY sequence LIMIT ?")?;
-    let rows = stmt
-        .query_map(sdk::rusqlite::params![position, req.limit as i64], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    out.complete = rows.len() < req.limit;
-    for (seq, id, typ, at, raw, stream, version) in rows {
+    let rows = stmt.query_map(sdk::rusqlite::params![position, 100_000_i64], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)?,
+        ))
+    })?;
+    let mut consumed = 0;
+    for row in rows {
+        let (seq, id, typ, at, raw, stream, version) = row?;
+        consumed += 1;
+        position = seq;
         ensure!(
             version == 1 || version == 2,
             "unsupported T3 application event version"
         );
+        if req
+            .since
+            .is_some_and(|since| timestamp(&json!(at)).is_some_and(|at| at < since))
+        {
+            continue;
+        }
         let payload: Value = serde_json::from_str(&raw)?;
         let thread = payload["threadId"]
             .as_str()
@@ -132,8 +139,12 @@ pub fn scan(req: &Request, state: &Value) -> Result<Scan> {
         {
             out.push(e);
         }
-        position = seq;
+        if out.envelopes.len() >= req.limit {
+            out.complete = false;
+            break;
+        }
     }
+    out.complete &= consumed < 100_000;
     out.next = json!({"generation":generation,"sequence":position});
     Ok(out)
 }
