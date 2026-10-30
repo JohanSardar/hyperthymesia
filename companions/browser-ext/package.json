@@ -1,0 +1,17 @@
+{
+  "name": "hyperthymesia-browser",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "bun build src/background.ts src/content.ts src/options.ts --outdir dist --target browser && cp manifest.json options.html dist/",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.7.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  }
+}
