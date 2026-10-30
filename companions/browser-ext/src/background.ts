@@ -17,19 +17,20 @@ async function patterns(): Promise<string[]> {
   const { excludedPatterns } = await store.get(["excludedPatterns"]);
   return Array.isArray(excludedPatterns) && excludedPatterns.every(x => typeof x === "string") ? [...DEFAULT_EXCLUSIONS, ...excludedPatterns] : DEFAULT_EXCLUSIONS;
 }
-interface State { counter: number; current?: CompanionEvent; page: boolean; url?: string }
+interface State { current?: CompanionEvent; page: boolean; url?: string }
 async function update(id: number, navigation = false, page?: boolean, expectedUrl?: string) {
   const tab = await chrome.tabs.get(id).catch(() => null);
   if (!tab || tab.incognito || !tab.url) return;
   const rules = await patterns();
   const { visits = {} } = await store.get(["visits"]);
-  const s: State = visits[id] ?? {counter: 0, page: false};
+  const s: State = visits[id] ?? {page: false};
   const now = new Date().toISOString();
   if (expectedUrl && expectedUrl !== tab.url) return;
+  const pending: CompanionEvent[] = [];
   if (excluded(tab.url, rules)) {
-    if (s.current) { s.current.ended_at = now; s.current.revision = now; await outbox.add(s.current); }
+    if (s.current && !excluded(String(s.current.payload.url), rules)) { s.current.ended_at = now; s.current.revision = now; pending.push(s.current); }
     // Excluded URL/title/text must never enter durable state.
-    delete visits[id]; await store.set({visits}); return;
+    delete visits[id]; await outbox.addAll(pending, {visits}); return;
   }
   const routeChanged = navigation || s.url !== tab.url;
   if (routeChanged) s.page = false;
@@ -37,15 +38,16 @@ async function update(id: number, navigation = false, page?: boolean, expectedUr
   const focused = await chrome.windows.getLastFocused().catch(() => null);
   const idle = await chrome.idle.queryState(60);
   const isVisible = visible(!!tab.active, tab.windowId, focused?.focused ? focused.id! : -1, s.page, idle);
-  if (s.current && !routeChanged && s.current.payload.visible === isVisible && s.current.payload.title === tab.title) return;
-  if (s.current) { s.current.ended_at = now; s.current.revision = now; await outbox.add(s.current); }
-  s.counter++;
+  if (s.current && !routeChanged && s.current.payload.visible === isVisible && s.current.payload.title === tab.title) {
+    visits[id] = s; await store.set({visits}); return;
+  }
+  if (s.current) { s.current.ended_at = now; s.current.revision = now; pending.push(s.current); }
   // Persist the counter even after tab deletion so reused IDs do not collide.
   const { navCounter = 0 } = await store.get(["navCounter"]);
   s.current = visit(tab, navCounter + 1, isVisible, now); s.current.revision = "open"; s.url = tab.url;
-  await outbox.add(s.current);
+  pending.push(s.current);
   visits[id] = s;
-  await store.set({visits, navCounter: navCounter + 1});
+  await outbox.addAll(pending, {visits, navCounter: navCounter + 1});
 }
 async function refresh() { for (const tab of await chrome.tabs.query({})) if (tab.id !== undefined) await update(tab.id); }
 async function drain() { await outbox.purge(await patterns()); await outbox.flush(); }
@@ -61,8 +63,8 @@ for (const hook of [chrome.webNavigation.onCommitted, chrome.webNavigation.onHis
 chrome.tabs.onRemoved.addListener(id => enqueue(async () => {
   const {visits = {}} = await store.get(["visits"]);
   const current = visits[id]?.current;
-  if (current) { current.ended_at = new Date().toISOString(); current.revision = current.ended_at; await outbox.add(current); }
-  delete visits[id]; await store.set({visits}); await drain();
+  if (current) { current.ended_at = new Date().toISOString(); current.revision = current.ended_at; }
+  delete visits[id]; await outbox.addAll(current ? [current] : [], {visits}); await drain();
 }));
 chrome.idle.onStateChanged.addListener(() => enqueue(async () => { await refresh(); await drain(); }));
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {

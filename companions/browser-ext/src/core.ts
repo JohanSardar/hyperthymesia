@@ -22,11 +22,14 @@ export const visible = (active: boolean, windowId: number, focused: number, page
 export interface Store { get(keys: string[]): Promise<Record<string, any>>; set(value: Record<string, any>): Promise<void> }
 export class Outbox {
   constructor(private store: Store, private send: (e: CompanionEvent) => Promise<boolean>) {}
-  async add(e: CompanionEvent) {
+  async add(e: CompanionEvent) { await this.addAll([e]); }
+  async addAll(events: CompanionEvent[], state: Record<string, unknown> = {}) {
     const { outbox = [] } = await this.store.get(["outbox"]);
-    if (!outbox.some((x: CompanionEvent) => x.source_key === e.source_key && x.revision === e.revision)) {
-      await this.store.set({ outbox: [...outbox, e] });
+    for (const e of events) {
+      if (!outbox.some((x: CompanionEvent) => x.source_key === e.source_key && x.revision === e.revision)) outbox.push(e);
     }
+    // The next visit identity and its pending observations commit together.
+    await this.store.set({ ...state, outbox });
   }
   async purge(patterns: string[]) {
     const { outbox = [] } = await this.store.get(["outbox"]);
