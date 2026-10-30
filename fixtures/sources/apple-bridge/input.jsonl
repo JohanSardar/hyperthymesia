@@ -1,0 +1,5 @@
+{"collection":"usage.app_day","data":{"bundle_id":"h_app","day":"2000-01-01","device_id":{"$ref":{"collection":"usage.device","native_key":"h_d1"}},"seconds_estimated":123.5,"uncertainty":"xxxxxxxx"},"deleted":false,"id":"h_u1","version":1}
+{"collection":"usage.app_day","data":{"bundle_id":"h_app","day":"2000-01-01","device_id":{"$ref":{"collection":"usage.device","native_key":"h_d1"}},"seconds_estimated":200.0,"uncertainty":"xxxxxxxx"},"deleted":false,"id":"h_u1","version":2}
+{"collection":"messages.message","data":{"chat_id":"h_chat","is_from_me":true,"sent_at":"2000-01-01T00:00:00Z","service":"h_service","text":"xxxxxxxx"},"deleted":false,"id":"h_m1","version":1}
+{"collection":"calendar.event","data":{"end":"2000-01-01T01:00:00Z","start":"2000-01-01T00:00:00Z","title":"h_title"},"deleted":false,"id":"h_c1","version":1}
+{"collection":"usage.app_day","data":{},"deleted":true,"id":"h_u1","version":3}
