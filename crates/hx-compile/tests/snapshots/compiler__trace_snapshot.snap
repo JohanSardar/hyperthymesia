@@ -87,7 +87,7 @@ expression: "compile(&observations, truth.window)"
         "end": "2026-01-01T00:03:00Z"
       },
       "state": "observed",
-      "reason": "synthetic:desktop:evidence"
+      "reason": "synthetic:desktop[focus]:evidence"
     },
     {
       "lane_key": "device:synthetic-desktop",
@@ -96,7 +96,7 @@ expression: "compile(&observations, truth.window)"
         "end": "2026-01-01T00:10:00Z"
       },
       "state": "unknown",
-      "reason": "synthetic:desktop:collector gap"
+      "reason": "synthetic:desktop[focus]:collector gap"
     }
   ],
   "aggregates": []
