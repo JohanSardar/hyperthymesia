@@ -55,7 +55,7 @@ fn run_inner(
     let mut hour = Instant::now();
     let mut spent = 0u64;
     let mut last_hash = String::new();
-    let mut last_health = Instant::now() - Duration::from_secs(60);
+    let mut last_health = Instant::now() - Duration::from_secs(45);
     let mut retry = Instant::now() - Duration::from_secs(60);
     while !stop.load(Ordering::Relaxed) {
         let mut focus = context.lock().expect("capture context").clone();
@@ -68,8 +68,33 @@ fn run_inner(
             && focus.as_ref().is_some_and(|f| {
                 policy.allows(&f.bundle_id, f.title.as_deref()) && !browser(f) && f.title.is_some()
             });
-        if last_health.elapsed() >= Duration::from_secs(60) {
+        if last_health.elapsed() >= Duration::from_secs(45) {
             last_health = Instant::now();
+            let mut clock = producer.core(
+                format!("clock-health:{}", ulid::Ulid::generate()),
+                "0",
+                Operation::Observe,
+                CorePayload::CollectorHealth(CollectorHealth {
+                    collector: "clock".into(),
+                    status: CollectorStatus::Running,
+                    last_sequence: producer.last_for("clock").map(|v| v.0),
+                    last_observed_at: producer.last_for("clock").map(|v| v.1),
+                    queue_age_ms: None,
+                    dropped: 0,
+                    detail: None,
+                }),
+            );
+            clock.coverage = Some(Coverage {
+                scope: "clock".into(),
+                completeness: Completeness::Partial,
+            });
+            tx.blocking_send(Submission {
+                envelope: clock,
+                reply: None,
+                focus: None,
+                secure: false,
+                blobs: vec![],
+            })?;
             let granted = hx_macos_sys::permissions().screen;
             let status = if !granted {
                 CollectorStatus::PermissionDenied

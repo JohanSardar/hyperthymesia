@@ -24,15 +24,11 @@ impl Producer {
         self
     }
     pub fn last_for(&self, collector: &str) -> Option<(u64, chrono::DateTime<Utc>)> {
-        let kind = match collector {
-            "focus" => "focus.span",
-            "presence" => "presence.span",
-            "accessibility" => "text.snapshot",
-            "input" => "input.bucket",
-            "media" => "media.chunk",
-            _ => return None,
-        };
-        self.last.get(kind).copied()
+        self.last
+            .iter()
+            .filter(|(kind, _)| kind.split('.').next() == Some(collector))
+            .map(|(_, sample)| *sample)
+            .max_by_key(|(sequence, _)| *sequence)
     }
     pub fn time(&self) -> ObservationTime {
         let mut t = ObservationTime::point(Utc::now());

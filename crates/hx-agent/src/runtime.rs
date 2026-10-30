@@ -44,7 +44,7 @@ pub fn status() -> Result<serde_json::Value> {
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     Ok(
-        serde_json::json!({"health":latest_health,"permissions":p,"profile":Profile::select(power,&cfg),"secure_input":hx_macos_sys::secure_input(),"collectors":{"focus":"available","presence":"available","accessibility":if p.accessibility {"available"}else {"permission_denied"},"input":if p.input {"available"}else {"permission_denied"},"media":if p.screen {"not_started"}else {"permission_denied"}}}),
+        serde_json::json!({"health":latest_health,"permissions":p,"profile":Profile::select(power,&cfg),"secure_input":hx_macos_sys::secure_input(),"collectors":{"focus":"available","presence":"available","text":if p.accessibility {"available"}else {"permission_denied"},"ui":if p.accessibility && p.input {"available"}else {"permission_denied"},"clock":"available","input":if p.input {"available"}else {"permission_denied"},"media":if p.screen {"not_started"}else {"permission_denied"}}}),
     )
 }
 fn io_worker(
@@ -285,11 +285,26 @@ pub fn run(options: RunOptions) -> Result<()> {
             }
         }
     };
+    let emit_gap = |e: Envelope| -> Result<()> {
+        emit(e.clone(), None)?;
+        for connector in [
+            format!("macos-media:{}", cfg.device_id),
+            format!("companion:browser:{}", cfg.device_id),
+            format!("companion:editor:{}", cfg.device_id),
+            format!("companion:shell:{}", cfg.device_id),
+        ] {
+            let mut copy = e.clone();
+            copy.observation_id = ObservationId::generate();
+            copy.connector_instance = ConnectorInstance::new(connector);
+            emit(copy, None)?;
+        }
+        Ok(())
+    };
     emit(producer.calibration(), None)?;
     let mut input = hx_macos_sys::InputTap::start();
     let start = Instant::now();
     let mut last_tick = Instant::now() - Duration::from_secs(1);
-    let mut last_health = Instant::now() - Duration::from_secs(60);
+    let mut last_health = Instant::now() - Duration::from_secs(45);
     let mut last_text = Instant::now();
     let mut focus: Option<Focus> = None;
     let mut focus_span: Option<Envelope> = None;
@@ -303,6 +318,8 @@ pub fn run(options: RunOptions) -> Result<()> {
     let ax = crate::accessibility::Worker::start();
     let mut ax_dropped = 0u64;
     let mut buckets = crate::input::Buckets::new(hx_macos_sys::continuous_nanos());
+    let mut policy_gap = crate::gap::PolicyGap::default();
+    let mut last_gap_update = Instant::now();
     let mut last_permissions = hx_macos_sys::permissions();
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed)
@@ -341,6 +358,11 @@ pub fn run(options: RunOptions) -> Result<()> {
                             }
                             let allowed =
                                 policy.allows(&activated.bundle_id, activated.title.as_deref());
+                            if let Some(gap) =
+                                policy_gap.observe(!allowed, event_time.clone(), &mut producer)
+                            {
+                                emit_gap(gap)?;
+                            }
                             let mut span = producer.core(
                                 format!("focus:{}", ulid::Ulid::generate()),
                                 "0",
@@ -429,11 +451,21 @@ pub fn run(options: RunOptions) -> Result<()> {
                     f.title = ax.title(f.pid);
                 }
                 if current != focus {
+                    if current.is_none()
+                        && let Some(gap) = policy_gap.observe(false, producer.time(), &mut producer)
+                    {
+                        emit_gap(gap)?;
+                    }
                     if let Some(span) = focus_span.take() {
                         emit(close_span(&span, &mut producer), None)?;
                     }
                     if let Some(f) = &current {
                         let allowed = policy.allows(&f.bundle_id, f.title.as_deref());
+                        if let Some(gap) =
+                            policy_gap.observe(!allowed, producer.time(), &mut producer)
+                        {
+                            emit_gap(gap)?;
+                        }
                         let mut span = producer.core(
                             format!("focus:{}", ulid::Ulid::generate()),
                             "0",
@@ -456,7 +488,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                         emit(
                             health(
                                 &mut producer,
-                                "accessibility",
+                                "text",
                                 CollectorStatus::Running,
                                 Some(format!(
                                     "AX notification registration errors {:?}; bounded polling remains active",
@@ -472,6 +504,19 @@ pub fn run(options: RunOptions) -> Result<()> {
                     last_text = Instant::now() - Duration::from_secs(3600);
                     last_text_hash.clear();
                 }
+            }
+            if tick
+                && last_gap_update.elapsed() >= Duration::from_secs(10)
+                && let Some(gap) = policy_gap.observe(
+                    focus
+                        .as_ref()
+                        .is_some_and(|f| !policy.allows(&f.bundle_id, f.title.as_deref())),
+                    producer.time(),
+                    &mut producer,
+                )
+            {
+                emit_gap(gap)?;
+                last_gap_update = Instant::now();
             }
             let content_allowed = !paused.load(Ordering::Relaxed)
                 && !locked
@@ -639,12 +684,18 @@ pub fn run(options: RunOptions) -> Result<()> {
                 input = hx_macos_sys::InputTap::start();
                 last_permissions = permissions;
             }
-            if last_health.elapsed() >= Duration::from_secs(60) || permission_change {
+            if last_health.elapsed() >= Duration::from_secs(45) || permission_change {
                 last_health = Instant::now();
                 for (collector, granted, implemented) in [
                     ("focus", true, true),
                     ("presence", true, true),
-                    ("accessibility", permissions.accessibility, true),
+                    ("text", permissions.accessibility, true),
+                    (
+                        "ui",
+                        permissions.accessibility && permissions.input,
+                        input.is_some(),
+                    ),
+                    ("clock", true, true),
                     ("input", permissions.input, input.is_some()),
                     ("media", permissions.screen, !options.dry_run),
                 ] {
@@ -655,7 +706,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                         CollectorStatus::PermissionDenied
                     } else if !implemented {
                         CollectorStatus::Failed
-                    } else if ["accessibility", "media"].contains(&collector) && !native_allowed {
+                    } else if ["text", "ui", "media"].contains(&collector) && !native_allowed {
                         CollectorStatus::Paused
                     } else {
                         CollectorStatus::Running
@@ -680,7 +731,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                             detail,
                             if ["focus", "presence"].contains(&collector) {
                                 main_loop.dropped()
-                            } else if collector == "accessibility" {
+                            } else if ["text", "ui"].contains(&collector) {
                                 ax_dropped + ax.dropped.load(Ordering::Relaxed)
                             } else if collector == "input" {
                                 input.as_ref().map_or(0, |t| t.dropped()) + buckets.dropped
@@ -692,6 +743,9 @@ pub fn run(options: RunOptions) -> Result<()> {
                     )?;
                 }
             }
+        }
+        if let Some(gap) = policy_gap.observe(false, producer.time(), &mut producer) {
+            emit_gap(gap)?;
         }
         if let Some(span) = focus_span.take() {
             emit(close_span(&span, &mut producer), None)?;
@@ -762,5 +816,44 @@ mod tests {
         closed.validate().unwrap();
         assert_eq!(closed.time.duration().unwrap().nanos, 0);
         assert_eq!(closed.coverage.unwrap().completeness, Completeness::Unknown);
+    }
+    #[test]
+    fn health_namespaces_map_to_the_real_compilers_collector_coverage() {
+        let mut p = Producer::new("test".into()).unwrap();
+        let start = p.time().observed_at;
+        let namespaces = ["focus", "presence", "input", "ui", "text", "media", "clock"];
+        let observations: Vec<_> = namespaces
+            .iter()
+            .enumerate()
+            .map(|(id, namespace)| {
+                let mut envelope = health(
+                    &mut p,
+                    namespace,
+                    CollectorStatus::PermissionDenied,
+                    None,
+                    0,
+                );
+                envelope.time.source_start = Some(start);
+                hx_compile::Observation {
+                    id: id as i64 + 1,
+                    received_at: envelope.time.observed_at,
+                    envelope,
+                }
+            })
+            .collect();
+        let timeline = hx_compile::compile(
+            &observations,
+            Interval::new(start, start + chrono::Duration::seconds(30)).unwrap(),
+        );
+        for namespace in namespaces {
+            assert!(
+                timeline.coverage.iter().any(|coverage| coverage
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(&format!("[{namespace}]:")))
+                    && coverage.state == hx_compile::CoverageState::Unknown),
+                "{namespace}"
+            );
+        }
     }
 }

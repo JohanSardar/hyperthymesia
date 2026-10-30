@@ -709,6 +709,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "hx-compile",
  "hx-macos-sys",
  "hx-schema",
  "regex",
