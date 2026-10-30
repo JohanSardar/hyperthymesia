@@ -105,14 +105,21 @@ async fn main() -> Result<()> {
                 provider: processing::coordinator_provider(ProviderConfig::from_env()),
             };
             let worker = tokio::spawn(async move {
-                let mut schedule = tokio::time::interval(std::time::Duration::from_secs(60));
+                let mut next_schedule = tokio::time::Instant::now();
                 loop {
-                    tokio::select! {
-                        _=schedule.tick()=>{if let Err(e)=processing::schedule(&runner.store).await{tracing::error!("scheduler failed: {e:#}");}},
-                        _=tokio::time::sleep(std::time::Duration::from_millis(200))=>{
-                            if let Err(e)=hx_jobs::run_one(&runner.store.pool,&runner).await{tracing::error!("processing failed: {e:#}");}
+                    if tokio::time::Instant::now() >= next_schedule {
+                        next_schedule =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                        if let Err(e) = processing::schedule(&runner.store).await {
+                            tracing::error!("scheduler failed: {e:#}");
                         }
                     }
+                    match hx_jobs::run_one(&runner.store.pool, &runner).await {
+                        Ok(true) => continue,
+                        Err(e) => tracing::error!("processing failed: {e:#}"),
+                        Ok(false) => {}
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             });
             let result = axum::serve(listener, hx_server::router(store))

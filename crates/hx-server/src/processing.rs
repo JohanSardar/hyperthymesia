@@ -1,8 +1,8 @@
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use chrono::{Duration, Utc};
 use hx_compile::Timeline;
 use hx_interpret::{EvidenceItem, Provider};
-use hx_jobs::{Handler, Job};
+use hx_jobs::{Deferred, Failure, Handler, Job};
 use hx_schema::{Interval, Sensitivity};
 use hx_store::Store;
 use serde_json::json;
@@ -61,10 +61,12 @@ impl Provider for StubProvider {
     async fn complete(
         &self,
         _system: &str,
-        user: &str,
+        _user: &str,
     ) -> Result<String, hx_interpret::InterpretError> {
-        let packet: serde_json::Value = serde_json::from_str(user).unwrap_or_default();
-        Ok(json!({"window":packet["window"],"episodes":[],"tasks":[],"summary":"Stub provider: no inferred activity.","provenance":{"input_digest":packet["input_digest"],"compiler_version":hx_compile::COMPILER_VERSION,"prompt_version":hx_interpret::PROMPT_VERSION,"model":"stub","created_at":Utc::now()},"check_failures":[]}).to_string())
+        Ok(
+            json!({"episodes":[],"tasks":[],"summary":"Stub provider: no inferred activity."})
+                .to_string(),
+        )
     }
 }
 pub async fn compile_window(store: &Store, w: Interval) -> Result<(Timeline, i64)> {
@@ -72,12 +74,17 @@ pub async fn compile_window(store: &Store, w: Interval) -> Result<(Timeline, i64
     let pending:i64=sqlx::query_scalar("SELECT count(*) FROM events e WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 AND NOT EXISTS(SELECT 1 FROM normalized n WHERE n.event_id=e.id) AND NOT EXISTS(SELECT 1 FROM quarantine q WHERE q.event_id=e.id)")
         .bind(w.start).bind(w.end).fetch_one(&store.pool).await?;
     if pending > 0 {
-        bail!("normalization pending");
+        return Err(Deferred::NormalizationPending.into());
+    }
+    let cached: Option<serde_json::Value> = sqlx::query_scalar("SELECT timeline FROM windows WHERE start_at=$1 AND generation=$2 AND compiled_generation=$2 AND compiler_version=$3 AND timeline IS NOT NULL")
+        .bind(w.start).bind(generation).bind(hx_compile::COMPILER_VERSION).fetch_optional(&store.pool).await?;
+    if let Some(timeline) = cached {
+        return Ok((serde_json::from_value(timeline)?, generation));
     }
     let observations = store.observations(w, true).await?;
     let timeline = hx_compile::compile(&observations, w);
     if !store.save_timeline(&timeline, generation).await? {
-        bail!("input generation changed");
+        return Err(Deferred::InputChanged.into());
     }
     Ok((timeline, generation))
 }
@@ -109,10 +116,18 @@ async fn interpret_window_key<P: Provider>(
         generation,
         namespaces,
     } = prepare_input(store, w, &provider.name()).await?;
-    let interpretation = hx_interpret::interpret(&packet, provider).await?;
+    let interpretation = hx_interpret::interpret(&packet, provider)
+        .await
+        .map_err(|error| {
+            let category = match &error {
+                hx_interpret::InterpretError::Provider(_) => Failure::Provider,
+                hx_interpret::InterpretError::Parse(_) => Failure::ModelOutput,
+            };
+            anyhow::Error::new(error).context(category)
+        })?;
     let failures = hx_interpret::check(&interpretation, &packet);
     if !failures.is_empty() {
-        bail!("interpretation failed evidence checks");
+        return Err(Failure::EvidenceChecks.into());
     }
     let mut value = serde_json::to_value(interpretation)?;
     value["input_manifest"] = manifest;
@@ -150,7 +165,7 @@ pub async fn prepare_input(
     let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM events e WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 AND NOT EXISTS(SELECT 1 FROM normalized n WHERE n.event_id=e.id) AND NOT EXISTS(SELECT 1 FROM quarantine q WHERE q.event_id=e.id)")
         .bind(expanded.start).bind(expanded.end).fetch_one(&store.pool).await?;
     if pending > 0 {
-        bail!("overlap normalization pending");
+        return Err(Deferred::NormalizationPending.into());
     }
     let observations = store.observations(expanded, true).await?;
     let evidence: Vec<EvidenceItem> = observations
@@ -177,9 +192,10 @@ pub async fn prepare_input(
         })
         .map(|i| i.tasks.into_iter().filter(|t| t.open).collect::<Vec<_>>())
         .unwrap_or_default();
+    let evidence_ids: std::collections::HashSet<_> = evidence.iter().map(|e| e.id).collect();
     let mut namespaces: std::collections::BTreeSet<String> = observations
         .iter()
-        .filter(|o| evidence.iter().any(|e| e.id == o.id))
+        .filter(|o| evidence_ids.contains(&o.id))
         .map(|o| o.envelope.connector_instance.to_string())
         .collect();
     for r in entity_rows {
@@ -194,7 +210,7 @@ pub async fn prepare_input(
     // Compile only the public evidence projection: captured strings never bypass egress policy.
     let safe_observations: Vec<_> = observations
         .into_iter()
-        .filter(|o| evidence.iter().any(|e| e.id == o.id))
+        .filter(|o| evidence_ids.contains(&o.id))
         .collect();
     let safe_timeline = hx_compile::compile(&safe_observations, expanded);
     let mut packet = hx_interpret::build_packet(&safe_timeline, &evidence, &entities, &open_tasks);
@@ -216,14 +232,16 @@ impl<P: Provider> Handler for Runner<P> {
     async fn handle(&self, job: &Job) -> Result<()> {
         match job.kind.as_str() {
             "normalize" => {
-                self.store
-                    .normalize(job.payload["event_id"].as_i64().context("event_id")?)
-                    .await?
+                if let Some(id) = job.payload["event_id"].as_i64() {
+                    self.store.normalize(id).await?;
+                } else {
+                    let w = serde_json::from_value(job.payload["window"].clone())?;
+                    self.store.normalize_window(w).await?;
+                }
             }
             "compile" => {
                 let w: Interval = serde_json::from_value(job.payload["window"].clone())?;
-                compile_window(&self.store, w).await?;
-                let generation = self.store.generation(w).await?;
+                let (_, generation) = compile_window(&self.store, w).await?;
                 let mut tx = self.store.pool.begin().await?;
                 hx_jobs::enqueue(
                     &mut tx,
@@ -250,7 +268,7 @@ impl<P: Provider> Handler for Runner<P> {
                 interpret_window_key(&self.store, w, &self.provider, &format!("job:{}", job.id))
                     .await?;
             }
-            _ => bail!("unknown job kind"),
+            _ => return Err(Failure::UnsupportedJob.into()),
         }
         Ok(())
     }
@@ -266,15 +284,7 @@ pub async fn schedule(store: &Store) -> Result<()> {
             end: r.get("end_at"),
         };
         let generation: i64 = r.get("generation");
-        hx_jobs::enqueue(
-            &mut tx,
-            &format!("compile:{}:{generation}", w.start),
-            "compile",
-            json!({"window":w}),
-            false,
-            Utc::now(),
-        )
-        .await?;
+        hx_store::request_window_job(&mut tx, "compile", w, generation).await?;
     }
     tx.commit().await?;
     Ok(())
