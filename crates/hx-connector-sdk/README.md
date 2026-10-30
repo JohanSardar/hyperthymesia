@@ -29,10 +29,23 @@ checkpoint its successfully collected prefix; it never implies deletions.
 
 Dry runs always backfill from the start, print envelope NDJSON to stdout, report
 coverage to stderr, and neither read nor write connector state. A normal sync
-reads at most one bounded prefix per JSONL file or T3 feed per invocation; repeat
-sync until `complete` is true. Limits are upper bounds, so metadata-only lines
-can produce fewer envelopes. `--since` filters source timestamps, consuming older
-records on normal sync. Use a new instance for an independent historical backfill.
+uploads and checkpoints up to 100 bounded batches per invocation, stopping when
+`complete` is true, the cursor stops progressing, or 30 seconds have elapsed
+between batches. A slow source read or upload can exceed that soft time budget.
+Repeat sync if the final report still has `complete:false`. Every batch has its
+own durable pending record and matching acknowledgement before the next scan.
+`--limit` bounds each batch. T3 and Codex consume older records without spending
+the envelope limit on them; source scans also cap raw records at 100,000 per T3
+scan or JSONL file to bound work when everything is excluded. Other sources may
+emit fewer envelopes for metadata-only or excluded records. `--since` filters
+source timestamps inclusively; records with unknown timestamps remain eligible.
+Use a new instance for an independent historical backfill.
+
+Codex cursor maps use versioned, lossless zstd compression (hex encoded in the
+state JSON); legacy maps are read and upgraded on the next acknowledged batch.
+Offsets, rotation anchors, and parsing context remain intact. File names and
+mtime are not used as timestamp filters: rollouts may contain later appended
+records or timestamps out of order.
 
 Codex tails both plain and zstd rollouts, with offsets in decompressed bytes for
 zstd. Claude tails project/subagent logs and the history index. Native identities
