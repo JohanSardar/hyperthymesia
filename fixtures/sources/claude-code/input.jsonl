@@ -1,0 +1,3 @@
+{"aiTitle":"h_title","sessionId":"h_s1","type":"ai-title"}
+{"isSidechain":true,"message":{"content":[{"text":"xxxxxxxx","type":"text"}],"model":"h_model","role":"assistant"},"parentUuid":"h_p1","sessionId":"h_s1","timestamp":"2000-01-01T00:00:00Z","type":"assistant","uuid":"h_m1"}
+{"message":{"content":[{"content":"xxxxxxxx","tool_use_id":"h_call","type":"tool_result"}],"role":"user"},"parentUuid":"h_m1","sessionId":"h_s1","timestamp":"2000-01-01T00:00:01Z","type":"user","uuid":"h_m2"}
