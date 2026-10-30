@@ -1,0 +1,18 @@
+{
+  "name": "hyperthymesia-editor",
+  "displayName": "Hyperthymesia Companion",
+  "description": "Semantic editor focus and debug session observations for the local Hyperthymesia agent.",
+  "publisher": "hyperthymesia",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.85.0" },
+  "main": "./dist/extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["ui"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false } },
+  "scripts": {
+    "build": "bun build src/extension.ts --outdir dist --target node --format cjs --external vscode",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": { "@types/vscode": "^1.85.0", "@types/node": "^22.0.0", "@types/bun": "^1.3.0", "typescript": "^5.7.0" }
+}

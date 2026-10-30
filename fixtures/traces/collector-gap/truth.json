@@ -1,0 +1,15 @@
+{
+  "window": {
+    "start": "2026-01-01T00:00:00Z",
+    "end": "2026-01-01T00:10:00Z"
+  },
+  "intervals": [],
+  "coverage": [
+    {
+      "start": "2026-01-01T00:01:00Z",
+      "end": "2026-01-01T00:03:00Z",
+      "state": "unknown"
+    }
+  ],
+  "aggregates": []
+}

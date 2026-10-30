@@ -1,0 +1,4 @@
+{"payload":{"cwd":"h_path","id":"h_s1","originator":"h_origin"},"timestamp":"2000-01-01T00:00:00Z","type":"session_meta"}
+{"payload":{"model":"h_model","turn_id":"h_t1"},"timestamp":"2000-01-01T00:00:00Z","type":"turn_context"}
+{"payload":{"content":[{"text":"xxxxxxxx","type":"output_text"}],"id":"h_m1","role":"assistant","type":"message"},"timestamp":"2000-01-01T00:00:01Z","type":"response_item"}
+{"payload":{"content":[{"text":"xxxxxxxxxxxxxxxx","type":"output_text"}],"id":"h_m1","role":"assistant","type":"message"},"timestamp":"2000-01-01T00:00:02Z","type":"response_item"}

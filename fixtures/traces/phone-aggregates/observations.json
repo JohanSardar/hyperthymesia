@@ -1,0 +1,28 @@
+[
+  {
+    "id": 1,
+    "received_at": "2026-01-01T00:00:05Z",
+    "envelope": {
+      "envelope_version": 1,
+      "observation_id": "00000000000000000000000001",
+      "connector_instance": "synthetic:desktop",
+      "source_key": "1",
+      "revision": "0",
+      "operation": "observe",
+      "kind": "usage.aggregate",
+      "schema_version": 1,
+      "time": {
+        "source_start": "2026-01-01T00:00:00Z",
+        "observed_at": "2026-01-01T00:00:00Z",
+        "resolution_ms": 1000
+      },
+      "device": "synthetic-phone",
+      "payload": {
+        "device_label": "Synthetic Phone",
+        "app": "Reader",
+        "day": "2026-01-01",
+        "seconds_estimated": 900
+      }
+    }
+  }
+]
