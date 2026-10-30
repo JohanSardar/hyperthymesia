@@ -53,6 +53,7 @@ impl Outbox {
             "event budget exhausted; capture must pause (no unacknowledged event removed)"
         );
         for (reference, data) in blobs {
+            ensure!(envelope.blobs.contains(reference), "unreferenced blob");
             ensure!(
                 reference.sha256 == hx_schema::sha256_hex(data)
                     && reference.bytes == data.len() as u64,
@@ -125,14 +126,21 @@ impl Outbox {
                 params![sha, bytes as i64],
             )?;
             // Replace unuploaded media observations with an explicit loss event atomically. In-flight observations are protected above.
-            let original:Option<Vec<u8>>=tx.query_row("SELECT json FROM events WHERE id IN (SELECT event FROM refs WHERE sha=?) LIMIT 1",[&sha],|r|r.get(0)).optional()?;
+            let mut affected=tx.prepare("SELECT json FROM events WHERE id IN (SELECT event FROM refs WHERE sha=?) ORDER BY id")?;
+            let originals = affected
+                .query_map([&sha], |r| r.get::<_, Vec<u8>>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(affected);
             tx.execute(
                 "DELETE FROM events WHERE id IN (SELECT event FROM refs WHERE sha=?)",
                 [&sha],
             )?;
-            tx.execute("DELETE FROM refs WHERE sha=?", [&sha])?;
+            tx.execute(
+                "DELETE FROM refs WHERE event NOT IN (SELECT id FROM events)",
+                [],
+            )?;
             tx.execute("DELETE FROM blobs WHERE sha=?", [&sha])?;
-            if let Some(json) = original {
+            for json in originals {
                 let old: Envelope = serde_json::from_slice(&json)?;
                 let payload = hx_schema::kinds::CorePayload::CollectorHealth(
                     hx_schema::kinds::CollectorHealth {
