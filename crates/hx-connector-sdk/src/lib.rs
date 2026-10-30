@@ -14,7 +14,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub use chrono;
@@ -22,6 +22,7 @@ pub use hx_schema;
 pub use reqwest;
 pub use rusqlite;
 pub use serde_json;
+pub use zstd;
 pub const TEXT_CAP: usize = 32_768;
 
 #[derive(Parser, Debug)]
@@ -217,20 +218,28 @@ pub fn run_cli(
     if state.pending.is_some() {
         deliver(&path, &mut state, &server, &token)?;
     }
-    let result = scan(&req, &state.cursor)?;
-    for e in &result.envelopes {
-        e.validate()?;
+    let started = Instant::now();
+    for _ in 0..100 {
+        let result = scan(&req, &state.cursor)?;
+        for e in &result.envelopes {
+            e.validate()?;
+        }
+        let progressed = result.next != state.cursor;
+        state.pending = Some(Pending {
+            batch: UploadBatch {
+                batch_id: ulid::Ulid::generate(),
+                envelopes: result.envelopes.clone(),
+            },
+            next: result.next.clone(),
+        });
+        atomic_json(&path, &state)?;
+        deliver(&path, &mut state, &server, &token)?;
+        report(&result);
+        // A partial line or unavailable source must not become a busy loop.
+        if result.complete || !progressed || started.elapsed() >= Duration::from_secs(30) {
+            break;
+        }
     }
-    state.pending = Some(Pending {
-        batch: UploadBatch {
-            batch_id: ulid::Ulid::generate(),
-            envelopes: result.envelopes.clone(),
-        },
-        next: result.next.clone(),
-    });
-    atomic_json(&path, &state)?;
-    deliver(&path, &mut state, &server, &token)?;
-    report(&result);
     Ok(())
 }
 fn report(s: &Scan) {
@@ -482,6 +491,23 @@ pub fn tail(
     saved: &TailCursor,
     budget: usize,
 ) -> Result<(Vec<TailLine>, TailCursor, bool)> {
+    let mut lines = vec![];
+    let (cursor, complete) = tail_each(path, saved, budget, |line, _, _| {
+        lines.push(line);
+        Ok(true)
+    })?;
+    Ok((lines, cursor, complete))
+}
+
+/// Stream JSONL records, counting only records accepted by the visitor against the
+/// output budget. Context changes and offsets are checkpointed together. A raw
+/// record cap bounds scans even when every record is excluded by a time filter.
+pub fn tail_each(
+    path: &Path,
+    saved: &TailCursor,
+    budget: usize,
+    mut visit: impl FnMut(TailLine, &mut Value, &str) -> Result<bool>,
+) -> Result<(TailCursor, bool)> {
     use std::os::unix::fs::MetadataExt;
     let file = File::open(path)?;
     let meta = file.metadata()?;
@@ -517,7 +543,7 @@ pub fn tail(
         let mut r = zstd::stream::read::Decoder::new(file)?;
         let skipped = std::io::copy(&mut r.by_ref().take(cursor.offset), &mut std::io::sink())?;
         if skipped != cursor.offset {
-            return tail(path, &TailCursor::default(), budget);
+            return tail_each(path, &TailCursor::default(), budget, visit);
         }
         Box::new(r)
     } else {
@@ -526,9 +552,10 @@ pub fn tail(
         Box::new(r)
     };
     let mut reader = BufReader::new(reader);
-    let mut lines = vec![];
+    let mut accepted = 0;
+    let mut records = 0;
     let mut complete = true;
-    while lines.len() < budget {
+    while accepted < budget && records < 100_000 {
         let mut bytes = vec![];
         let n = reader.read_until(b'\n', &mut bytes)?;
         if n == 0 {
@@ -538,6 +565,7 @@ pub fn tail(
             complete = false;
             break;
         }
+        records += 1;
         let offset = cursor.offset;
         cursor.offset += n as u64;
         if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -545,13 +573,19 @@ pub fn tail(
         }
         let value = serde_json::from_slice(&bytes)
             .context("invalid complete JSONL record; checkpoint retained")?;
-        lines.push(TailLine {
-            value,
-            offset,
-            end: cursor.offset,
-        });
+        if visit(
+            TailLine {
+                value,
+                offset,
+                end: cursor.offset,
+            },
+            &mut cursor.context,
+            &cursor.generation,
+        )? {
+            accepted += 1;
+        }
     }
-    if lines.len() == budget {
+    if accepted == budget || records == 100_000 {
         complete = false;
     }
     let file = File::open(path)?;
@@ -566,14 +600,40 @@ pub fn tail(
         .take(cursor.offset.min(64))
         .read_to_end(&mut anchor)?;
     cursor.anchor = hx_schema::sha256_hex(&anchor);
-    Ok((lines, cursor, complete))
+    Ok((cursor, complete))
 }
 pub fn tail_state(state: &Value) -> Result<BTreeMap<String, TailCursor>> {
     if state.is_null() {
         Ok(BTreeMap::new())
+    } else if let Some(hex) = state["zstd_tail_v1"].as_str() {
+        ensure!(hex.len().is_multiple_of(2), "invalid compact tail state");
+        let bytes = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair)?;
+                Ok(u8::from_str_radix(pair, 16)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(serde_json::from_slice(&zstd::decode_all(
+            bytes.as_slice(),
+        )?)?)
     } else {
         Ok(serde_json::from_value(state.clone())?)
     }
+}
+/// Lossless, versioned compression keeps large per-file maps small on disk.
+/// Legacy object maps remain readable; no offsets or parsing context are dropped.
+pub fn compact_tail_state(positions: &BTreeMap<String, TailCursor>) -> Result<Value> {
+    use std::fmt::Write as _;
+    let bytes = zstd::encode_all(serde_json::to_vec(positions)?.as_slice(), 1)?;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(hex, "{byte:02x}")?;
+    }
+    Ok(json!({"zstd_tail_v1":hex}))
 }
 pub fn after_since(req: &Request, e: &Envelope) -> bool {
     req.since

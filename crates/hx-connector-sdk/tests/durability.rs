@@ -42,6 +42,17 @@ fn server(
     Arc<Mutex<Vec<hx_schema::UploadBatch>>>,
     std::thread::JoinHandle<()>,
 ) {
+    server_with_ack(status, count, true)
+}
+fn server_with_ack(
+    status: u16,
+    count: usize,
+    matching: bool,
+) -> (
+    String,
+    Arc<Mutex<Vec<hx_schema::UploadBatch>>>,
+    std::thread::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = format!("http://{}", listener.local_addr().unwrap());
     let batches = Arc::new(Mutex::new(vec![]));
@@ -84,6 +95,13 @@ fn server(
                 .unwrap()
             } else {
                 "{}".into()
+            };
+            let body = if matching || status != 200 {
+                body
+            } else {
+                let mut ack: serde_json::Value = serde_json::from_str(&body).unwrap();
+                ack["batch_id"] = json!("00000000000000000000000000");
+                ack.to_string()
             };
             captured.lock().unwrap().push(batch);
             write!(socket,"HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
@@ -213,4 +231,83 @@ fn readonly_sqlite_sees_wal_and_refuses_writes() {
             .execute("INSERT INTO evidence VALUES(8)", [])
             .is_err()
     );
+}
+
+#[test]
+fn sync_checkpoints_each_batch_before_scanning_the_next_and_stops_without_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, batches, handle) = server(200, 4);
+    run_cli(cli(dir.path(), addr), "test", "", &[], |_, cursor| {
+        let n = cursor["n"].as_u64().unwrap_or(0);
+        if n > 0 {
+            let state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("test.json")).unwrap())
+                    .unwrap();
+            assert_eq!(&state["cursor"], cursor);
+            assert!(state["pending"].is_null());
+        }
+        let mut scan = Scan::new(json!({"n": (n+1).min(3)}));
+        scan.complete = false;
+        Ok(scan)
+    })
+    .unwrap();
+    handle.join().unwrap();
+    assert_eq!(batches.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn compact_tail_state_reads_legacy_and_preserves_offsets_and_context() {
+    let state = json!({"synthetic": {"generation":"1:2", "offset":42,"anchor":"h_anchor", "context":{"session":"h_session","turn":"h_turn"}}});
+    let legacy = tail_state(&state).unwrap();
+    let encoded = compact_tail_state(&legacy).unwrap();
+    assert_eq!(
+        serde_json::to_value(tail_state(&encoded).unwrap()).unwrap(),
+        state
+    );
+    assert!(tail_state(&json!({"zstd_tail_v1":"0"})).is_err());
+    assert!(tail_state(&json!({"zstd_tail_v1":"zz"})).is_err());
+}
+
+#[test]
+fn mismatched_ack_never_commits_or_scans_the_next_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _, handle) = server_with_ack(200, 3, false);
+    let scans = std::cell::Cell::new(0);
+    assert!(
+        run_cli(cli(dir.path(), addr), "test", "", &[], |_, cursor| {
+            assert!(cursor.is_null());
+            scans.set(scans.get() + 1);
+            let mut scan = Scan::new(json!({"n":1}));
+            scan.complete = false;
+            Ok(scan)
+        })
+        .is_err()
+    );
+    handle.join().unwrap();
+    assert_eq!(scans.get(), 1);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("test.json")).unwrap()).unwrap();
+    assert!(saved["cursor"].is_null());
+    assert_eq!(saved["pending"]["next"]["n"], 1);
+}
+
+#[test]
+fn filtered_tail_caps_raw_work_and_can_resume_without_losing_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("input.jsonl");
+    std::fs::write(&path, "{}\n".repeat(100_001)).unwrap();
+    let (cursor, complete) = tail_each(&path, &TailCursor::default(), 1, |_, ctx, _| {
+        *ctx = json!({"synthetic":"h_context"});
+        Ok(false)
+    })
+    .unwrap();
+    assert!(!complete);
+    assert_eq!(cursor.offset, 300_000);
+    let (end, complete) = tail_each(&path, &cursor, 1, |_, ctx, _| {
+        assert_eq!(ctx["synthetic"], "h_context");
+        Ok(false)
+    })
+    .unwrap();
+    assert!(complete);
+    assert_eq!(end.offset, 300_003);
 }
