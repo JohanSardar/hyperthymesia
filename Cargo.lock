@@ -837,6 +837,14 @@ version = "0.1.0"
 [[package]]
 name = "hx-visual"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
 
 [[package]]
 name = "hyper"
