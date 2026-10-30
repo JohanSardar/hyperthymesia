@@ -12,11 +12,13 @@ From this directory:
 Open `chrome://extensions`, enable Developer mode, select **Load unpacked**, and
 choose this directory's `dist` folder. Reload existing tabs after installing.
 The agent must separately register the native host `com.hyperthymesia.agent`
-with this extension's ID in its origin allowlist. The extension sends one
+with this extension's ID in its origin allowlist. With the built agent installed,
+run `hx-agent install-nm-host --extension-id <ID from chrome://extensions>`.
+The extension sends one
 CompanionEvent per native message and removes it from the durable queue only
 when the host responds with `{ "ok": true }`, after durable acceptance. Other
-replies/errors/timeouts retain it. Confirm that ack shape with the native agent
-before deployment; the envelope schema does not specify acknowledgments.
+replies/errors/timeouts retain it. This matches the native host implementation
+currently on main; the envelope schema itself does not specify acknowledgments.
 
 Events include active/background visits, closed interval revisions, viewport
 text and SHA-256 digests. A visit is visible only with an active tab, focused
