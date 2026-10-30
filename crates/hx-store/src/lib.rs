@@ -30,7 +30,7 @@ impl Token {
     }
 }
 
-pub use hx_schema::{UploadBatch, UploadAck, Rejected};
+pub use hx_schema::{Rejected, UploadAck, UploadBatch};
 
 pub fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -102,7 +102,12 @@ impl Store {
         }))
     }
     pub async fn ingest(&self, batch: UploadBatch, token: &Token) -> Result<UploadAck> {
-        let mut ack = UploadAck { batch_id: batch.batch_id, accepted: 0, duplicates: 0, rejected: vec![] };
+        let mut ack = UploadAck {
+            batch_id: batch.batch_id,
+            accepted: 0,
+            duplicates: 0,
+            rejected: vec![],
+        };
         let mut tx = self.pool.begin().await?;
         for e in batch.envelopes {
             let error = if !token.has("ingest") {
@@ -166,7 +171,17 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         let e: Envelope = serde_json::from_value(v)?;
-        if let Some(Err(err)) = CorePayload::decode(e.kind.as_str(), &e.payload) {
+        let failure = if hx_schema::kinds::is_core(e.kind.as_str()) && e.schema_version != 1 {
+            Some(format!(
+                "unsupported core schema_version {}",
+                e.schema_version
+            ))
+        } else {
+            CorePayload::decode(e.kind.as_str(), &e.payload)
+                .and_then(Result::err)
+                .map(|e| e.to_string())
+        };
+        if let Some(err) = failure {
             sqlx::query("INSERT INTO quarantine(event_id,reason) VALUES($1,$2) ON CONFLICT(event_id) DO UPDATE SET reason=EXCLUDED.reason")
                 .bind(id).bind(err.to_string()).execute(&self.pool).await?;
             return Ok(());
@@ -216,14 +231,63 @@ impl Store {
         generation: i64,
         value: Value,
     ) -> Result<(i64, bool)> {
+        self.publish_revision_key(w, generation, value, &ulid::Ulid::generate().to_string())
+            .await
+    }
+    pub async fn publish_revision_key(
+        &self,
+        w: Interval,
+        generation: i64,
+        value: Value,
+        output_key: &str,
+    ) -> Result<(i64, bool)> {
+        let namespaces:Vec<String>=sqlx::query_scalar("SELECT DISTINCT connector_instance FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1")
+            .bind(w.start-Duration::minutes(30)).bind(w.end).fetch_all(&self.pool).await?;
+        self.publish_revision_manifest(w, generation, value, output_key, &namespaces)
+            .await
+    }
+    pub async fn publish_revision_manifest(
+        &self,
+        w: Interval,
+        generation: i64,
+        value: Value,
+        output_key: &str,
+        namespaces: &[String],
+    ) -> Result<(i64, bool)> {
         let mut tx = self.pool.begin().await?;
-        let current: i64 =
-            sqlx::query_scalar("SELECT generation FROM windows WHERE start_at=$1 FOR UPDATE")
-                .bind(w.start)
-                .fetch_one(&mut *tx)
+        let window = sqlx::query(
+            "SELECT generation,canonical_revision FROM windows WHERE start_at=$1 FOR UPDATE",
+        )
+        .bind(w.start)
+        .fetch_one(&mut *tx)
+        .await?;
+        let current: i64 = window.get("generation");
+        let canonical: Option<i64> = window.get("canonical_revision");
+        sqlx::query("INSERT INTO revisions(start_at,input_generation,interpretation,output_key,input_namespaces) VALUES($1,$2,$3,$4,$5) ON CONFLICT(output_key) DO NOTHING").bind(w.start).bind(generation).bind(&value).bind(output_key).bind(namespaces).execute(&mut *tx).await?;
+        let revision = sqlx::query(
+            "SELECT id,input_generation,start_at,interpretation FROM revisions WHERE output_key=$1",
+        )
+        .bind(output_key)
+        .fetch_one(&mut *tx)
+        .await?;
+        let id: i64 = revision.get("id");
+        let publish = canonical.is_none_or(|canonical| canonical <= id)
+            && current == revision.get::<i64, _>("input_generation")
+            && w.start == revision.get::<DateTime<Utc>, _>("start_at");
+        if publish {
+            let previous:Option<Value>=sqlx::query_scalar("SELECT coalesce(interpretation->'tasks','null'::jsonb) FROM revisions WHERE id=(SELECT canonical_revision FROM windows WHERE start_at=$1)")
+                .bind(w.start).fetch_optional(&mut *tx).await?;
+            let stored: Value = revision.get("interpretation");
+            if previous.as_ref().unwrap_or(&Value::Null)
+                != stored.get("tasks").unwrap_or(&Value::Null)
+            {
+                sqlx::query(
+                    "UPDATE windows SET generation=generation+1,dirty=true WHERE start_at>=$1",
+                )
+                .bind(w.end)
+                .execute(&mut *tx)
                 .await?;
-        let id:i64=sqlx::query_scalar("INSERT INTO revisions(start_at,input_generation,interpretation) VALUES($1,$2,$3) RETURNING id").bind(w.start).bind(generation).bind(value).fetch_one(&mut *tx).await?;
-        if current == generation {
+            }
             sqlx::query("UPDATE windows SET canonical_revision=$2 WHERE start_at=$1")
                 .bind(w.start)
                 .bind(id)
@@ -231,7 +295,7 @@ impl Store {
                 .await?;
         }
         tx.commit().await?;
-        Ok((id, current == generation))
+        Ok((id, publish))
     }
     pub async fn search(&self, q: &str, raw: bool, prefixes: &[String]) -> Result<Vec<Value>> {
         let rows=sqlx::query("SELECT e.id,n.search_text,e.source_start FROM normalized n JOIN events e ON e.id=n.event_id WHERE search_vector @@ plainto_tsquery('simple',$1) AND ($2 OR e.sensitivity='normal') AND EXISTS(SELECT 1 FROM unnest($3::text[]) p WHERE starts_with(e.connector_instance,p)) ORDER BY e.source_start DESC LIMIT 100")
@@ -305,6 +369,34 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+    pub async fn assert_entity(
+        &self,
+        entity: &str,
+        assertion: Value,
+        evidence: &[i64],
+    ) -> Result<i64> {
+        if entity.is_empty() || evidence.is_empty() {
+            bail!("entity and evidence are required");
+        }
+        let sensitivity:String=sqlx::query_scalar("SELECT CASE max(CASE sensitivity WHEN 'restricted' THEN 2 WHEN 'sensitive' THEN 1 ELSE 0 END) WHEN 0 THEN 'normal' WHEN 1 THEN 'sensitive' ELSE 'restricted' END FROM events WHERE id=ANY($1)")
+            .bind(evidence).fetch_one(&self.pool).await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(DISTINCT id) FROM events WHERE id=ANY($1)")
+                .bind(evidence)
+                .fetch_one(&self.pool)
+                .await?;
+        let unique: std::collections::HashSet<_> = evidence.iter().collect();
+        if count as usize != unique.len() {
+            bail!("unknown evidence");
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE windows SET generation=generation+1,dirty=true")
+            .execute(&mut *tx)
+            .await?;
+        let id=sqlx::query_scalar("INSERT INTO entity_assertions(entity,assertion,evidence,sensitivity) VALUES($1,$2,$3,$4) RETURNING id").bind(entity).bind(assertion).bind(evidence).bind(sensitivity).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(id)
     }
     pub async fn evidence(&self, id: i64) -> Result<Option<Value>> {
         let value:Option<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',e.id,'envelope',e.envelope,'sensitivity',e.sensitivity,'blobs',coalesce((SELECT jsonb_agg(jsonb_build_object('sha256',b.sha256,'evidence_expired',b.evidence_expired)) FROM event_blobs eb JOIN blobs b USING(sha256) WHERE eb.event_id=e.id),'[]'::jsonb)) FROM events e WHERE id=$1").bind(id).fetch_optional(&self.pool).await?;
