@@ -72,8 +72,6 @@ pub async fn run_one<H: Handler>(pool: &PgPool, handler: &H) -> Result<bool> {
             .map(|_| "job failed; inspect local server logs"),
     )
     .await?;
-    if let Err(e) = result {
-        return Err(e);
-    }
+    result?;
     Ok(true)
 }
