@@ -587,12 +587,17 @@ fn coverage(active: &[&Observation], t: &mut Timeline) {
         let mut cursor = 0;
         let mut alive_until = DateTime::<Utc>::MIN_UTC;
         let mut policy_until = DateTime::<Utc>::MIN_UTC;
+        let mut interrupted_until = DateTime::<Utc>::MIN_UTC;
         let mut status = hx_schema::kinds::CollectorStatus::Running;
         for pair in bounds.windows(2) {
             let start = pair[0];
             while let Some(o) = events.get(cursor).filter(|o| at(o) <= start) {
                 if o.envelope.kind.as_str() == "policy.gap" {
-                    policy_until = policy_until.max(end(o));
+                    if o.envelope.payload["reason"] == "capture_interrupted" {
+                        interrupted_until = interrupted_until.max(end(o));
+                    } else {
+                        policy_until = policy_until.max(end(o));
+                    }
                 } else {
                     alive_until = alive_until.max(horizon(o));
                 }
@@ -605,7 +610,9 @@ fn coverage(active: &[&Observation], t: &mut Timeline) {
             let failed = status != hx_schema::kinds::CollectorStatus::Running && !paused;
             let policy = policy_until > start;
             let alive = alive_until > start;
-            let state = if paused || policy {
+            let state = if interrupted_until > start {
+                CoverageState::Unknown
+            } else if paused || policy {
                 CoverageState::Suppressed
             } else if failed || !alive {
                 CoverageState::Unknown

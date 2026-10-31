@@ -52,11 +52,24 @@ fn io_worker(
     rx: tokio::sync::mpsc::Receiver<Submission>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
+    let result = io_worker_at(config, rx, stop.clone(), support_dir());
+    if result.is_err() {
+        stop.store(true, Ordering::Relaxed);
+    }
+    result
+}
+fn io_worker_at(
+    config: Config,
+    rx: tokio::sync::mpsc::Receiver<Submission>,
+    stop: Arc<AtomicBool>,
+    dir: std::path::PathBuf,
+) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let dir=support_dir();std::fs::create_dir_all(&dir)?;use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(&dir,std::fs::Permissions::from_mode(0o700))?;
+        std::fs::create_dir_all(&dir)?;use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(&dir,std::fs::Permissions::from_mode(0o700))?;
         let policy=Policy::new(&config)?;
         let mut outbox=Outbox::open(&dir.join("outbox.sqlite"),config.event_budget_bytes,config.media_budget_bytes)?;
+        outbox.reconcile(Producer::new(config.device_id.clone())?.time())?;
         let mut latest_health=serde_json::Map::new();
         let mut uploader=Uploader::new(&config)?;let mut rx=rx;let mut next=tokio::time::Instant::now()+uploader.delay();
         loop {tokio::select! {
@@ -230,6 +243,14 @@ pub fn run(options: RunOptions) -> Result<()> {
         None
     };
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    let (companion_tx, companion_rx) = mpsc::sync_channel(128);
+    let socket = if options.dry_run {
+        None
+    } else {
+        Some(socket_listener(companion_tx, stop.clone())?)
+    };
+    // Own the singleton socket before the I/O worker reconciles a previous run.
+    // A rejected duplicate launch must never close a live agent's intervals.
     let worker = if options.dry_run {
         drop(rx);
         None
@@ -237,12 +258,6 @@ pub fn run(options: RunOptions) -> Result<()> {
         let cfg = cfg.clone();
         let stop = stop.clone();
         Some(std::thread::spawn(move || io_worker(cfg, rx, stop)))
-    };
-    let (companion_tx, companion_rx) = mpsc::sync_channel(128);
-    let socket = if options.dry_run {
-        None
-    } else {
-        Some(socket_listener(companion_tx, stop.clone())?)
     };
     let capture_context = Arc::new(std::sync::Mutex::new(None::<Focus>));
     let media_stop = stop.clone();
@@ -356,8 +371,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                                     None,
                                 )?;
                             }
-                            let allowed =
-                                policy.allows(&activated.bundle_id, activated.title.as_deref());
+                            let allowed = !policy.excludes_native(&activated);
                             if let Some(gap) =
                                 policy_gap.observe(!allowed, event_time.clone(), &mut producer)
                             {
@@ -460,7 +474,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                         emit(close_span(&span, &mut producer), None)?;
                     }
                     if let Some(f) = &current {
-                        let allowed = policy.allows(&f.bundle_id, f.title.as_deref());
+                        let allowed = !policy.excludes_native(f);
                         if let Some(gap) =
                             policy_gap.observe(!allowed, producer.time(), &mut producer)
                         {
@@ -508,9 +522,7 @@ pub fn run(options: RunOptions) -> Result<()> {
             if tick
                 && last_gap_update.elapsed() >= Duration::from_secs(10)
                 && let Some(gap) = policy_gap.observe(
-                    focus
-                        .as_ref()
-                        .is_some_and(|f| !policy.allows(&f.bundle_id, f.title.as_deref())),
+                    focus.as_ref().is_some_and(|f| policy.excludes_native(f)),
                     producer.time(),
                     &mut producer,
                 )
@@ -677,6 +689,20 @@ pub fn run(options: RunOptions) -> Result<()> {
                 }
             }
             let permissions = hx_macos_sys::permissions();
+            let screen_lost = last_permissions.screen && !permissions.screen;
+            // Report revocation even if media is blocked finalizing an encoder.
+            if screen_lost && !options.dry_run {
+                let mut denied = health(
+                    &mut producer,
+                    "media",
+                    CollectorStatus::PermissionDenied,
+                    Some("PermissionDenied: use explicit onboard command".into()),
+                    0,
+                );
+                denied.connector_instance =
+                    ConnectorInstance::new(format!("macos-media:{}", cfg.device_id));
+                emit(denied, None)?;
+            }
             let permission_change = permissions.accessibility != last_permissions.accessibility
                 || permissions.input != last_permissions.input
                 || permissions.screen != last_permissions.screen;
@@ -855,5 +881,144 @@ mod tests {
                 "{namespace}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_regressions {
+    use super::*;
+    #[test]
+    fn captured_observation_event_budget_failure_records_loss_without_stopping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.sqlite");
+        let mut p = Producer::new("synthetic".into()).unwrap();
+        let mut seed = Outbox::open(&path, 100_000, 8).unwrap();
+        for _ in 0..2 {
+            seed.enqueue(&p.calibration(), &[]).unwrap();
+        }
+        let budget = seed.stats().unwrap().1 as u64;
+        drop(seed);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let rejected = p.core(
+            "synthetic-capture",
+            "0",
+            Operation::Observe,
+            CorePayload::PresenceSpan(PresenceSpan {
+                state: DeviceState::Active,
+                idle_threshold_s: Some(300),
+            }),
+        );
+        let (reply, ack) = mpsc::sync_channel(1);
+        tx.blocking_send(Submission {
+            envelope: rejected.clone(),
+            reply: Some(reply),
+            focus: None,
+            secure: false,
+            blobs: vec![],
+        })
+        .unwrap();
+        drop(tx);
+        let stop = Arc::new(AtomicBool::new(false));
+        io_worker_at(
+            Config {
+                device_id: "synthetic".into(),
+                event_budget_bytes: budget,
+                ..Default::default()
+            },
+            rx,
+            stop.clone(),
+            dir.path().to_owned(),
+        )
+        .unwrap();
+        assert!(!stop.load(Ordering::Relaxed));
+        assert!(!ack.recv().unwrap());
+        let mut reopened = Outbox::open(&path, budget, 8).unwrap();
+        let batch = reopened.batch().unwrap().unwrap();
+        assert_eq!(batch.envelopes.len(), 3);
+        assert!(batch.envelopes.iter().any(|e| {
+            e.payload["reason"] == "event_budget"
+                && e.payload["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&rejected.observation_id.to_string())
+        }));
+    }
+
+    #[test]
+    fn budget_rejection_keeps_io_worker_and_metadata_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Producer::new("synthetic".into()).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut rejected = p.calibration();
+        rejected.kind = Kind::new("media.still");
+        rejected.payload = serde_json::to_value(MediaStill {
+            display: "synthetic".into(),
+            trigger: StillTrigger::FocusChange,
+            width: 1,
+            height: 1,
+            app_bundle_id: None,
+            window_title: None,
+        })
+        .unwrap();
+        let bytes = b"oversized".to_vec();
+        let blob = BlobRef {
+            sha256: sha256_hex(&bytes),
+            media_type: "image/jpeg".into(),
+            bytes: bytes.len() as u64,
+        };
+        rejected.blobs.push(blob.clone());
+        let focus = Focus {
+            bundle_id: "synthetic.app".into(),
+            name: "Synthetic".into(),
+            pid: 1,
+            title: Some("Public".into()),
+            electron: false,
+        };
+        let (reply, ack) = mpsc::sync_channel(1);
+        tx.blocking_send(Submission {
+            envelope: rejected,
+            reply: Some(reply),
+            focus: Some(focus),
+            secure: false,
+            blobs: vec![(blob, bytes)],
+        })
+        .unwrap();
+        let metadata = p.calibration();
+        tx.blocking_send(Submission {
+            envelope: metadata.clone(),
+            reply: None,
+            focus: None,
+            secure: false,
+            blobs: vec![],
+        })
+        .unwrap();
+        drop(tx);
+        let stop = Arc::new(AtomicBool::new(false));
+        io_worker_at(
+            Config {
+                device_id: "synthetic".into(),
+                media_budget_bytes: 1,
+                ..Default::default()
+            },
+            rx,
+            stop.clone(),
+            dir.path().to_owned(),
+        )
+        .unwrap();
+        assert!(!ack.recv().unwrap());
+        assert!(!stop.load(Ordering::Relaxed));
+        let mut out = Outbox::open(&dir.path().join("outbox.sqlite"), 100_000, 1).unwrap();
+        let batch = out.batch().unwrap().unwrap();
+        assert!(
+            batch
+                .envelopes
+                .iter()
+                .any(|e| e.observation_id == metadata.observation_id)
+        );
+        assert!(batch.envelopes.iter().any(|e| {
+            e.coverage
+                .as_ref()
+                .is_some_and(|c| c.scope == "capture_loss")
+        }));
     }
 }

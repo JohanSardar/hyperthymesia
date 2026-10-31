@@ -21,6 +21,10 @@ impl Policy {
             && (self.titles.is_empty()
                 || title.is_some_and(|t| !self.titles.iter().any(|r| r.is_match(t))))
     }
+    pub fn excludes_native(&self, focus: &hx_macos_sys::Focus) -> bool {
+        !self.allows(&focus.bundle_id, focus.title.as_deref())
+            || hx_macos_sys::unverifiable_private_state(focus)
+    }
     pub fn allows_payload(&self, value: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::Object(map) => {
@@ -62,13 +66,29 @@ pub fn persist(
     envelope: &hx_schema::Envelope,
     blobs: &[(hx_schema::BlobRef, Vec<u8>)],
 ) -> anyhow::Result<bool> {
-    let content = matches!(
-        envelope.kind.as_str(),
-        "text.snapshot" | "ui.click" | "media.chunk" | "media.still"
-    ) || envelope
-        .connector_instance
-        .as_str()
-        .starts_with("companion:");
+    // Only the closed, content-free gap schema bypasses companion content checks.
+    // A companion cannot smuggle arbitrary fields or blobs under this kind.
+    let metadata_gap = envelope.kind.as_str() == "policy.gap"
+        && envelope.blobs.is_empty()
+        && blobs.is_empty()
+        && envelope.payload.as_object().is_some_and(|map| {
+            map.len() == 2
+                && map.get("open").is_some_and(serde_json::Value::is_boolean)
+                && map
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|reason| {
+                        ["policy_exclusion", "capture_interrupted"].contains(&reason)
+                    })
+        });
+    let content = !metadata_gap
+        && (matches!(
+            envelope.kind.as_str(),
+            "text.snapshot" | "ui.click" | "media.chunk" | "media.still"
+        ) || envelope
+            .connector_instance
+            .as_str()
+            .starts_with("companion:"));
     let browser_unknown = envelope
         .connector_instance
         .as_str()
@@ -87,8 +107,7 @@ pub fn persist(
     {
         return Ok(false);
     }
-    outbox.enqueue(envelope, blobs)?;
-    Ok(true)
+    outbox.capture(envelope, blobs)
 }
 
 fn has_public_window_signal(value: &serde_json::Value) -> bool {
