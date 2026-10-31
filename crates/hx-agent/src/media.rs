@@ -17,6 +17,7 @@ struct Chunk {
     writer: VideoWriter,
     path: std::path::PathBuf,
     start: ObservationTime,
+    last_frame: ObservationTime,
     started: Instant,
     width: u32,
     height: u32,
@@ -56,20 +57,23 @@ fn run_inner(
     let mut spent = 0u64;
     let mut last_hash = String::new();
     let mut last_health = Instant::now() - Duration::from_secs(45);
+    let mut last_screen = None;
     let mut retry = Instant::now() - Duration::from_secs(60);
     while !stop.load(Ordering::Relaxed) {
         let mut focus = context.lock().expect("capture context").clone();
         if let Some(f) = focus.as_mut() {
             f.title = hx_macos_sys::window_title(f.pid);
         }
+        let screen = hx_macos_sys::permissions().screen;
         let allowed = !paused.load(Ordering::Relaxed)
             && !hx_macos_sys::secure_input()
-            && hx_macos_sys::permissions().screen
+            && screen
             && focus.as_ref().is_some_and(|f| {
                 policy.allows(&f.bundle_id, f.title.as_deref()) && !browser(f) && f.title.is_some()
             });
-        if last_health.elapsed() >= Duration::from_secs(45) {
+        if health_due(last_health.elapsed(), last_screen, screen) {
             last_health = Instant::now();
+            last_screen = Some(screen);
             let mut clock = producer.core(
                 format!("clock-health:{}", ulid::Ulid::generate()),
                 "0",
@@ -95,7 +99,7 @@ fn run_inner(
                 secure: false,
                 blobs: vec![],
             })?;
-            let granted = hx_macos_sys::permissions().screen;
+            let granted = screen;
             let status = if !granted {
                 CollectorStatus::PermissionDenied
             } else if !allowed {
@@ -148,6 +152,7 @@ fn run_inner(
                 if now.as_ref() != Some(&s.focus)
                     || paused.load(Ordering::Relaxed)
                     || hx_macos_sys::secure_input()
+                    || !hx_macos_sys::permissions().screen
                 {
                     continue;
                 }
@@ -167,23 +172,26 @@ fn run_inner(
                     chunk = Some(Chunk {
                         writer,
                         path,
-                        start: producer.time(),
+                        start: frame_time(producer.time(), frame.nanos),
+                        last_frame: frame_time(producer.time(), frame.nanos),
                         started: Instant::now(),
                         width: s.stream.width,
                         height: s.stream.height,
                         focus: s.focus.clone(),
                     });
                 }
-                if let Some(c) = chunk.as_mut()
-                    && !c.writer.append(&frame).map_err(anyhow::Error::msg)?
-                {
-                    send_health(
-                        &mut producer,
-                        &tx,
-                        CollectorStatus::Running,
-                        "encoder backpressure: frame skipped".into(),
-                        1,
-                    )?;
+                if let Some(c) = chunk.as_mut() {
+                    if c.writer.append(&frame).map_err(anyhow::Error::msg)? {
+                        c.last_frame = frame_time(producer.time(), frame.nanos);
+                    } else {
+                        send_health(
+                            &mut producer,
+                            &tx,
+                            CollectorStatus::Running,
+                            "encoder backpressure: frame skipped".into(),
+                            1,
+                        )?;
+                    }
                 }
                 let profile = Profile::select(hx_macos_sys::power(), &config);
                 let cadence = config.still_cadence_s.max(match profile {
@@ -292,10 +300,7 @@ fn finish(
             frames,
         }),
     );
-    let end = e.time.clone();
-    e.time = c.start;
-    e.time.source_end = end.source_start;
-    e.time.mono_end = end.mono_start;
+    e.time = chunk_interval(c.start, c.last_frame, e.time);
     let blob = BlobRef {
         sha256: sha256_hex(&bytes),
         media_type: "video/mp4".into(),
@@ -368,4 +373,57 @@ pub(crate) fn run(
         )?;
     }
     result
+}
+
+fn health_due(elapsed: Duration, last_screen: Option<bool>, screen: bool) -> bool {
+    elapsed >= Duration::from_secs(45) || last_screen != Some(screen)
+}
+fn chunk_interval(
+    start: ObservationTime,
+    last_frame: ObservationTime,
+    finish: ObservationTime,
+) -> ObservationTime {
+    let mut time = start;
+    time.source_end = last_frame.source_start;
+    time.mono_end = last_frame.mono_start;
+    time.observed_at = finish.observed_at;
+    time
+}
+fn frame_time(mut now: ObservationTime, nanos: u64) -> ObservationTime {
+    let stamp = now.mono_start.as_mut().expect("native stamp");
+    now.source_start = Some(
+        now.observed_at
+            - chrono::Duration::nanoseconds(
+                stamp.nanos.saturating_sub(nanos).min(i64::MAX as u64) as i64
+            ),
+    );
+    stamp.nanos = nanos;
+    now
+}
+
+#[cfg(test)]
+mod statechart_regressions {
+    use super::*;
+    #[test]
+    fn screen_permission_loss_is_reported_before_heartbeat() {
+        assert!(health_due(Duration::from_secs(1), Some(true), false));
+        assert!(!health_due(Duration::from_secs(1), Some(false), false));
+        assert!(health_due(Duration::from_secs(46), Some(false), false));
+    }
+    #[test]
+    fn video_finish_timestamp_stops_at_last_accepted_frame() {
+        let p = Producer::new("synthetic".into()).unwrap();
+        let start = p.time();
+        let mut last = start.clone();
+        last.source_start = last.source_start.map(|t| t + chrono::Duration::seconds(4));
+        last.mono_start.as_mut().unwrap().nanos += 4_000_000_000;
+        let boundary = last.source_start.unwrap() + chrono::Duration::seconds(1);
+        let mut finish = last.clone();
+        finish.source_start = Some(boundary + chrono::Duration::seconds(5));
+        finish.mono_start.as_mut().unwrap().nanos += 6_000_000_000;
+        let interval = chunk_interval(start, last.clone(), finish);
+        assert_eq!(interval.source_end, last.source_start);
+        assert_eq!(interval.mono_end, last.mono_start);
+        assert!(interval.source_end.unwrap() < boundary);
+    }
 }

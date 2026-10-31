@@ -1161,13 +1161,19 @@ async fn pending_overlap_defers_interpretation_without_spending_attempts() {
         .await
         .unwrap();
     let mut tx = f.store.pool.begin().await.unwrap();
+    // Immediate eligibility is evaluated by Postgres; do not assume the test
+    // process and a disposable database VM have identical wall clocks.
+    let ready_at = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
     hx_jobs::enqueue(
         &mut tx,
         "pending-interpret",
         "interpret",
         json!({"window":w}),
         false,
-        Utc::now(),
+        ready_at,
     )
     .await
     .unwrap();

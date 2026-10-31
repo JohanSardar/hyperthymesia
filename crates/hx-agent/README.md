@@ -26,17 +26,37 @@ an extension or start capture.
 
 - `focus.span` and `presence.span` are upserts: revision 0 opens the span and a later
   revision closes it. Native notifications retain capture-time monotonic stamps.
+  Durable checkpoints survive upload acknowledgments. At startup, intervals left
+  open by an interrupted run close at that run's last durable observation; a
+  content-free `capture_interrupted` gap bounds the unknown time through restart.
+  Across reboots, downtime uses UTC rather than subtracting unrelated clocks.
 - Health collector names are kind namespaces: `focus`, `presence`, `input`, `ui`,
   `text`, `media`, and `clock`. Heartbeats run every 45 seconds, leaving margin
-  before the compiler's 60-second liveness expiry. Permission loss is explicit.
+  before the compiler's 60-second liveness expiry. Screen Recording permission
+  changes bypass the heartbeat timer, and the main loop reports detected loss
+  even while the media worker is finalizing an encoder.
 - `policy.gap` upserts carry the excluded interval in envelope source and monotonic
   start/end fields. An active gap extends only through observed time, updates
   every ten seconds, and closes on policy exit or orderly shutdown. Its payload
-  contains no excluded application or window content. Suppression is also emitted
+  contains no excluded application or window content. Unverifiable native browser
+  privacy state opens the same gap and redacts the focused-window metadata.
+  Content-free companion gap copies pass the persistence gate without requiring
+  a public-window signal. Suppression is also emitted
   for the media and companion installations sharing this device policy.
 - Upload batches are persisted before transport and replayed unchanged until a
   matching complete acknowledgment. Blob PUTs are idempotent. Media eviction
   preserves every affected observation's manifest in durable loss records.
+- Video intervals end at the last accepted frame's capture stamp, never at encoder
+  finalization. Queued frames are checked again for permission and focus before
+  encoding.
+- Event-budget, oversized-media, pinned-media and eviction-loss-budget rejections
+  write content-free, deliverable `collector.health` loss summaries in 64 KiB of
+  additional outbox headroom reserved for losses and restart reconciliation.
+  Repeated losses coalesce by installation and reason with a count, time range,
+  and first/latest observation IDs; pending upload batches remain immutable.
+  Budget rejection leaves metadata capture and upload alive where capacity permits.
+  Exhausted recovery headroom or other storage errors still stop capture explicitly.
+  The in-memory handoff remains volatile until the I/O worker commits it.
 
 ## Verification and limits
 
