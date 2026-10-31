@@ -47,6 +47,31 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
         .find_map(|line| line.strip_prefix("time_support="))
         .and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default();
+    let support_by_evidence: Option<BTreeMap<EvidenceId, Vec<Interval>>> = packet
+        .timeline_text
+        .lines()
+        .find_map(|line| line.strip_prefix("time_support_by_evidence="))
+        .and_then(|json| serde_json::from_str(json).ok());
+    let supported_by_citations = |intervals: &[Interval], ids: &[EvidenceId]| {
+        support_by_evidence.as_ref().is_none_or(|by_id| {
+            let cited: Vec<Interval> = ids
+                .iter()
+                .filter_map(|id| by_id.get(id))
+                .flatten()
+                .copied()
+                .collect();
+            intervals.iter().all(|i| {
+                cited.iter().any(|s| s.start == i.start || s.end == i.start)
+                    && cited.iter().any(|s| s.start == i.end || s.end == i.end)
+                    && hx_schema::union_len(
+                        &cited
+                            .iter()
+                            .filter_map(|s| s.intersect(i))
+                            .collect::<Vec<_>>(),
+                    ) == i.end - i.start
+            })
+        })
+    };
     let supported = |intervals: &[Interval]| {
         intervals.iter().all(|i| {
             support
@@ -77,7 +102,10 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
             fail(&episode.id, "rejected episode with unknown evidence id");
             return false;
         }
-        if !valid_intervals(&episode.intervals, packet.window) || !supported(&episode.intervals) {
+        if !valid_intervals(&episode.intervals, packet.window)
+            || !supported(&episode.intervals)
+            || !supported_by_citations(&episode.intervals, &episode.evidence)
+        {
             fail(&episode.id, "rejected invalid episode intervals");
             return false;
         }
@@ -113,7 +141,10 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
                 })
             {
                 claim.basis = Basis::ReportedBySource;
-                fail(&item, "changed observed action to reported-by-source");
+                fail(
+                    &item,
+                    "downgraded source report presented as observed action",
+                );
             }
             if claim.outcome == "completed"
                 && !claim.outcome_evidence.iter().any(|id| {

@@ -130,6 +130,9 @@ pub enum InterpretError {
 /// A language model backend. Implementations: Claude CLI (`claude -p`), recorded fixtures.
 pub trait Provider: Send + Sync {
     fn name(&self) -> String;
+    fn tool_agent(&self) -> bool {
+        false
+    }
     fn complete(
         &self,
         system: &str,
@@ -171,6 +174,31 @@ pub const SYSTEM_PROMPT: &str = concat!(
     "Goals may be null or unknown. Hyperthymesia self_generated content cannot independently support a claim."
 );
 
+/// Parse model content; provenance is always server-owned. Validation is separate.
+pub fn parse_output(
+    packet: &Packet,
+    text: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<Interpretation, InterpretError> {
+    let output: ModelOutput = serde_json::from_str(strip_fence(text))
+        .map_err(|e| InterpretError::Parse(e.to_string()))?;
+    Ok(Interpretation {
+        window: packet.window,
+        episodes: output.episodes,
+        tasks: output.tasks,
+        summary: output.summary,
+        provenance: Provenance {
+            input_digest: packet.input_digest.clone(),
+            compiler_version: packet::compiler_version(packet),
+            prompt_version: prompt.into(),
+            model: model.into(),
+            created_at: Utc::now(),
+        },
+        check_failures: vec![],
+    })
+}
+
 pub async fn interpret<P: Provider>(
     packet: &Packet,
     provider: &P,
@@ -181,7 +209,10 @@ pub async fn interpret<P: Provider>(
     let mut last_error = String::new();
     let mut best: Option<Interpretation> = None;
     for attempt in 0..3 {
-        let text = provider.complete(SYSTEM_PROMPT, &user).await?;
+        let text = match provider.complete(SYSTEM_PROMPT, &user).await {
+            Ok(text) => text,
+            Err(error) => return best.ok_or(error),
+        };
         match serde_json::from_str::<ModelOutput>(strip_fence(&text)) {
             Ok(output) => {
                 let mut result = Interpretation {

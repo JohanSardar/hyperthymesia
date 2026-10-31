@@ -11,12 +11,14 @@ use sqlx::Row;
 
 pub enum ProviderConfig {
     Stub,
+    Fx,
     ClaudeCli { model: String },
 }
 impl ProviderConfig {
-    /// `HX_PROVIDER=claude` selects the `claude -p` CLI (model from `HX_MODEL`); anything else is the stub.
+    /// Select `fx` for the tool agent or `claude` for the legacy CLI; otherwise use the stub.
     pub fn from_env() -> Self {
         match std::env::var("HX_PROVIDER").as_deref() {
+            Ok("fx") => Self::Fx,
             Ok("claude") => Self::ClaudeCli {
                 model: std::env::var("HX_MODEL").unwrap_or_else(|_| "sonnet".into()),
             },
@@ -26,11 +28,16 @@ impl ProviderConfig {
 }
 pub enum AnyProvider {
     Stub(StubProvider),
+    Fx,
     ClaudeCli(hx_interpret::providers::ClaudeCliProvider),
 }
 impl Provider for AnyProvider {
+    fn tool_agent(&self) -> bool {
+        matches!(self, Self::Fx)
+    }
     fn name(&self) -> String {
         match self {
+            Self::Fx => "fx".into(),
             Self::Stub(p) => p.name(),
             Self::ClaudeCli(p) => p.name(),
         }
@@ -41,6 +48,9 @@ impl Provider for AnyProvider {
         user: &str,
     ) -> Result<String, hx_interpret::InterpretError> {
         match self {
+            Self::Fx => Err(hx_interpret::InterpretError::Provider(
+                "fx requires the server broker".into(),
+            )),
             Self::Stub(p) => p.complete(system, user).await,
             Self::ClaudeCli(p) => p.complete(system, user).await,
         }
@@ -48,6 +58,7 @@ impl Provider for AnyProvider {
 }
 pub fn coordinator_provider(config: ProviderConfig) -> AnyProvider {
     match config {
+        ProviderConfig::Fx => AnyProvider::Fx,
         ProviderConfig::Stub => AnyProvider::Stub(StubProvider),
         ProviderConfig::ClaudeCli { model } => {
             AnyProvider::ClaudeCli(hx_interpret::providers::ClaudeCliProvider { model })
@@ -110,6 +121,10 @@ async fn interpret_window_key<P: Provider>(
     provider: &P,
     output_key: &str,
 ) -> Result<bool> {
+    if provider.tool_agent() {
+        return crate::fx::interpret_window(store, w, output_key, &crate::fx::Config::from_env())
+            .await;
+    }
     let PreparedInput {
         packet,
         manifest,
@@ -136,7 +151,7 @@ async fn interpret_window_key<P: Provider>(
         .await?
         .1)
 }
-fn self_generated(e: &hx_schema::Envelope) -> bool {
+pub(crate) fn self_generated(e: &hx_schema::Envelope) -> bool {
     e.connector_instance.as_str().starts_with("hyperthymesia:")
         || ["window_title", "title", "surface"].iter().any(|key| {
             e.payload[key].as_str().is_some_and(|v| {
@@ -257,29 +272,43 @@ pub async fn prepare_input_with_policy(
         .into_iter()
         .partition(|e| e.kind.ends_with(":media.still"));
     evidence.extend(crate::ocr::derived_evidence_for_sources(store, &stills).await?);
-    let entity_rows=sqlx::query("SELECT assertion::text AS assertion,ARRAY(SELECT DISTINCT e.connector_instance FROM events e WHERE e.id=ANY(a.evidence)) AS namespaces FROM entity_assertions a WHERE sensitivity='normal' AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id=ANY(a.evidence) AND e.sensitivity!='normal') ORDER BY id DESC LIMIT 100").fetch_all(&store.pool).await?;
-    let entities: Vec<String> = entity_rows.iter().map(|r| r.get("assertion")).collect();
-    let prior=sqlx::query("SELECT r.interpretation,r.input_namespaces FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 ORDER BY w.end_at DESC LIMIT 1").bind(w.start).fetch_optional(&store.pool).await?;
-    let open_tasks = prior
-        .as_ref()
-        .and_then(|r| {
-            serde_json::from_value::<hx_interpret::Interpretation>(r.get("interpretation")).ok()
-        })
-        .map(|i| i.tasks.into_iter().filter(|t| t.open).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let broker = crate::mcp::Broker::new(store.clone(), disclosure.clone(), sensitive, w);
+    let prior = broker.prior_context(w.start).await?;
+    let entities: Vec<String> = prior["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(ToString::to_string)
+        .collect();
+    let open_tasks: Vec<hx_interpret::Task> = prior["revisions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(1)
+        .flat_map(|r| r["tasks"].as_array().into_iter().flatten())
+        .filter_map(|v| serde_json::from_value::<hx_interpret::Task>(v.clone()).ok())
+        .filter(|t| t.open)
+        .collect();
     let evidence_ids: std::collections::HashSet<_> = evidence.iter().map(|e| e.id).collect();
     let mut namespaces: std::collections::BTreeSet<String> = observations
         .iter()
         .filter(|o| evidence_ids.contains(&o.id))
         .map(|o| o.envelope.connector_instance.to_string())
         .collect();
-    for r in entity_rows {
-        namespaces.extend(r.get::<Vec<String>, _>("namespaces"));
-    }
-    if !open_tasks.is_empty()
-        && let Some(r) = prior
+    // Include every provenance namespace used by prior context, even outside this window.
+    for id in prior["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(prior["revisions"].as_array().into_iter().flatten())
+        .flat_map(|v| v["evidence"].as_array().into_iter().flatten())
+        .filter_map(serde_json::Value::as_i64)
     {
-        namespaces.extend(r.get::<Vec<String>, _>("input_namespaces"));
+        if let Some(v) = store.evidence(id).await?
+            && let Some(ns) = v["envelope"]["connector_instance"].as_str()
+        {
+            namespaces.insert(ns.to_owned());
+        }
     }
     let namespaces: Vec<String> = namespaces.into_iter().collect();
     // Compile only the public evidence projection: captured strings never bypass egress policy.

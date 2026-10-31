@@ -1,6 +1,8 @@
 # Spec: agent interpreter (fx loop)
 
-Status: agreed with the owner on 2026-10-31. Implementation has not started.
+Status: v1 implemented on 2026-10-31. Select `HX_PROVIDER=fx`; see
+[server operation and synthetic verification](../../crates/hx-server/README.md#fx-agent-interpreter).
+Live connectors remain unconfigured; real-data acceptance is a separate owner run.
 This spec replaces the "single prompt, no tools" interpreter in [DESIGN.md §5.2](../DESIGN.md#52-interpreter-every-4-h-plus-scheduled-revisions).
 Everything else in DESIGN.md stays in force unless this spec says otherwise.
 

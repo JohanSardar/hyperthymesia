@@ -126,18 +126,22 @@ pub async fn run_one<H: Handler>(pool: &PgPool, handler: &H) -> Result<bool> {
 pub enum Deferred {
     NormalizationPending,
     InputChanged,
+    RateLimited,
+    ProviderBusy,
 }
 impl std::fmt::Display for Deferred {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::NormalizationPending => "normalization pending",
             Self::InputChanged => "input generation changed",
+            Self::RateLimited => "subscription rate limited",
+            Self::ProviderBusy => "subscription credential busy",
         })
     }
 }
 impl std::error::Error for Deferred {}
 pub async fn defer(pool: &PgPool, job: &Job, reason: &Deferred) -> Result<bool> {
-    Ok(sqlx::query("UPDATE jobs SET state='ready',attempts=CASE WHEN request_version>leased_version THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=now()+interval '1 second',lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
+    Ok(sqlx::query("UPDATE jobs SET state='ready',attempts=CASE WHEN request_version>leased_version THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=now()+CASE WHEN $3='subscription rate limited' THEN interval '5 minutes' WHEN $3='subscription credential busy' THEN interval '5 seconds' ELSE interval '1 second' END,lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
         .bind(job.id).bind(&job.owner).bind(reason.to_string()).execute(pool).await?.rows_affected()==1)
 }
 // Never persist arbitrary Display strings: SQL/provider/serde errors can contain source text.
