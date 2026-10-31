@@ -12,11 +12,13 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub const PROMPT_VERSION: &str = "hx-replica/v1";
-pub const PROMPT: &str = include_str!("../prompts/replica-v1.txt");
+pub const PROMPT_VERSION: &str = "hx-replica/v3";
+pub const PROMPT: &str = include_str!("../prompts/replica-v3.txt");
 pub const FX_VERSION: &str = "0.0.16";
 pub const MODEL: &str = "gpt-6.1-sol";
-pub const MAX_STEPS: u64 = 24;
+/// Defaults sized for a dense real four-hour window; override per deployment.
+pub const DEFAULT_MAX_STEPS: u64 = 120;
+pub const DEFAULT_TIMEOUT_S: u64 = 1200;
 const OUTPUT_LIMIT: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -24,6 +26,7 @@ pub struct Config {
     pub binary: PathBuf,
     pub credential: PathBuf,
     pub timeout: Duration,
+    pub max_steps: u64,
 }
 impl Config {
     pub fn from_env() -> Self {
@@ -35,9 +38,17 @@ impl Config {
             credential: std::env::var_os("HX_FX_CREDENTIAL")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".fx/chatgpt-auth.json")),
-            timeout: Duration::from_secs(180),
+            timeout: Duration::from_secs(env_u64("HX_FX_TIMEOUT_S", DEFAULT_TIMEOUT_S)),
+            max_steps: env_u64("HX_FX_MAX_STEPS", DEFAULT_MAX_STEPS),
         }
     }
+}
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 // Share fx's own advisory lock name so refreshed subscription credentials survive
 // the isolated profile and concurrent jobs cannot rotate the same refresh token.
@@ -172,7 +183,7 @@ async fn output(
 pub async fn run(config: &Config, broker: &Broker, instruction: &str) -> Result<Value> {
     tokio::time::timeout(
         config.timeout,
-        run_limited(config, broker, instruction, MAX_STEPS),
+        run_limited(config, broker, instruction, config.max_steps),
     )
     .await
     .context("fx run timeout")?
@@ -221,7 +232,7 @@ async fn run_limited(
             &json!({"mcpServers":{"hyperthymesia":{"type":"http","url":format!("http://{addr}/mcp"),"bearer_token_env":"HX_MCP_TOKEN","operation_timeout_ms":15000}}}),
         )?,
     )?;
-    std::fs::write(work.join("replica-v1.txt"), PROMPT)?;
+    std::fs::write(work.join("replica-v3.txt"), PROMPT)?;
     let command = || {
         let mut cmd = tokio::process::Command::new(&config.binary);
         cmd.env_clear()
@@ -332,7 +343,8 @@ pub async fn interpret_window(
             .iter()
             .filter_map(|v: &Value| v["steps"].as_u64())
             .sum();
-        let steps = MAX_STEPS
+        let steps = config
+            .max_steps
             .checked_sub(used)
             .filter(|n| *n > 0)
             .context("fx turn budget exhausted")?;

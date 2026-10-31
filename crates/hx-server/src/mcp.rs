@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 
 pub const MAX_RESULT_BYTES: usize = 48 * 1024;
-pub const MAX_CALLS: usize = 80;
+pub const MAX_CALLS: usize = 240;
 pub const TOOLS: [&str; 8] = [
     "window_overview",
     "timeline",
