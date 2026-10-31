@@ -152,10 +152,36 @@ pub struct PreparedInput {
     pub generation: i64,
     pub namespaces: Vec<String>,
 }
+/// How `sensitive` evidence leaves the server for the LLM. `restricted` evidence never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitiveEgress {
+    /// Full text, like `normal` evidence.
+    Full,
+    /// Kind and time only; hx-interpret replaces the text.
+    Redact,
+}
+impl SensitiveEgress {
+    /// `HX_EGRESS_SENSITIVE=redact` withholds sensitive text; the default sends it in full.
+    pub fn from_env() -> Self {
+        match std::env::var("HX_EGRESS_SENSITIVE").as_deref() {
+            Ok("redact") => Self::Redact,
+            _ => Self::Full,
+        }
+    }
+}
 pub async fn prepare_input(
     store: &Store,
     w: Interval,
     provider_name: &str,
+) -> Result<PreparedInput> {
+    prepare_input_with(store, w, provider_name, SensitiveEgress::from_env()).await
+}
+pub async fn prepare_input_with(
+    store: &Store,
+    w: Interval,
+    provider_name: &str,
+    sensitive: SensitiveEgress,
 ) -> Result<PreparedInput> {
     let (_, generation) = compile_window(store, w).await?;
     let expanded = Interval {
@@ -170,14 +196,20 @@ pub async fn prepare_input(
     let observations = store.observations(expanded, true).await?;
     let evidence: Vec<EvidenceItem> = observations
         .iter()
-        .filter(|o| {
-            o.envelope.sensitivity == Sensitivity::Normal
-                && hx_schema::kinds::is_core(o.envelope.kind.as_str())
+        .filter_map(|o| {
+            let class = match (o.envelope.sensitivity, sensitive) {
+                (Sensitivity::Normal, _) | (Sensitivity::Sensitive, SensitiveEgress::Full) => {
+                    "normal"
+                }
+                (Sensitivity::Sensitive, SensitiveEgress::Redact) => "sensitive",
+                (Sensitivity::Restricted, _) => return None,
+            };
+            hx_schema::kinds::is_core(o.envelope.kind.as_str()).then_some((o, class))
         })
-        .map(|o| EvidenceItem {
+        .map(|(o, class)| EvidenceItem {
             id: o.id,
             at: o.envelope.time.observed_at,
-            kind: format!("normal:{}", o.envelope.kind),
+            kind: format!("{class}:{}", o.envelope.kind),
             text: o.envelope.payload.to_string().chars().take(4096).collect(),
             self_generated: self_generated(&o.envelope),
         })
@@ -215,7 +247,7 @@ pub async fn prepare_input(
     let safe_timeline = hx_compile::compile(&safe_observations, expanded);
     let mut packet = hx_interpret::build_packet(&safe_timeline, &evidence, &entities, &open_tasks);
     packet.window = w;
-    let manifest = json!({"window":w,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"packet":packet,"input_namespaces":namespaces});
+    let manifest = json!({"window":w,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"packet":packet,"input_namespaces":namespaces});
     packet.input_digest = hx_store::hash(&serde_json::to_vec(&manifest)?);
     Ok(PreparedInput {
         packet,

@@ -1318,3 +1318,42 @@ async fn migration_supersedes_legacy_backlog_and_preserves_work() {
     assert_eq!(count(&f.store, "normalized").await, 2);
     f.close().await;
 }
+
+#[tokio::test]
+async fn sensitive_egress_policy_controls_text_and_restricted_never_leaves() {
+    let f = Fixture::new().await;
+    let mut sensitive = event("sensitive", 8);
+    sensitive.sensitivity = Sensitivity::Sensitive;
+    sensitive.payload["title"] = json!("SENSITIVE_SENTINEL");
+    let mut restricted = event("restricted", 8);
+    restricted.sensitivity = Sensitivity::Restricted;
+    restricted.payload["title"] = json!("RESTRICTED_SENTINEL");
+    ingest(&f.store, vec![sensitive, restricted]).await;
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM events ORDER BY id")
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+    for id in &ids {
+        f.store.normalize(*id).await.unwrap();
+    }
+    let w = hx_store::window_at(event("packet", 8).time.observed_at);
+    let store = &f.store;
+    let packet = |p| async move {
+        let input = hx_server::processing::prepare_input_with(store, w, "stub", p)
+            .await
+            .unwrap();
+        (
+            input.packet.evidence.len(),
+            serde_json::to_string(&input.packet).unwrap(),
+        )
+    };
+    let (n, full) = packet(hx_server::processing::SensitiveEgress::Full).await;
+    assert_eq!(n, 1);
+    assert!(full.contains("SENSITIVE_SENTINEL"));
+    assert!(!full.contains("RESTRICTED_SENTINEL"));
+    let (n, redacted) = packet(hx_server::processing::SensitiveEgress::Redact).await;
+    assert_eq!(n, 1);
+    assert!(!redacted.contains("SENSITIVE_SENTINEL"));
+    assert!(!redacted.contains("RESTRICTED_SENTINEL"));
+    f.close().await;
+}
