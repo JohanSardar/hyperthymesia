@@ -214,7 +214,13 @@ pub async fn prepare_input_with(
                 .source_start
                 .unwrap_or(o.envelope.time.observed_at),
             kind: format!("{class}:{}", o.envelope.kind),
-            text: o.envelope.payload.to_string().chars().take(4096).collect(),
+            text: json!({
+                "connector_instance": o.envelope.connector_instance,
+                "subject": o.envelope.subject,
+                "resource": o.envelope.resource,
+                "payload": o.envelope.payload,
+            })
+            .to_string(),
             self_generated: self_generated(&o.envelope),
         })
         .collect();
@@ -248,7 +254,8 @@ pub async fn prepare_input_with(
         .into_iter()
         .filter(|o| evidence_ids.contains(&o.id))
         .collect();
-    let safe_timeline = hx_compile::compile(&safe_observations, expanded);
+    let mut safe_timeline = hx_compile::compile(&safe_observations, expanded);
+    safe_timeline.window = w;
     let mut packet = hx_interpret::build_packet(&safe_timeline, &evidence, &entities, &open_tasks);
     packet.window = w;
     let manifest = json!({"window":w,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"packet":packet,"input_namespaces":namespaces});
