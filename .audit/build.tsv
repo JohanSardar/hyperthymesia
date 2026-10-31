@@ -28,3 +28,6 @@ ts	phase	decision	why	evidence	result
 2026-10-31T17:05:23Z	E2E	recursive capture shim incident	command -v returned shell function name; shim recursed and wrote ~1GB packet copies to /tmp	killed, deleted; data stayed local; replaced with absolute path + recursion guard	FIXED
 2026-10-31T17:05:23Z	E2E	next: validator regenerates all prose on any single failure	titles became 'Evidence-backed episode'	revision 24	OPEN
 2026-10-31T17:13:09Z	E2E	merge PR10 scoped prose repair	live rerun: 11 titled episodes, 4 tasks; only unsupported ones regenerated	latest revision on real 12-4pm window	VERIFIED
+2026-10-31T20:22:40Z	C	merge PR11 server disclosure policy	hx-agent labels everything restricted, so laptop capture never reached the LLM	kinds match agent emitters; 75 tests + clippy; CI green	VERIFIED
+2026-10-31T20:22:40Z	C	merge PR12 server OCR + still lineage fix	stills were dropped before OCR and OCR text inherited restricted	new test laptop_policy_turns_restricted_stills_into_ocr_text_only; CI green	VERIFIED
+2026-10-31T20:22:40Z	E2E	laptop capture live	needs user-granted Accessibility/Screen/Input permissions	no macos-* events on server yet	OPEN
