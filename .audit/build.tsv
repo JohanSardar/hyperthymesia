@@ -23,3 +23,7 @@ ts	phase	decision	why	evidence	result
 2026-10-31T16:46:11Z	E2E	sensitive evidence egress full text (user decision)	connectors label agent text sensitive; server dropped it so LLM saw nothing	live claude run abstained on empty packet; new test	VERIFIED
 2026-10-31T16:46:11Z	E2E	evidence at source time	backfilled observed_at is hours after source_start; packet window filter dropped all	live run then cited items; regression test	VERIFIED
 2026-10-31T16:46:11Z	E2E	delegate interpreter evidence selection to Sol (synthetic data only)	128-item earliest-first cap filled by lead-in; live Claude abstained	revision 22 summary	OPEN
+2026-10-31T17:05:23Z	E2E	merge PR8 compile perf	238s -> 0.11s on 20k obs; reference equivalence on fixtures+256 random; stress test re-enabled	cargo test release; CI	VERIFIED
+2026-10-31T17:05:23Z	E2E	PR9 live fixes: fence strip, keep best retry, span support with sampled evidence	live Claude run: fenced JSON, all episodes rejected because support was zero-length points	revision 24: 8 episodes 5 tasks from real 12-4pm window	VERIFIED
+2026-10-31T17:05:23Z	E2E	recursive capture shim incident	command -v returned shell function name; shim recursed and wrote ~1GB packet copies to /tmp	killed, deleted; data stayed local; replaced with absolute path + recursion guard	FIXED
+2026-10-31T17:05:23Z	E2E	next: validator regenerates all prose on any single failure	titles became 'Evidence-backed episode'	revision 24	OPEN
