@@ -553,3 +553,161 @@ fn agent_activity_bounds_prefer_monotonic_elapsed_time() {
         Duration::seconds(30)
     );
 }
+
+#[path = "support/reference.rs"]
+mod reference;
+
+fn mixed_window(count: usize) -> (Vec<Observation>, Interval) {
+    let base = focus(1, 0, None);
+    let window = Interval {
+        start: window().start,
+        end: window().start + Duration::hours(4),
+    };
+    let observations = (0..count)
+        .map(|i| {
+            let mut o = base.clone();
+            o.id = i as i64 + 1;
+            o.envelope.source_key = hx_schema::SourceKey::new(format!("synthetic:{i}"));
+            o.envelope.time = hx_schema::ObservationTime::point(
+                window.start + Duration::milliseconds((i * 14_400_000 / count) as i64),
+            );
+            match i % 5 {
+                0..=2 => {
+                    o.envelope.kind = hx_schema::Kind::new("web.visit");
+                    o.envelope.payload = serde_json::json!({
+                        "url":"https://synthetic.invalid/page",
+                        "title":format!("Synthetic tab {}", i % 17)
+                    });
+                }
+                3 => {}
+                _ => {
+                    o.envelope.kind = hx_schema::Kind::new("collector.health");
+                    o.envelope.payload = serde_json::json!({
+                        "collector":"web", "status":"running", "dropped":0
+                    });
+                }
+            }
+            o
+        })
+        .collect();
+    (observations, window)
+}
+
+#[test]
+fn mixed_four_hour_window_under_two_seconds() {
+    let count = 20_000;
+    let (observations, window) = mixed_window(count);
+    let started = std::time::Instant::now();
+    let timeline = compile(&observations, window);
+    let elapsed = started.elapsed();
+    eprintln!("mixed observations={count}, compile={elapsed:?}");
+    assert_evidence(&timeline, &observations);
+    assert_eq!(
+        timeline
+            .lanes
+            .iter()
+            .find(|l| l.id.kind == "browser")
+            .unwrap()
+            .intervals
+            .len(),
+        count * 3 / 5
+    );
+    if !cfg!(debug_assertions) {
+        assert!(elapsed.as_secs_f64() < 2.0, "compile took {elapsed:?}");
+    }
+}
+
+#[test]
+fn all_trace_outputs_match_reference() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/traces");
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().join("observations.json").is_file() {
+            let (observations, truth) = fixture(entry.file_name().to_str().unwrap());
+            assert_eq!(
+                compile(&observations, truth.window),
+                reference::compile(&observations, truth.window),
+                "{}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn indexed_spans_match_scan_reference(
+        specs in prop::collection::vec((0u8..9, -120i64..800, prop::option::of(0i64..240), 0u8..3, 0u8..3, 0u8..4, any::<bool>(), any::<bool>()), 0..55)
+    ) {
+        let mut observations = Vec::new();
+        for (i, (kind, start, duration, device, source, revision, monotonic, duplicate)) in specs.into_iter().enumerate() {
+            let (kind, payload) = match kind {
+                0 => ("web.visit", serde_json::json!({"url":"https://synthetic.invalid"})),
+                1 => ("focus.span", serde_json::json!({"app_bundle_id":"synthetic.app","app_name":"Synthetic"})),
+                2 => ("presence.span", serde_json::json!({"state":"device_asleep"})),
+                3 => ("presence.span", serde_json::json!({"state":"locked"})),
+                4 => ("presence.span", serde_json::json!({"state":"active"})),
+                5 => ("collector.health", serde_json::json!({"collector":"web","status":"paused","dropped":0})),
+                6 => ("collector.health", serde_json::json!({"collector":"web.span","status":"running","dropped":0})),
+                7 => ("policy.gap", serde_json::json!({"reason":"synthetic"})),
+                _ => ("shell.command", serde_json::json!({"command":"synthetic","cwd":"/synthetic","duration_ms":12000})),
+            };
+            let mut o = event(i as i64 + 1, start, duration.map(|d| start + d), kind, payload);
+            o.envelope.device = (device != 0).then(|| hx_schema::DeviceId::new(format!("synthetic-{device}")));
+            o.envelope.connector_instance = hx_schema::ConnectorInstance::new(format!("synthetic:{source}"));
+            o.envelope.source_key = hx_schema::SourceKey::new(format!("event:{}", i / 2));
+            o.envelope.revision = hx_schema::Revision::new(format!("{revision}"));
+            o.envelope.sequence = Some(revision.into());
+            if revision == 3 { o.envelope.operation = Operation::Delete; }
+            if monotonic {
+                let stamp = |second: i64| hx_schema::MonoStamp {
+                    domain: hx_schema::ClockDomain::MachContinuous,
+                    boot_id: hx_schema::BootId::new(format!("synthetic-{device}")),
+                    nanos: ((second + 120) as u64) * 1_000_000_000,
+                };
+                o.envelope.time.mono_start = Some(stamp(start));
+                o.envelope.time.mono_end = duration.map(|d| stamp(start + d / 2));
+            }
+            if duplicate { let mut copy = o.clone(); copy.id += 1000; observations.push(copy); }
+            observations.push(o);
+        }
+        prop_assert_eq!(compile(&observations, window()), reference::compile(&observations, window()));
+    }
+}
+
+#[test]
+fn gap_heavy_browser_window_stays_bounded() {
+    let (mut observations, window) = mixed_window(20_000);
+    for (i, o) in observations.iter_mut().enumerate() {
+        if i % 10 == 4 {
+            o.envelope.payload["status"] = "paused".into();
+        }
+    }
+    let started = std::time::Instant::now();
+    let timeline = compile(&observations, window);
+    let elapsed = started.elapsed();
+    eprintln!("gap-heavy observations=20000, compile={elapsed:?}");
+    assert_evidence(&timeline, &observations);
+    assert_eq!(
+        timeline
+            .lanes
+            .iter()
+            .find(|l| l.id.kind == "browser")
+            .unwrap()
+            .intervals
+            .len(),
+        6_000
+    );
+    assert!(
+        timeline
+            .coverage
+            .iter()
+            .filter(|c| c.state == CoverageState::Suppressed)
+            .count()
+            > 1000
+    );
+    if !cfg!(debug_assertions) {
+        assert!(elapsed.as_secs_f64() < 2.0, "compile took {elapsed:?}");
+    }
+}

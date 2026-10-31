@@ -147,6 +147,7 @@ pub(super) fn compile(observations: &[Observation], window: Interval) -> Timelin
         .filter(|o| o.envelope.operation != Operation::Delete)
         .collect();
     coverage(&active, &mut t);
+    let index = SpanIndex::new(&active, &t.coverage);
     // Connector identity stays in the internal grouping even for device lanes.
     let mut groups: BTreeMap<(LaneId, String), Vec<&Observation>> = BTreeMap::new();
     for o in &active {
@@ -264,16 +265,7 @@ pub(super) fn compile(observations: &[Observation], window: Interval) -> Timelin
             }
             if matches!(id.kind.as_str(), "focus" | "presence" | "browser") {
                 if uncertain {
-                    let horizon = active
-                        .iter()
-                        .filter(|a| {
-                            a.envelope.connector_instance == o.envelope.connector_instance
-                                && a.envelope.device == o.envelope.device
-                                && collector_name(a) == collector_name(o)
-                        })
-                        .map(|a| end(a).max(at(a)))
-                        .max()
-                        .unwrap_or(start);
+                    let horizon = index.horizons[&collector_id(o)];
                     finish = events.get(i + 1).map(|n| at(n)).unwrap_or(horizon);
                     if let Some(next) = events.get(i + 1) {
                         let mut clock = o.envelope.time.clone();
@@ -291,16 +283,13 @@ pub(super) fn compile(observations: &[Observation], window: Interval) -> Timelin
                 if let Some(next) = events.get(i + 1) {
                     finish = finish.min(at(next));
                 }
-                if id.kind == "focus" || id.kind == "browser" {
-                    for sleep in &active {
-                        if key(sleep) == id.key
-                            && at(sleep) >= start
-                            && at(sleep) < finish
-                            && matches!(sleep.envelope.core_payload(), Some(Ok(Payload::PresenceSpan(p))) if matches!(p.state, hx_schema::kinds::DeviceState::DeviceAsleep | hx_schema::kinds::DeviceState::Locked | hx_schema::kinds::DeviceState::DisplayOff))
-                        {
-                            finish = at(sleep);
-                            uncertain = true;
-                        }
+                if (id.kind == "focus" || id.kind == "browser")
+                    && let Some(sleeps) = index.sleeps.get(&id.key)
+                {
+                    let next = sleeps.partition_point(|time| *time < start);
+                    if let Some(sleep) = sleeps.get(next).filter(|time| **time < finish) {
+                        finish = *sleep;
+                        uncertain = true;
                     }
                 }
             }
@@ -315,35 +304,35 @@ pub(super) fn compile(observations: &[Observation], window: Interval) -> Timelin
                 let open =
                     o.envelope.time.source_end.is_none() && o.envelope.time.mono_end.is_none();
                 if matches!(id.kind.as_str(), "focus" | "presence" | "browser") {
-                    for gap in &t.coverage {
-                        if gap.lane_key == key(o)
-                            && gap.state != CoverageState::Observed
-                            && gap
-                                .reason
-                                .as_deref()
-                                .is_some_and(|r| r.starts_with(&coverage_prefix(o)))
-                        {
-                            let mut remaining = Vec::new();
-                            for piece in pieces {
-                                if let Some(overlap) = piece.intersect(&gap.interval) {
-                                    uncertain = true;
-                                    if piece.start < overlap.start {
-                                        remaining.push(Interval {
-                                            start: piece.start,
-                                            end: overlap.start,
-                                        });
-                                    }
-                                    if !open && overlap.end < piece.end {
-                                        remaining.push(Interval {
-                                            start: overlap.end,
-                                            end: piece.end,
-                                        });
-                                    }
-                                } else {
-                                    remaining.push(piece);
+                    let gaps = &index.gaps[&(key(o), coverage_prefix(o))];
+                    let first = gaps.partition_point(|gap| gap.end <= interval.start);
+                    for gap in gaps[first..]
+                        .iter()
+                        .take_while(|gap| gap.start < interval.end)
+                    {
+                        let mut remaining = Vec::new();
+                        for piece in pieces {
+                            if let Some(overlap) = piece.intersect(gap) {
+                                uncertain = true;
+                                if piece.start < overlap.start {
+                                    remaining.push(Interval {
+                                        start: piece.start,
+                                        end: overlap.start,
+                                    });
                                 }
+                                if !open && overlap.end < piece.end {
+                                    remaining.push(Interval {
+                                        start: overlap.end,
+                                        end: piece.end,
+                                    });
+                                }
+                            } else {
+                                remaining.push(piece);
                             }
-                            pieces = remaining;
+                        }
+                        pieces = remaining;
+                        if open {
+                            break;
                         }
                     }
                 }
@@ -478,6 +467,73 @@ pub(super) fn compile(observations: &[Observation], window: Interval) -> Timelin
     t.aggregates
         .sort_by_key(|a| (a.day.clone(), a.label.clone(), a.evidence.clone()));
     t
+}
+
+// Device identity is kept separate from the rendered lane key (including None).
+type CollectorId = (String, Option<String>, String);
+fn collector_id(o: &Observation) -> CollectorId {
+    (
+        o.envelope.connector_instance.to_string(),
+        o.envelope.device.as_ref().map(ToString::to_string),
+        collector_name(o),
+    )
+}
+
+struct SpanIndex {
+    horizons: BTreeMap<CollectorId, DateTime<Utc>>,
+    sleeps: BTreeMap<String, Vec<DateTime<Utc>>>,
+    gaps: BTreeMap<(String, String), Vec<Interval>>,
+}
+impl SpanIndex {
+    fn new(active: &[&Observation], coverage: &[CoverageSpan]) -> Self {
+        let mut index = Self {
+            horizons: BTreeMap::new(),
+            sleeps: BTreeMap::new(),
+            gaps: BTreeMap::new(),
+        };
+        for o in active {
+            let finish = end(o).max(at(o));
+            index
+                .horizons
+                .entry(collector_id(o))
+                .and_modify(|last| *last = (*last).max(finish))
+                .or_insert(finish);
+            if matches!(o.envelope.core_payload(), Some(Ok(Payload::PresenceSpan(p))) if matches!(p.state, hx_schema::kinds::DeviceState::DeviceAsleep | hx_schema::kinds::DeviceState::Locked | hx_schema::kinds::DeviceState::DisplayOff))
+            {
+                index.sleeps.entry(key(o)).or_default().push(at(o));
+            }
+            index.gaps.entry((key(o), coverage_prefix(o))).or_default();
+        }
+        for sleeps in index.sleeps.values_mut() {
+            sleeps.sort_unstable();
+        }
+        for ((lane_key, prefix), gaps) in &mut index.gaps {
+            gaps.extend(
+                coverage
+                    .iter()
+                    .filter(|gap| {
+                        gap.lane_key == *lane_key
+                            && gap.state != CoverageState::Observed
+                            && gap.reason.as_deref().is_some_and(|r| r.starts_with(prefix))
+                    })
+                    .map(|gap| gap.interval),
+            );
+            // Only the union matters for subtraction, including open spans that stop at the first gap.
+            gaps.sort_unstable();
+            let mut merged: Vec<Interval> = Vec::new();
+            for gap in gaps.drain(..) {
+                if let Some(last) = merged.last_mut()
+                    && gap.start <= last.end
+                {
+                    last.end = last.end.max(gap.end);
+                } else {
+                    merged.push(gap);
+                }
+            }
+            *gaps = merged;
+        }
+        index
+    }
 }
 
 fn collector_name(o: &Observation) -> String {
