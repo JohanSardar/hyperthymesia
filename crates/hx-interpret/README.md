@@ -15,7 +15,28 @@ After the last check failure it returns the repaired interpretation with audit
 records; persistent JSON parse failures return an error. `check` preserves its
 frozen immutable signature and reports repairs on a clone. Call
 `check_and_repair` when validating externally loaded interpretations for use.
-Repairs also replace free prose so removed claims cannot survive in summaries.
+Prose repair follows the structured dependencies:
+
+- Only an episode with removed or downgraded claims has its title and description
+  regenerated from retained actor/action/object/outcome fields. Titles normalize
+  whitespace and are capped at 120 Unicode characters (including an ellipsis).
+  The outcome comes first so truncation cannot hide a downgrade. An episode with
+  no retained claims is labeled “Activity unknown (no supported claims)”.
+- Only retained tasks referencing a changed episode have prose regenerated from
+  their retained episodes and their goal cleared. A task referencing any removed
+  episode is dropped by the existing reference check. Unaffected episode/task
+  prose and goals remain byte-for-byte unchanged.
+- The summary is preserved only when no claims changed and no episodes or tasks
+  were removed. Otherwise it is rebuilt from retained episode titles ordered by
+  earliest interval start (stable input order breaks ties). Because summaries
+  have no assertion references, even one downgrade/removal requires rebuilding;
+  a window-only correction does not. Removing a task also triggers rebuilding
+  because the summary might repeat its unsupported prose or goal.
+
+Audit labels use claim positions rather than rejected action text, so removed
+instruction text is not echoed into validation failures. These checks preserve
+reference-based safety; they cannot detect unrelated hallucinations in otherwise
+valid model prose.
 
 The validator proves reference membership, interval support and independent
 corroboration presence. Explicit instruction-bearing evidence is ineligible to
