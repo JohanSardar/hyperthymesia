@@ -56,6 +56,14 @@ pub fn render_day(
             @for level in ["episodes","tasks"] {
                 section id=(level) class="zoom" {h2 {(level)}
                     @for revision in revisions {p {"Revision " (revision["revision_id"])}
+                        @if revision["has_agent_run"] == true {
+                            p {a href=(format!("/revision/{}/run",revision["revision_id"])) {"Agent tool-call log"}}
+                        }
+                        p {"Evidence: "
+                            @for id in crate::mcp::revision_evidence(&revision["interpretation"]) {
+                                a href=(if revision["has_agent_run"] == true {format!("/revision/{}/evidence/{id}",revision["revision_id"])} else {format!("/evidence/{id}")}) {(id)} " "
+                            }
+                        }
                         pre {(serde_json::to_string_pretty(&revision["interpretation"][level]).unwrap_or_default())}
                     }
                 }
@@ -205,4 +213,109 @@ pub async fn sign_in(
         axum::response::Redirect::to("/"),
     )
         .into_response())
+}
+
+/// Audit prose is indivisible: hide it when any input namespace or policy changed.
+async fn authorized_run(
+    store: &Store,
+    headers: &HeaderMap,
+    revision: i64,
+) -> ApiResult<serde_json::Value> {
+    use sqlx::Row;
+    let token = auth(store, headers, "read_raw").await?;
+    let row = sqlx::query("SELECT agent_run,input_namespaces,interpretation FROM revisions WHERE id=$1 AND agent_run IS NOT NULL")
+        .bind(revision).fetch_optional(&store.pool).await?.ok_or(crate::ApiError(axum::http::StatusCode::NOT_FOUND,"run not found".into()))?;
+    let namespaces: Vec<String> = row.get("input_namespaces");
+    let interpretation: serde_json::Value = row.get("interpretation");
+    let broker = crate::mcp::Broker::new(
+        store.clone(),
+        crate::disclosure::DisclosurePolicy::from_env()?,
+        crate::processing::SensitiveEgress::from_env(),
+        hx_store::window_at(Utc::now()),
+    );
+    if namespaces.iter().any(|ns| !token.allows(ns))
+        || interpretation["input_manifest"]["disclosure_policy"]["digest"] != broker.policy.digest()
+        || interpretation["input_manifest"]["sensitive_egress"]
+            != serde_json::json!(broker.sensitive)
+    {
+        return Err(crate::ApiError(
+            axum::http::StatusCode::NOT_FOUND,
+            "run unavailable under current policy".into(),
+        ));
+    }
+    let value: serde_json::Value = row.get("agent_run");
+    for id in value["evidence"]
+        .as_object()
+        .into_iter()
+        .flat_map(|v| v.keys())
+        .filter_map(|s| s.parse::<i64>().ok())
+    {
+        if !broker.allowed_id(id).await? {
+            return Err(crate::ApiError(
+                axum::http::StatusCode::NOT_FOUND,
+                "run unavailable under current policy".into(),
+            ));
+        }
+    }
+    Ok(value)
+}
+pub async fn revision_evidence(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path((revision, id)): Path<(i64, i64)>,
+) -> ApiResult<Html<String>> {
+    let run = authorized_run(&store, &headers, revision).await?;
+    let snapshot = run["evidence"][id.to_string()].clone();
+    if snapshot.is_null() {
+        return Err(crate::ApiError(
+            axum::http::StatusCode::NOT_FOUND,
+            "evidence not seen in this run".into(),
+        ));
+    }
+    let projection: serde_json::Value =
+        serde_json::from_str(snapshot["text"].as_str().unwrap_or("")).unwrap_or_default();
+    let mut links: Vec<String> = projection["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|link| link["target"].as_str().map(str::to_owned))
+        .collect();
+    for key in ["url", "commit_url", "source_url"] {
+        if let Some(url) = projection["payload"][key].as_str() {
+            links.push(url.to_owned());
+        }
+    }
+    links.retain(|url| {
+        ["https://", "http://", "t3://", "codex://", "claude://"]
+            .iter()
+            .any(|scheme| url.starts_with(scheme))
+    });
+    links.sort();
+    links.dedup();
+    Ok(shell(
+        "Agent evidence",
+        html! { h1 {"Evidence " (id) " seen in revision " (revision)}
+            p {a href=(format!("/revision/{revision}/run")) {"Agent tool-call log"} " · " a href=(format!("/evidence/{id}")) {"Original stored record and source links"}}
+            @for link in links {p {a href=(link.as_str()) rel="noreferrer noopener" {(link)}}}
+            pre {(serde_json::to_string_pretty(&snapshot).unwrap_or_default())}
+        },
+    ))
+}
+pub async fn run_page(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(revision): Path<i64>,
+) -> ApiResult<Html<String>> {
+    let run = authorized_run(&store, &headers, revision).await?;
+    Ok(shell(
+        "Agent run",
+        html! {h1 {"Agent run for revision " (revision)}
+            p {"fx " (run["fx_version"]) " / " (run["model"]) " / effort " (run["effort"]) " / fast " (run["fast"])}
+            @for (id,_) in run["evidence"].as_object().into_iter().flatten() {
+                a href=(format!("/revision/{revision}/evidence/{id}")) {"Evidence " (id)} " "
+            }
+            h2 {"Tool calls and exact results"} pre {(serde_json::to_string_pretty(&run["calls"]).unwrap_or_default())}
+            h2 {"fx completion log"} pre {(serde_json::to_string_pretty(&run["responses"]).unwrap_or_default())}
+        },
+    ))
 }

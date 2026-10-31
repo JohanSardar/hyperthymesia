@@ -2108,3 +2108,417 @@ async fn laptop_policy_turns_restricted_stills_into_ocr_text_only() {
     assert!(withheld.packet.evidence.is_empty());
     f.close().await;
 }
+
+#[tokio::test]
+async fn mcp_tools_are_bounded_and_current_policy_controls_all_context() {
+    use hx_server::{disclosure::DisclosurePolicy, mcp::Broker, processing::SensitiveEgress};
+    let f = Fixture::new().await;
+    let mut hidden = event("mcp-hidden", 1);
+    hidden.sensitivity = Sensitivity::Restricted;
+    hidden.payload["title"] = json!("SYNTHETIC_RESTRICTED_CANARY");
+    let mut visible = event("mcp-visible", 1);
+    visible.payload["title"] = json!("synthetic visible");
+    ingest(&f.store, vec![hidden, visible]).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    f.store.normalize_window(w).await.unwrap();
+    let observations = f.store.observations(w, true).await.unwrap();
+    let hidden = observations
+        .iter()
+        .find(|o| o.envelope.sensitivity == Sensitivity::Restricted)
+        .unwrap()
+        .id;
+    let visible = observations
+        .iter()
+        .find(|o| o.envelope.sensitivity == Sensitivity::Normal)
+        .unwrap()
+        .id;
+    let broker = Broker::new(
+        f.store.clone(),
+        DisclosurePolicy::default(),
+        SensitiveEgress::Full,
+        w,
+    );
+    for (tool, args) in [
+        ("window_overview", json!({"from":w.start,"to":w.end})),
+        (
+            "timeline",
+            json!({"from":w.start,"to":w.end,"level":"seconds"}),
+        ),
+        ("search", json!({"query":"synthetic"})),
+        ("read_evidence", json!({"id":hidden})),
+        ("read_evidence", json!({"id":visible})),
+        ("screen_at", json!({"time":w.start+Duration::hours(1)})),
+        ("list_sources", json!({})),
+        ("prior_context", json!({"before":w.end})),
+        (
+            "live_lookup",
+            json!({"source":"synthetic","request":"fixture"}),
+        ),
+    ] {
+        let result = broker.call(tool, args).await.unwrap();
+        assert!(
+            !result.to_string().contains("SYNTHETIC_RESTRICTED_CANARY"),
+            "{tool}"
+        );
+        assert!(serde_json::to_vec(&result).unwrap().len() <= hx_server::mcp::MAX_RESULT_BYTES);
+    }
+    assert!(broker.audit.lock().await.evidence.contains_key(&visible));
+    assert!(!broker.audit.lock().await.evidence.contains_key(&hidden));
+    f.store
+        .assert_entity("synthetic", json!({"name":"synthetic memory"}), &[visible])
+        .await
+        .unwrap();
+    assert_eq!(
+        broker.prior_context(w.end).await.unwrap()["entities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let deny = DisclosurePolicy::from_json(
+        r#"{"rules":[{"connector_prefix":"test:","kind":"*","class":"restricted"}]}"#,
+    )
+    .unwrap();
+    let denied = Broker::new(f.store.clone(), deny, SensitiveEgress::Full, w);
+    let context = denied.prior_context(w.end).await.unwrap();
+    assert!(context["entities"].as_array().unwrap().is_empty());
+    assert!(context["revisions"].as_array().unwrap().is_empty());
+    let grant = DisclosurePolicy::from_json(
+        r#"{"rules":[{"connector_prefix":"test:","kind":"*","class":"normal"}]}"#,
+    )
+    .unwrap();
+    // The owner can authorize a producer-restricted record; cached labels cannot veto it.
+    f.store
+        .assert_entity(
+            "synthetic granted",
+            json!({"name":"synthetic granted memory"}),
+            &[hidden],
+        )
+        .await
+        .unwrap();
+    let granted = Broker::new(f.store.clone(), grant, SensitiveEgress::Full, w);
+    assert_eq!(
+        granted.prior_context(w.end).await.unwrap()["entities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let calls = broker.audit.lock().await.calls.len();
+    for _ in calls..hx_server::mcp::MAX_CALLS {
+        broker.call("live_lookup", json!({})).await.unwrap();
+    }
+    assert!(broker.call("list_sources", json!({})).await.is_err());
+    assert!(broker.audit.lock().await.exhausted);
+    f.close().await;
+}
+
+#[cfg(unix)]
+fn fake_fx(dir: &std::path::Path, mode: &str) -> hx_server::fx::Config {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = dir.join(format!("fake-fx-{mode}"));
+    let script = r#"#!/usr/bin/python3
+import sys,os,json,pathlib,time,urllib.request
+if '--version' in sys.argv:
+ print('0.0.16');sys.exit(0)
+mode = 'MODE'
+home=pathlib.Path(os.environ['HOME']); work=pathlib.Path.cwd()
+settings=json.loads((home/'.fx/settings.json').read_text())
+assert settings['context'] is False and settings['permission']['*']=='deny'
+assert settings['permission']['mcp_hyperthymesia_*']=='allow'
+assert 0<settings['max_agent_steps']<=24
+assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude').exists()
+assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
+assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
+assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
+assert 'hx-replica/v1' in sys.argv[sys.argv.index('--system')+1]
+assert sys.stdin.read().strip()
+if mode=='timeout': time.sleep(3)
+if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
+if mode=='rate': print(json.dumps({'error':'429 rate limited','exit_code':1}));sys.exit(1)
+server=json.loads((home/'.fx/mcp.json').read_text())['mcpServers']['hyperthymesia']
+def rpc(method,params):
+ req=urllib.request.Request(server['url'],data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['HX_MCP_TOKEN']})
+ return json.load(urllib.request.urlopen(req))['result']
+rpc('initialize',{})
+assert len(rpc('tools/list',{})['tools'])==8
+result=rpc('tools/call',{'name':'window_overview','arguments':{'from':'2026-01-01T00:00:00Z','to':'2026-01-01T04:00:00Z'}})
+data=json.loads(result['content'][0]['text'])
+assert 'SYNTHETIC_RESTRICTED_CANARY' not in json.dumps(data)
+e=data['evidence'][0]; point={'start':e['at'],'end':e['at']}
+answer={'episodes':[{'id':'synthetic-episode','intervals':[point],'title':'Synthetic visit','description':'Synthetic visit','claims':[{'actor':'owner','action':'visited','object':'synthetic page','outcome':'unknown','basis':'observed','evidence':[e['id']],'outcome_evidence':[]}],'evidence':[e['id']],'confidence':0.8}], 'tasks':[], 'summary':'Synthetic visit'}
+if mode=='invalid': answer='this is not JSON'
+if mode=='repair-failure':
+ counter=pathlib.Path('COUNTER')
+ if counter.exists(): print(json.dumps({'error':'synthetic repair failure','exit_code':1}));sys.exit(1)
+ counter.write_text('1'); answer['episodes'][0]['claims'][0]['outcome']='completed'
+print(json.dumps({'exit_code':0,'model':'gpt-6.1-sol','steps':2,'final_output':answer if isinstance(answer,str) else json.dumps(answer),'tool_calls':[{'name':'mcp_hyperthymesia_window_overview','status':'success'}]}))
+"#;
+    std::fs::write(
+        &binary,
+        script
+            .replace("MODE", mode)
+            .replace("COUNTER", dir.join("counter").to_str().unwrap()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let credential = dir.join("synthetic-auth.json");
+    std::fs::write(&credential, "{}").unwrap();
+    hx_server::fx::Config {
+        binary,
+        credential,
+        timeout: std::time::Duration::from_secs(10),
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("fx-visible", 1)]).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "success");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-success", &config)
+            .await
+            .unwrap()
+    );
+    let previous: i64 =
+        sqlx::query_scalar("SELECT canonical_revision FROM windows WHERE start_at=$1")
+            .bind(w.start)
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    let row = sqlx::query("SELECT interpretation,agent_run FROM revisions WHERE id=$1")
+        .bind(previous)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let value: Value = row.get("interpretation");
+    let run: Value = row.get("agent_run");
+    assert_eq!(value["episodes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        value["input_manifest"]["input_namespaces"],
+        json!(["test:device"])
+    );
+    assert_eq!(run["fx_version"], "0.0.16");
+    assert_eq!(run["effort"], "xhigh");
+    assert_eq!(run["fast"], true);
+    let id = value["episodes"][0]["evidence"][0].as_i64().unwrap();
+    assert_eq!(run["evidence"][id.to_string()]["id"], id);
+    assert_eq!(
+        run["calls"][0]["result"]["evidence"][0],
+        run["evidence"][id.to_string()]
+    );
+    let secret = f
+        .store
+        .create_token(
+            "synthetic dashboard",
+            vec!["test:".into()],
+            vec!["read_raw".into()],
+        )
+        .await
+        .unwrap();
+    for path in [
+        format!("/revision/{previous}/run"),
+        format!("/revision/{previous}/evidence/{id}"),
+    ] {
+        let response = hx_server::router(f.store.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header("authorization", format!("Bearer {secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("synthetic"));
+    }
+    for mode in ["invalid", "failure", "timeout", "rate"] {
+        let mut config = fake_fx(scratch.path(), mode);
+        if mode == "timeout" {
+            config.timeout = std::time::Duration::from_millis(100);
+        }
+        let result =
+            hx_server::fx::interpret_window(&f.store, w, &format!("synthetic-fx-{mode}"), &config)
+                .await;
+        assert!(result.is_err(), "{mode}");
+        if mode == "rate" {
+            assert!(matches!(
+                result.unwrap_err().downcast_ref::<hx_jobs::Deferred>(),
+                Some(hx_jobs::Deferred::RateLimited)
+            ));
+        }
+        let canonical: i64 =
+            sqlx::query_scalar("SELECT canonical_revision FROM windows WHERE start_at=$1")
+                .bind(w.start)
+                .fetch_one(&f.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(canonical, previous, "{mode} replaced served revision");
+    }
+    let generation = f.store.generation(w).await.unwrap();
+    sqlx::query("UPDATE windows SET generation=generation+1 WHERE start_at=$1")
+        .bind(w.start)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert!(
+        !f.store
+            .publish_revision_manifest(
+                w,
+                generation,
+                json!({"episodes":[],"tasks":[],"agent_run":{}}),
+                "synthetic-stale-agent",
+                &[]
+            )
+            .await
+            .unwrap()
+            .1
+    );
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM revisions WHERE output_key='synthetic-stale-agent'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(stale, 0);
+    let config = fake_fx(scratch.path(), "repair-failure");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-repaired", &config)
+            .await
+            .unwrap()
+    );
+    let value: Value = sqlx::query_scalar(
+        "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-repaired'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(value["episodes"][0]["claims"][0]["outcome"], "attempted");
+    assert!(!value["check_failures"].as_array().unwrap().is_empty());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn fx_live_synthetic_only_when_explicitly_enabled() {
+    if std::env::var("HX_LIVE_FX").as_deref() != Ok("1") {
+        return;
+    }
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("synthetic-live-fx", 1)]).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    f.store.normalize_window(w).await.unwrap();
+    let broker = hx_server::mcp::Broker::new(
+        f.store.clone(),
+        hx_server::disclosure::DisclosurePolicy::default(),
+        hx_server::processing::SensitiveEgress::Full,
+        w,
+    );
+    let result=hx_server::fx::run(&hx_server::fx::Config::from_env(),&broker,"SYNTHETIC FIXTURE ONLY. Use window_overview from 2026-01-01T00:00:00Z to 2026-01-01T04:00:00Z. Then return JSON episodes:[], tasks:[], summary:'Synthetic fixture inspected'. Do not call other tools except capability_search or mcp_select_tool to find Hyperthymesia tools.").await.unwrap();
+    assert_eq!(result["model"], "gpt-6.1-sol");
+    assert!(
+        !broker.audit.lock().await.calls.is_empty(),
+        "real fx must reach the synthetic MCP server"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn mcp_ocr_only_dense_results_new_sources_and_prior_revision_filter() {
+    use hx_server::{disclosure::DisclosurePolicy, mcp::Broker, processing::SensitiveEgress};
+    let f = Fixture::new().await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    let bytes = synthetic_png(0);
+    ingest(
+        &f.store,
+        vec![still("mcp-ocr", 0, Sensitivity::Normal, &bytes)],
+    )
+    .await;
+    f.store
+        .upload_blob(&hx_store::hash(&bytes), &bytes)
+        .await
+        .unwrap();
+    drain_ocr(&f.store, SyntheticOcr::new(false), "synthetic-mcp/v1").await;
+    let broker = Broker::new(
+        f.store.clone(),
+        DisclosurePolicy::default(),
+        SensitiveEgress::Full,
+        w,
+    );
+    let result = broker
+        .call("screen_at", json!({"time":w.start+Duration::hours(1)}))
+        .await
+        .unwrap();
+    let ocr = result["evidence"][0].clone();
+    assert_eq!(ocr["kind"], "normal:ocr.text");
+    assert!(ocr["text"].as_str().unwrap().contains("SYNTHETIC ORCHID"));
+    assert!(!result.to_string().contains("image/png"));
+    let id = ocr["id"].as_i64().unwrap();
+    let read = broker
+        .call("read_evidence", json!({"id":id}))
+        .await
+        .unwrap();
+    assert_eq!(read["evidence"][0], ocr);
+    // Newly connected source kinds require neither prompt nor tool changes.
+    let mut new_source = event("mcp-new-source", 1);
+    new_source.kind = Kind::new("synthetic.document");
+    new_source.payload = json!({"text":"synthetic comet discovery"});
+    ingest(&f.store, vec![new_source]).await;
+    let search = broker
+        .call("search", json!({"query":"comet discovery"}))
+        .await
+        .unwrap();
+    assert_eq!(search["evidence"].as_array().unwrap().len(), 1);
+    let visible = search["evidence"][0]["id"].as_i64().unwrap();
+    let sources = broker.call("list_sources", json!({})).await.unwrap();
+    assert!(sources.to_string().contains("synthetic.document"));
+    let generation = f.store.generation(w).await.unwrap();
+    f.store.publish_revision(w,generation,json!({"episodes":[{"evidence":[visible]}],"tasks":[],"summary":"synthetic prior","input_manifest":{"disclosure_policy":{"digest":DisclosurePolicy::default().digest()},"sensitive_egress":"full"}})).await.unwrap();
+    assert_eq!(
+        broker.prior_context(w.end).await.unwrap()["revisions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let deny=DisclosurePolicy::from_json(r#"{"rules":[{"connector_prefix":"test:","kind":"synthetic.document","class":"restricted"}]}"#).unwrap();
+    let denied = Broker::new(f.store.clone(), deny, SensitiveEgress::Full, w);
+    assert!(
+        denied.prior_context(w.end).await.unwrap()["revisions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let mut dense = vec![];
+    for i in 0..40 {
+        let mut e = event(&format!("mcp-dense-{i}"), 2);
+        e.payload["title"] = json!(format!("synthetic dense {}", "🌸".repeat(4000)));
+        dense.push(e);
+    }
+    ingest(&f.store, dense).await;
+    let result = broker
+        .call("search", json!({"query":"synthetic dense"}))
+        .await
+        .unwrap();
+    assert_eq!(result["truncated"], true);
+    assert!(serde_json::to_vec(&result).unwrap().len() <= hx_server::mcp::MAX_RESULT_BYTES);
+    for item in result["evidence"].as_array().unwrap() {
+        assert!(serde_json::from_str::<Value>(item["text"].as_str().unwrap()).is_ok());
+    }
+    f.close().await;
+}

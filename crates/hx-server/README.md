@@ -216,3 +216,80 @@ producer-controlled disclosure grant. Synthetic fake-engine tests exercise jobs,
 exact caching, sampling, lineage, retries, packet inclusion, authorization and HTML
 escaping on every platform. `hx-visual` also tests real Vision OCR on a generated
 text image only on macOS; capture permissions and actual screenshots are unused.
+
+## fx agent interpreter
+
+Run migrations, then select `HX_PROVIDER=fx` for `serve` or `interpret`. The stub
+(default) and `HX_PROVIDER=claude` remain available. fx **0.0.16** is required;
+version drift fails closed. `HX_FX_BINARY` overrides `$HOME/.local/bin/fx` and
+`HX_FX_CREDENTIAL` overrides `$HOME/.fx/chatgpt-auth.json`. Sign in separately
+with `fx login codex`; jobs never initiate sign-in or show approval dialogs.
+
+Each window gets an authenticated, ephemeral loopback Streamable HTTP MCP server.
+The bearer credential is random, per invocation, and never stored with the run.
+Only the eight tools in the agent spec are exposed. Results are at most 48 KiB,
+records use explicit excerpts above 12 KiB, and scans cover at most 2,000 rows.
+Narrow time ranges to explore dense data. Timeline levels preserve exact seconds;
+`minutes`/`lanes` select the same lossless compiled projection. Source completeness
+is explicitly unknown rather than inferred from silence. Search defaults to the
+job window; explicit ranges may cover any day in the store. `screen_at` returns
+OCR/text and focus within 30 seconds, with no image bytes.
+
+Jobs use a private temporary HOME/profile and empty working directory: `context`
+is false, all skill discovery roots are empty, inherited MCP servers and settings
+are absent, and all tools are denied except broker discovery and the broker's
+namespaced tools. The subscription credential alone is copied with mode 0600 and
+removed with the temporary directory. fx's credential advisory lock serializes
+refreshes; refreshed credentials are atomically persisted back to the source file
+with mode 0600, including on cancellation. Busy credentials defer the job without
+spending attempts. Environment variables (including API keys,
+tracing, additional workspaces and user shell configuration) are not inherited.
+No full-access flag is used. The network boundary is fx's denied tools, not an OS
+network sandbox; the harness itself still contacts ChatGPT and the loopback MCP
+server. Automatic upgrades, session saves, prompt history, titles and sounds are
+disabled. `--system` accepts text, so the compiled-in versioned prompt file's
+contents are passed verbatim, with its version and SHA-256 recorded.
+
+A run has 24 total model steps across up to three scoped repairs, 80 total broker
+calls and a 180-second total timeout. Output streams are capped at 2 MiB each.
+Provider failures and timeouts keep the previous canonical revision. A valid
+repaired response is retained if a later repair fails. Subscription rate limits
+defer jobs for five minutes without consuming attempts. Publication checks the
+input generation atomically and rejects stale agent runs without storing them.
+
+`revisions.agent_run` stores exact broker arguments/results, evidence projections,
+fx JSON completion logs, and pinned model/prompt settings in the same transaction
+as the revision. Dashboard evidence links under `/revision/{revision}/evidence/{id}`
+open that immutable projection, with a link to the original stored record and its
+source links. `/revision/{revision}/run` shows the complete audit. These routes
+require raw-read authorization for every input namespace and fail closed when the
+current disclosure policy or sensitive-egress setting differs from the run.
+Legacy prior replicas without a matching policy manifest are withheld. Entity
+assertions resolve their evidence against the current policy, regardless of cached
+producer labels.
+
+`live_lookup` currently returns `no live connectors configured`. A future connector
+must snapshot the exact returned content into an immutable server-owned event
+before returning it: use an authenticated connector namespace, source URL and
+retrieval timestamp, preserve the complete response as text/JSON evidence, assign
+an event ID, and project it through the same disclosure broker. A changing remote
+document creates another event/revision; it must never mutate the cited snapshot.
+The generation manifest must include the new snapshot before publication. No live
+connector or remote network operation is reachable through the current stub.
+
+Synthetic tests:
+
+```sh
+CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="$PWD/scripts/synthetic-test-runner.py" \
+  HX_TEST_DATABASE_URL=postgres://hx:hx@localhost:55432/YOUR_SCRATCH_DB cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+# Optional subscription smoke, synthetic fixtures only:
+CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="$PWD/scripts/synthetic-test-runner.py" \
+  HX_TEST_DATABASE_URL=postgres://hx:hx@localhost:55432/YOUR_SCRATCH_DB HX_LIVE_FX=1 \
+  HX_FX_BINARY=/absolute/path/to/fx HX_FX_CREDENTIAL=/absolute/path/to/chatgpt-auth.json \
+  cargo test -p hx-server --test server fx_live_synthetic_only -- --nocapture
+```
+
+Use the runner variable for your Rust host triple on other platforms. The runner
+keeps connector fixtures from consulting real home directories. The live smoke
+requires explicit binary and credential paths because its test home is empty.
