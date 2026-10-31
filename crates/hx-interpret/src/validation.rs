@@ -133,14 +133,12 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
                 fail(&item, "rejected unknown outcome");
                 return false;
             }
+            // A source describing somebody's action is testimony, even when the
+            // citation is independent. Mixed citations need a direct observation.
             if claim.basis == Basis::Observed
-                && claim
-                    .evidence
-                    .iter()
-                    .filter_map(|id| evidence.get(id))
-                    .all(|e| {
-                        e.kind.ends_with(":agent.message") || e.kind.ends_with(":calendar.event")
-                    })
+                && !claim.evidence.iter().any(|id| {
+                    independent(id) && evidence.get(id).is_some_and(|e| observes_actor(e, claim))
+                })
             {
                 claim.basis = Basis::ReportedBySource;
                 fail(
@@ -148,11 +146,18 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
                     "downgraded source report presented as observed action",
                 );
             }
-            if claim.outcome == "completed" && !claim.outcome_evidence.iter().any(independent) {
+            if claim.outcome == "completed"
+                && !claim.outcome_evidence.iter().any(|id| {
+                    independent(id)
+                        && evidence
+                            .get(id)
+                            .is_some_and(|e| supports_completion(e, claim))
+                })
+            {
                 claim.outcome = "attempted".into();
                 fail(
                     &item,
-                    "downgraded completion without independent outcome evidence",
+                    "downgraded completion without supported independent outcome evidence",
                 );
             }
             true
@@ -238,11 +243,79 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
     failures
 }
 
+/// Free-form text is not a machine-verifiable outcome. In particular, browsing,
+/// checkout clicks, source statements and planned work cannot prove completion.
+/// Accept only outcomes with a typed result and a claim bound to that exact result;
+/// extend this allowlist when new outcome-bearing connector schemas are available.
+fn supports_completion(e: &EvidenceItem, claim: &Claim) -> bool {
+    if !observes_actor(e, claim) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&e.text) else {
+        return false;
+    };
+    let payload = value.get("payload").unwrap_or(&value);
+    match e.kind.strip_prefix("normal:") {
+        Some("shell.command") => {
+            matches!(
+                claim.action.to_ascii_lowercase().as_str(),
+                "run" | "execute"
+            ) && payload["command"].as_str() == Some(claim.object.as_str())
+                && payload["exit_code"].as_i64().is_some()
+        }
+        Some("code.commit") => {
+            claim.action.eq_ignore_ascii_case("commit")
+                && payload["sha"]
+                    .as_str()
+                    .is_some_and(|sha| !sha.is_empty() && sha == claim.object)
+        }
+        _ => false,
+    }
+}
+
+// Unbound statements about somebody else are testimony. A named actor needs
+// source-owned subject attribution; a model-provided name is not that binding.
+fn observes_actor(e: &EvidenceItem, claim: &Claim) -> bool {
+    !source_report(e)
+        && (claim.actor == "subject"
+            || serde_json::from_str::<serde_json::Value>(&e.text)
+                .ok()
+                .is_some_and(|value| value["subject"].as_str() == Some(claim.actor.as_str())))
+}
+
+fn source_report(e: &EvidenceItem) -> bool {
+    if matches!(
+        e.kind.strip_prefix("normal:"),
+        Some("agent.message" | "message.event")
+    ) {
+        return true;
+    }
+    let text = e.text.to_ascii_lowercase();
+    [
+        "source report",
+        "reported by",
+        "reports that",
+        "says ",
+        "said ",
+        "no direct observation",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
 fn claim_prose(claim: &Claim) -> String {
     // Put the outcome first so truncating a title cannot hide an attempted outcome.
     format!(
-        "{}: {} {} {}",
-        claim.outcome, claim.actor, claim.action, claim.object
+        "{}: {}{} {} {}",
+        claim.outcome,
+        if claim.basis == Basis::ReportedBySource {
+            "reported by source: "
+        } else {
+            ""
+        },
+        claim.actor,
+        claim.action,
+        claim.object
     )
 }
 

@@ -83,8 +83,7 @@ impl Provider for StubProvider {
 }
 pub async fn compile_window(store: &Store, w: Interval) -> Result<(Timeline, i64)> {
     let generation = store.generation(w).await?;
-    let pending:i64=sqlx::query_scalar("SELECT count(*) FROM events e WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 AND NOT EXISTS(SELECT 1 FROM normalized n WHERE n.event_id=e.id) AND NOT EXISTS(SELECT 1 FROM quarantine q WHERE q.event_id=e.id)")
-        .bind(w.start).bind(w.end).fetch_one(&store.pool).await?;
+    let pending = store.pending_normalization(w).await?;
     if pending > 0 {
         return Err(Deferred::NormalizationPending.into());
     }
@@ -221,8 +220,7 @@ pub async fn prepare_input_with_policy(
         start: w.start - Duration::minutes(30),
         end: w.end,
     };
-    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM events e WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 AND NOT EXISTS(SELECT 1 FROM normalized n WHERE n.event_id=e.id) AND NOT EXISTS(SELECT 1 FROM quarantine q WHERE q.event_id=e.id)")
-        .bind(expanded.start).bind(expanded.end).fetch_one(&store.pool).await?;
+    let pending = store.pending_normalization(expanded).await?;
     if pending > 0 {
         return Err(Deferred::NormalizationPending.into());
     }
@@ -381,6 +379,9 @@ impl<P: Provider> Handler for Runner<P> {
     }
 }
 pub async fn schedule(store: &Store) -> Result<()> {
+    // Retry bounded rounds after a cooldown, including interpretations whose
+    // compilation is already clean or whose previous canonical view is stale.
+    hx_jobs::revive_window_jobs(&store.pool).await?;
     let current = hx_store::window_at(Utc::now() - Duration::hours(4));
     store.generation(current).await?;
     let rows=sqlx::query("SELECT start_at,end_at,generation FROM windows WHERE dirty OR (end_at<=now() AND canonical_revision IS NULL) ORDER BY start_at LIMIT 1000").fetch_all(&store.pool).await?;
