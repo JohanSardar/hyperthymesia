@@ -1010,7 +1010,6 @@ async fn synthetic_day_burst() {
 }
 
 #[tokio::test]
-#[ignore = "known quadratic open-browser-transition cost in hx-compile; run separately in release"]
 async fn synthetic_browser_point_stress() {
     synthetic_burst(true).await;
 }
