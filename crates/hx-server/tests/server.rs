@@ -1379,6 +1379,431 @@ async fn backfilled_evidence_is_placed_at_source_time() {
     f.close().await;
 }
 
+// Every OCR test uses generated PNG bytes, an injected engine, and a scratch schema.
+struct SyntheticOcr {
+    calls: std::sync::atomic::AtomicUsize,
+    fail: bool,
+}
+impl SyntheticOcr {
+    fn new(fail: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail,
+        })
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+impl hx_visual::OcrEngine for SyntheticOcr {
+    fn ocr(&self, _: &[u8], _: &str) -> anyhow::Result<hx_visual::OcrResult> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(!self.fail, "synthetic engine failure: PRIVATE TEXT");
+        Ok(hx_visual::OcrResult {
+            engine_name: "synthetic".into(),
+            engine_version: "1".into(),
+            coverage: "partial".into(),
+            lines: vec![hx_visual::OcrLine {
+                text: format!(
+                    "SYNTHETIC ORCHID <script>alert(1)</script> {}",
+                    "🌸".repeat(3000)
+                ),
+                confidence: 1.0,
+                bbox: hx_visual::BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+            }],
+        })
+    }
+}
+fn synthetic_png(variant: u8) -> Vec<u8> {
+    let mut pixels = image::GrayImage::new(64, 64);
+    for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+        *pixel = image::Luma([if x < 32 { 10 + variant } else { 240 - variant }]);
+        if x == 1 && y == 1 {
+            *pixel = image::Luma([variant]);
+        }
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageLuma8(pixels)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+fn still(key: &str, seconds: i64, sensitivity: Sensitivity, bytes: &[u8]) -> Envelope {
+    let mut e = event(key, 1);
+    e.time = ObservationTime::point(e.time.observed_at + Duration::seconds(seconds));
+    e.kind = Kind::new("media.still");
+    e.device = Some(hx_schema::DeviceId::new("synthetic-device"));
+    e.payload = json!({"display":"synthetic","trigger":"focus_change","width":64,"height":64,"app_bundle_id":"synthetic.app"});
+    e.sensitivity = sensitivity;
+    e.blobs.push(hx_schema::BlobRef {
+        sha256: hx_store::hash(bytes),
+        media_type: "image/png".into(),
+        bytes: bytes.len() as u64,
+    });
+    e
+}
+async fn drain_ocr(store: &Store, engine: std::sync::Arc<SyntheticOcr>, version: &str) {
+    hx_server::ocr::discover(store, version).await.unwrap();
+    while hx_server::ocr::run_one(store, engine.clone(), version)
+        .await
+        .unwrap()
+    {}
+}
+
+#[tokio::test]
+async fn ocr_backfill_exact_cache_lineage_packet_and_dashboard() {
+    let f = Fixture::new().await;
+    let bytes = synthetic_png(0);
+    let sha = hx_store::hash(&bytes);
+    let first = still("ocr-first", 0, Sensitivity::Normal, &bytes);
+    let observation_id = first.observation_id.to_string();
+    let source_time = first.time.source_start.unwrap();
+    ingest(&f.store, vec![first]).await;
+    let engine = SyntheticOcr::new(false);
+    // Event-first arrival does not consume OCR attempts before its blob is published.
+    drain_ocr(&f.store, engine.clone(), "fake/v1").await;
+    assert_eq!(engine.calls(), 0);
+    f.store.upload_blob(&sha, &bytes).await.unwrap();
+    drain_ocr(&f.store, engine.clone(), "fake/v1").await;
+    // New observations may arrive after the cached blob was already processed.
+    ingest(
+        &f.store,
+        vec![still("ocr-late", 60, Sensitivity::Restricted, &bytes)],
+    )
+    .await;
+    drain_ocr(&f.store, engine.clone(), "fake/v1").await;
+    assert_eq!(engine.calls(), 1);
+    assert!(!f.store.upload_blob(&sha, &bytes).await.unwrap());
+    let rows =
+        sqlx::query("SELECT id,source_event_id,sensitivity,envelope FROM ocr_derived ORDER BY id")
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<String, _>("sensitivity"), "normal");
+    assert_eq!(rows[1].get::<String, _>("sensitivity"), "restricted");
+    let envelope: Value = rows[0].get("envelope");
+    assert_eq!(envelope["payload"]["source_observation_id"], observation_id);
+    assert_eq!(envelope["payload"]["sha256"], sha);
+    assert_eq!(envelope["connector_instance"], "test:device");
+    assert_eq!(envelope["device"], "synthetic-device");
+    let source_id: i64 = rows[0].get("source_event_id");
+    let derived_id: i64 = rows[0].get("id");
+    let source = f.store.evidence(source_id).await.unwrap().unwrap();
+    assert_eq!(envelope["time"], source["envelope"]["time"]);
+    let w = hx_store::window_at(source_time);
+    f.store.normalize_window(w).await.unwrap();
+    let prepared = hx_server::processing::prepare_input_with(
+        &f.store,
+        w,
+        "synthetic",
+        hx_server::processing::SensitiveEgress::Full,
+    )
+    .await
+    .unwrap();
+    let ocr: Vec<_> = prepared
+        .packet
+        .evidence
+        .iter()
+        .filter(|e| e.kind == "normal:ocr.text")
+        .collect();
+    assert_eq!(ocr.len(), 1);
+    assert_eq!(ocr[0].id, derived_id);
+    assert_eq!(ocr[0].at, source_time);
+    assert!(ocr[0].text.contains("ORCHID"));
+    assert!(ocr[0].text.len() <= hx_interpret::PacketBudget::default().max_item_chars);
+    let value = hx_server::authorized_evidence(&f.store, &token(), derived_id)
+        .await
+        .unwrap();
+    assert_eq!(value["source_event_id"], source_id);
+    let denied = Token {
+        prefixes: vec!["other:".into()],
+        scopes: vec!["read_raw".into()],
+    };
+    assert!(
+        hx_server::authorized_evidence(&f.store, &denied, derived_id)
+            .await
+            .is_err()
+    );
+    let secret = f
+        .store
+        .create_token("ocr-reader", token().prefixes, token().scopes)
+        .await
+        .unwrap();
+    let response = hx_server::router(f.store.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/evidence/{source_id}"))
+                .header("authorization", format!("Bearer {secret}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("data:image/png;base64,"));
+    assert!(body.contains("OCR text"));
+    assert!(body.contains("&lt;script&gt;"));
+    assert!(!body.contains("<script>alert(1)</script>"));
+    // Version bumps produce new durable results, then remain exact-cache hits.
+    drain_ocr(&f.store, engine.clone(), "fake/v2").await;
+    drain_ocr(&f.store, engine.clone(), "fake/v2").await;
+    assert_eq!(engine.calls(), 2);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn ocr_sampling_is_not_text_reuse_and_is_scoped_to_surface() {
+    let f = Fixture::new().await;
+    let engine = SyntheticOcr::new(false);
+    for (key, second, variant, surface) in [
+        ("a", 0, 0, "one"),
+        ("b", 1, 1, "one"),
+        ("c", 2, 2, "two"),
+        ("d", 90, 3, "one"),
+    ] {
+        let bytes = synthetic_png(variant);
+        // Blob-first ordering is also discovered.
+        f.store
+            .upload_blob(&hx_store::hash(&bytes), &bytes)
+            .await
+            .unwrap();
+        let mut e = still(key, second, Sensitivity::Normal, &bytes);
+        e.payload["display"] = json!(surface);
+        ingest(&f.store, vec![e]).await;
+        drain_ocr(&f.store, engine.clone(), "fake/v1").await;
+    }
+    assert_eq!(engine.calls(), 3);
+    let sampled: i64 = sqlx::query_scalar("SELECT count(*) FROM ocr_jobs WHERE status='sampled' AND result IS NULL AND sampled_from IS NOT NULL").fetch_one(&f.store.pool).await.unwrap();
+    assert_eq!(sampled, 1);
+    let evidence: i64 = sqlx::query_scalar("SELECT count(*) FROM ocr_evidence")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(evidence, 3);
+    assert_eq!(count(&f.store, "events").await, 4);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn ocr_source_policy_redaction_self_generated_and_bounded_retries() {
+    let f = Fixture::new().await;
+    let bytes = synthetic_png(0);
+    f.store
+        .upload_blob(&hx_store::hash(&bytes), &bytes)
+        .await
+        .unwrap();
+    let mut e = still("sensitive", 0, Sensitivity::Sensitive, &bytes);
+    e.payload["window_title"] = json!("Hyperthymesia synthetic");
+    ingest(&f.store, vec![e]).await;
+    let engine = SyntheticOcr::new(false);
+    drain_ocr(&f.store, engine.clone(), "fake/v1").await;
+    let at = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap();
+    let w = hx_store::window_at(at);
+    f.store.normalize_window(w).await.unwrap();
+    for policy in [
+        hx_server::processing::SensitiveEgress::Full,
+        hx_server::processing::SensitiveEgress::Redact,
+    ] {
+        let input = hx_server::processing::prepare_input_with(&f.store, w, "synthetic", policy)
+            .await
+            .unwrap();
+        let item = input
+            .packet
+            .evidence
+            .iter()
+            .find(|e| e.kind.ends_with("ocr.text"))
+            .unwrap();
+        assert!(item.self_generated);
+        assert_eq!(
+            item.text.contains("ORCHID"),
+            policy == hx_server::processing::SensitiveEgress::Full
+        );
+    }
+    let broken = SyntheticOcr::new(true);
+    hx_server::ocr::discover(&f.store, "broken/v1")
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        assert!(
+            hx_server::ocr::run_one(&f.store, broken.clone(), "broken/v1")
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE ocr_jobs SET available_at=now() WHERE engine_version='broken/v1'")
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+    }
+    assert!(
+        !hx_server::ocr::run_one(&f.store, broken.clone(), "broken/v1")
+            .await
+            .unwrap()
+    );
+    assert_eq!(broken.calls(), 5);
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM ocr_jobs WHERE engine_version='broken/v1'")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "failed");
+    f.close().await;
+}
+
+struct ConcurrentOcr {
+    calls: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+    maximum: std::sync::atomic::AtomicUsize,
+}
+impl hx_visual::OcrEngine for ConcurrentOcr {
+    fn ocr(&self, bytes: &[u8], media: &str) -> anyhow::Result<hx_visual::OcrResult> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.calls.fetch_add(1, SeqCst);
+        let active = self.active.fetch_add(1, SeqCst) + 1;
+        self.maximum.fetch_max(active, SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        self.active.fetch_sub(1, SeqCst);
+        hx_visual::NullEngine.ocr(bytes, media)
+    }
+}
+#[tokio::test]
+async fn ocr_concurrent_workers_are_bounded_and_committed_results_survive_restart() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::SeqCst},
+    };
+    let f = Fixture::new().await;
+    for i in 0..3 {
+        let bytes = synthetic_png(i);
+        let e = still(
+            &format!("concurrent-{i}"),
+            i64::from(i) * 60,
+            Sensitivity::Normal,
+            &bytes,
+        );
+        f.store
+            .upload_blob(&hx_store::hash(&bytes), &bytes)
+            .await
+            .unwrap();
+        ingest(&f.store, vec![e]).await;
+    }
+    hx_server::ocr::discover(&f.store, "fake/v1").await.unwrap();
+    let engine = Arc::new(ConcurrentOcr {
+        calls: AtomicUsize::new(0),
+        active: AtomicUsize::new(0),
+        maximum: AtomicUsize::new(0),
+    });
+    for _ in 0..3 {
+        let (a, b) = tokio::join!(
+            hx_server::ocr::run_one(&f.store, engine.clone(), "fake/v1"),
+            hx_server::ocr::run_one(&f.store, engine.clone(), "fake/v1")
+        );
+        a.unwrap();
+        b.unwrap();
+    }
+    assert_eq!(engine.calls.load(SeqCst), 3);
+    assert_eq!(engine.maximum.load(SeqCst), 1);
+    // A fresh engine/worker sees the committed cache, not in-memory state.
+    let restarted = SyntheticOcr::new(false);
+    drain_ocr(&f.store, restarted.clone(), "fake/v1").await;
+    assert_eq!(restarted.calls(), 0);
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM ocr_jobs WHERE status='complete'")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 3);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn ocr_late_results_dirty_overlap_and_keep_original_source_time() {
+    let f = Fixture::new().await;
+    let bytes = synthetic_png(0);
+    let e = still(
+        "overlap-ocr",
+        2 * 3600 + 50 * 60,
+        Sensitivity::Normal,
+        &bytes,
+    );
+    let at = e.time.source_start.unwrap();
+    ingest(&f.store, vec![e]).await;
+    let w = hx_store::window_at(at);
+    let next = hx_store::window_at(w.end);
+    f.store.normalize_window(w).await.unwrap();
+    hx_server::processing::compile_window(&f.store, w)
+        .await
+        .unwrap();
+    hx_server::processing::compile_window(&f.store, next)
+        .await
+        .unwrap();
+    let before = f.store.generation(next).await.unwrap();
+    f.store
+        .upload_blob(&hx_store::hash(&bytes), &bytes)
+        .await
+        .unwrap();
+    drain_ocr(&f.store, SyntheticOcr::new(false), "fake/v1").await;
+    let after = f.store.generation(next).await.unwrap();
+    assert!(after > before);
+    let dirty: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM windows WHERE dirty AND start_at=ANY($1)")
+            .bind(vec![w.start, next.start])
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(dirty, 2);
+    // Existing packet policy reserves at most 5% of items for lead-in evidence.
+    // Populate the target window so both the source still and OCR fit that quota.
+    let target: Vec<_> = (0..40)
+        .map(|i| {
+            let mut e = event(&format!("target-{i}"), 4);
+            e.time = ObservationTime::point(e.time.observed_at + Duration::minutes(i));
+            e
+        })
+        .collect();
+    ingest(&f.store, target).await;
+    f.store.normalize_window(next).await.unwrap();
+    let after = f.store.generation(next).await.unwrap();
+    let input = hx_server::processing::prepare_input_with(
+        &f.store,
+        next,
+        "synthetic",
+        hx_server::processing::SensitiveEgress::Full,
+    )
+    .await
+    .unwrap();
+    let derived = input
+        .packet
+        .evidence
+        .iter()
+        .find(|e| e.kind.ends_with("ocr.text"))
+        .unwrap();
+    assert_eq!(derived.at, at);
+    assert!(derived.at < next.start);
+    let value = f.store.evidence(derived.id).await.unwrap().unwrap();
+    // Derived envelopes retain the schema's valid observation identities and time contract.
+    let parsed: Envelope = serde_json::from_value(value["envelope"].clone()).unwrap();
+    assert_eq!(parsed.time.source_start, Some(at));
+    // Discovery replay does not dirty windows again for existing lineage.
+    hx_server::ocr::discover(&f.store, "fake/v1").await.unwrap();
+    assert_eq!(f.store.generation(next).await.unwrap(), after);
+    f.close().await;
+}
+
 /// Exercise authenticated ingest all the way to the provider prompt, using only
 /// generated laptop observations. Observed/received time deliberately differs.
 #[tokio::test]
@@ -1620,5 +2045,66 @@ async fn laptop_disclosure_reaches_provider_with_source_time_and_focus_support()
             .iter()
             .all(|o| o.envelope.sensitivity == Sensitivity::Restricted)
     );
+    f.close().await;
+}
+
+/// A restricted-labelled laptop still yields OCR text under the owner's laptop
+/// policy, while the still record itself never enters the packet.
+#[tokio::test]
+async fn laptop_policy_turns_restricted_stills_into_ocr_text_only() {
+    let f = Fixture::new().await;
+    let bytes = synthetic_png(7);
+    let sha = hx_store::hash(&bytes);
+    let mut e = still("laptop-still", 0, Sensitivity::Restricted, &bytes);
+    e.connector_instance = ConnectorInstance::new("macos-media:fixture");
+    let source_time = e.time.source_start.unwrap();
+    let laptop = Token {
+        prefixes: vec!["macos-media:".into()],
+        scopes: vec!["ingest".into()],
+    };
+    f.store
+        .ingest(
+            UploadBatch {
+                batch_id: ulid::Ulid::generate(),
+                envelopes: vec![e],
+            },
+            &laptop,
+        )
+        .await
+        .unwrap();
+    f.store.upload_blob(&sha, &bytes).await.unwrap();
+    drain_ocr(&f.store, SyntheticOcr::new(false), "fake/v1").await;
+    let w = hx_store::window_at(source_time);
+    f.store.normalize_window(w).await.unwrap();
+    let prepare = |policy: hx_server::disclosure::DisclosurePolicy| {
+        let store = f.store.clone();
+        async move {
+            hx_server::processing::prepare_input_with_policy(
+                &store,
+                w,
+                "synthetic",
+                hx_server::processing::SensitiveEgress::Full,
+                &policy,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let granted = prepare(hx_server::disclosure::DisclosurePolicy::laptop()).await;
+    let kinds: Vec<_> = granted
+        .packet
+        .evidence
+        .iter()
+        .map(|e| e.kind.as_str())
+        .collect();
+    assert_eq!(kinds, ["normal:ocr.text"]);
+    assert_eq!(granted.packet.evidence[0].at, source_time);
+    assert_eq!(
+        granted.packet.evidence[0].effective_class,
+        Sensitivity::Sensitive
+    );
+    assert!(granted.packet.evidence[0].text.contains("ORCHID"));
+    let withheld = prepare(hx_server::disclosure::DisclosurePolicy::default()).await;
+    assert!(withheld.packet.evidence.is_empty());
     f.close().await;
 }

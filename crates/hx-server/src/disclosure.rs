@@ -89,6 +89,8 @@ impl DisclosurePolicy {
             add("macos-agent:", kind, Sensitivity::Sensitive, None);
         }
         add("macos-media:", "text.*", Sensitivity::Sensitive, None);
+        // Stills are only a lineage source for server OCR text; image blobs never leave.
+        add("macos-media:", "media.still", Sensitivity::Sensitive, None);
         add(
             "macos-media:",
             "collector.health",
@@ -174,6 +176,7 @@ mod tests {
             ("macos-agent:synthetic", "ui.click"),
             ("macos-agent:synthetic", "text.snapshot"),
             ("macos-media:synthetic", "text.snapshot"),
+            ("macos-media:synthetic", "media.still"),
             ("companion:browser:synthetic", "browser.navigation"),
             ("companion:editor:synthetic", "editor.selection"),
             ("companion:shell:synthetic", "shell.command"),
@@ -188,7 +191,6 @@ mod tests {
             ("unrelated:synthetic", "text.snapshot"),
             ("companion:unknown:synthetic", "shell.command"),
             ("macos-agent:synthetic", "unknown.content"),
-            ("macos-media:synthetic", "media.still"),
             ("macos-agent:synthetic", "policy.gap"),
         ] {
             assert_eq!(

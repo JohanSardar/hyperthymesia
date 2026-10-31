@@ -212,15 +212,12 @@ pub async fn prepare_input_with_policy(
         return Err(Deferred::NormalizationPending.into());
     }
     let observations = store.observations(expanded, true).await?;
-    let evidence: Vec<EvidenceItem> = observations
+    let all: Vec<EvidenceItem> = observations
         .iter()
         .filter_map(|o| {
             // Every stored observation passed Store::ingest's token scope and namespace
             // checks. Policy grants apply only inside that authenticated boundary.
-            if matches!(
-                o.envelope.kind.as_str(),
-                "policy.gap" | "media.still" | "media.chunk"
-            ) {
+            if matches!(o.envelope.kind.as_str(), "policy.gap" | "media.chunk") {
                 return None;
             }
             let effective_class = disclosure.effective_class(&o.envelope);
@@ -257,6 +254,11 @@ pub async fn prepare_input_with_policy(
             self_generated: self_generated(&o.envelope),
         })
         .collect();
+    // Stills are lineage sources for OCR text only; their own records never enter the packet.
+    let (stills, mut evidence): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|e| e.kind.ends_with(":media.still"));
+    evidence.extend(crate::ocr::derived_evidence_for_sources(store, &stills).await?);
     let entity_rows=sqlx::query("SELECT assertion::text AS assertion,ARRAY(SELECT DISTINCT e.connector_instance FROM events e WHERE e.id=ANY(a.evidence)) AS namespaces FROM entity_assertions a WHERE sensitivity='normal' AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id=ANY(a.evidence) AND e.sensitivity!='normal') ORDER BY id DESC LIMIT 100").fetch_all(&store.pool).await?;
     let entities: Vec<String> = entity_rows.iter().map(|r| r.get("assertion")).collect();
     let prior=sqlx::query("SELECT r.interpretation,r.input_namespaces FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 ORDER BY w.end_at DESC LIMIT 1").bind(w.start).fetch_optional(&store.pool).await?;
