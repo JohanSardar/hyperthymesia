@@ -157,6 +157,8 @@ Every collector has overflow counters, cancellation, restart/re-registration on 
   - aggregate-only data (e.g. phone app-day totals) stays in aggregate cards and is never placed into specific seconds
 
 ### 5.2 Interpreter (every 4 h, plus scheduled revisions)
+> **Superseded in part (2026-10-31):** the interpreter becomes a tool-using agent loop on Vercel fx. See [specs/agent-interpreter.md](specs/agent-interpreter.md). The output, checks and revision rules below still apply.
+
 - **Inputs:** an immutable input manifest (L2 range + 30 min overlap, source revisions, compiler / normalizer / prompt / model versions, entity-memory snapshot) and a bounded evidence packet. The interpreter has **no tools**; if it needs more evidence, it goes through a read-only broker.
 - **Outputs:** structured claims (`actor, action, object, outcome, time support, evidence relation`), each marked **observed / reported-by-source / inferred**.
   - Completion claims ("ordered", "merged") require outcome evidence; otherwise the claim is an *attempt*.
