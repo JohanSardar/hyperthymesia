@@ -28,6 +28,12 @@ credential hash.
     cargo run -p hx-server -- interpret --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
     cargo run -p hx-server -- gc --data-dir ./data
 
+Interpretation uses a stub provider unless `HX_PROVIDER=claude` selects the
+`claude -p` CLI (model from `HX_MODEL`, default `sonnet`). Restricted evidence
+never reaches a provider. Sensitive evidence is sent in full text by default;
+`HX_EGRESS_SENSITIVE=redact` sends only its kind and time. The policy is part of
+the input digest, so changing it re-interprets windows.
+
 The serve process normalizes and compiles queued windows, schedules interpretation
 at four-hour UTC boundaries, and enqueues a second interpretation at window end
 plus 24 hours. Late data dirties affected windows, including the next window when
