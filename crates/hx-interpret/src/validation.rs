@@ -61,6 +61,8 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
                 ) == i.end - i.start
         })
     };
+    let original_episode_count = value.episodes.len();
+    let mut changed_episodes = BTreeSet::new();
     let mut episode_ids = BTreeSet::new();
     value.episodes.retain_mut(|episode| {
         if !episode_ids.insert(episode.id.clone()) || episode.id.is_empty() {
@@ -83,8 +85,11 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
             fail(&episode.id, "rejected invalid confidence");
             return false;
         }
+        let original_claims = episode.claims.clone();
+        let mut claim_index = 0;
         episode.claims.retain_mut(|claim| {
-            let item = format!("{}/{}", episode.id, claim.action);
+            let item = format!("{}/claim[{claim_index}]", episode.id);
+            claim_index += 1;
             if !known(&claim.evidence) || !known(&claim.outcome_evidence) {
                 fail(&item, "rejected claim with unknown evidence id");
                 return false;
@@ -109,11 +114,29 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
             }
             true
         });
+        if episode.claims != original_claims {
+            changed_episodes.insert(episode.id.clone());
+            episode.description = episode
+                .claims
+                .iter()
+                .map(claim_prose)
+                .collect::<Vec<_>>()
+                .join("; ");
+            episode.title = bounded_title(&episode.description);
+            if episode.title.is_empty() {
+                episode.title = "Activity unknown (no supported claims)".into();
+            }
+            fail(
+                &episode.id,
+                "regenerated episode prose from retained claims",
+            );
+        }
         true
     });
+    let original_task_count = value.tasks.len();
     let episode_ids: BTreeSet<_> = value.episodes.iter().map(|e| e.id.clone()).collect();
     let mut task_ids = BTreeSet::new();
-    value.tasks.retain(|task| {
+    value.tasks.retain_mut(|task| {
         let reason = if task.id.is_empty() || !task_ids.insert(task.id.clone()) {
             Some("rejected duplicate or empty task id")
         } else if !valid_intervals(&task.intervals, packet.window) || !supported(&task.intervals) {
@@ -131,44 +154,76 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
             fail(&task.id, reason);
             false
         } else {
+            if task
+                .episode_ids
+                .iter()
+                .any(|id| changed_episodes.contains(id))
+            {
+                let episodes = ordered_episodes(
+                    value
+                        .episodes
+                        .iter()
+                        .filter(|e| task.episode_ids.contains(&e.id)),
+                );
+                task.title = bounded_title(&episode_titles(&episodes));
+                task.description = episodes
+                    .iter()
+                    .map(|e| e.description.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                task.goal = None;
+                fail(
+                    &task.id,
+                    "regenerated task prose from retained episodes; cleared goal",
+                );
+            }
             true
         }
     });
-    if !failures.is_empty() {
-        // Free-form prose cannot retain a claim which the structured checker removed.
-        value.summary = value
-            .episodes
-            .iter()
-            .filter(|e| !e.claims.is_empty())
-            .map(|e| {
-                e.claims
-                    .iter()
-                    .map(|c| format!("{} {} {} ({})", c.actor, c.action, c.object, c.outcome))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        for episode in &mut value.episodes {
-            episode.title = "Evidence-backed episode".into();
-            episode.description = episode
-                .claims
-                .iter()
-                .map(|c| format!("{} {} {} ({})", c.actor, c.action, c.object, c.outcome))
-                .collect::<Vec<_>>()
-                .join("; ");
-        }
-        for task in &mut value.tasks {
-            task.title = "Evidence-backed task".into();
-            task.description.clear();
-            task.goal = None;
-        }
-    }
-    if !failures.is_empty() {
-        failures.push(CheckFailure { item: "prose".into(), reason: "regenerated summary/episode prose from retained claims; cleared task descriptions and goals".into() });
+    if !changed_episodes.is_empty()
+        || value.episodes.len() != original_episode_count
+        || value.tasks.len() != original_task_count
+    {
+        // Summary prose has no references proving which removed assertion it used.
+        value.summary = episode_titles(&ordered_episodes(value.episodes.iter()));
+        fail(
+            "summary",
+            "regenerated summary from retained episode titles in time order",
+        );
     }
     value.check_failures.extend(failures.clone());
     failures
+}
+
+fn claim_prose(claim: &Claim) -> String {
+    // Put the outcome first so truncating a title cannot hide an attempted outcome.
+    format!(
+        "{}: {} {} {}",
+        claim.outcome, claim.actor, claim.action, claim.object
+    )
+}
+
+fn bounded_title(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= 120 {
+        text
+    } else {
+        text.chars().take(119).chain(std::iter::once('…')).collect()
+    }
+}
+
+fn ordered_episodes<'a>(episodes: impl Iterator<Item = &'a Episode>) -> Vec<&'a Episode> {
+    let mut episodes: Vec<_> = episodes.collect();
+    episodes.sort_by_key(|e| e.intervals.iter().map(|i| i.start).min());
+    episodes
+}
+
+fn episode_titles(episodes: &[&Episode]) -> String {
+    episodes
+        .iter()
+        .map(|e| e.title.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 // This catches explicit instruction-bearing pages, not arbitrary semantic contradictions.
