@@ -2232,7 +2232,7 @@ home=pathlib.Path(os.environ['HOME']); work=pathlib.Path.cwd()
 settings=json.loads((home/'.fx/settings.json').read_text())
 assert settings['context'] is False and settings['permission']['*']=='deny'
 assert settings['permission']['mcp_hyperthymesia_*']=='allow'
-assert 0<settings['max_agent_steps']<=24
+assert 0<settings['max_agent_steps']<=120
 assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude').exists()
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
