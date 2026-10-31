@@ -227,3 +227,22 @@ fn lead_in_never_establishes_target_coverage_or_leaks_sensitive_metadata() {
             .all(|e| e.at >= timeline.window.start)
     );
 }
+
+#[test]
+fn sampled_activity_spans_remain_time_support() {
+    let (timeline, evidence) = synthetic();
+    let packet = build_packet(&timeline, &evidence, &[], &[]);
+    // Selection keeps a fraction of each thread's 40 messages; the spans must survive anyway.
+    assert!(packet.evidence.len() < evidence.len());
+    let support: Vec<Interval> = packet
+        .timeline_text
+        .lines()
+        .find_map(|l| l.strip_prefix("time_support="))
+        .map(|j| serde_json::from_str(j).unwrap())
+        .unwrap();
+    assert!(
+        support
+            .iter()
+            .any(|s| s.end - s.start == Duration::hours(4))
+    );
+}
