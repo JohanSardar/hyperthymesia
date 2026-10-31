@@ -111,6 +111,8 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let mut affected = std::collections::BTreeMap::new();
         let mut normalize_windows = std::collections::BTreeMap::new();
+        let mut watermarks =
+            std::collections::BTreeMap::<String, (DateTime<Utc>, Option<u64>)>::new();
         for e in batch.envelopes {
             let error = if !token.has("ingest") {
                 Some("ingest scope required".into())
@@ -132,14 +134,15 @@ impl Store {
                 Sensitivity::Sensitive => "sensitive",
                 _ => "restricted",
             };
-            let id: Option<i64> = sqlx::query_scalar("INSERT INTO events(observation_id,connector_instance,source_key,revision,kind,source_start,source_end,observed_at,device,sensitivity,envelope) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(connector_instance,source_key,revision) DO NOTHING RETURNING id")
+            let inserted = sqlx::query("INSERT INTO events(observation_id,connector_instance,source_key,revision,kind,source_start,source_end,observed_at,device,sensitivity,envelope) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(connector_instance,source_key,revision) DO NOTHING RETURNING id,(SELECT coalesce(jsonb_agg(jsonb_build_array(prior.source_start,prior.source_end)),'[]'::jsonb) FROM events prior WHERE prior.connector_instance=$2 AND prior.source_key=$3) AS previous_ranges")
                 .bind(e.observation_id.to_string()).bind(e.connector_instance.as_str()).bind(e.source_key.as_str()).bind(e.revision.as_str()).bind(e.kind.as_str())
                 .bind(start).bind(e.time.source_end).bind(e.time.observed_at).bind(e.device.as_ref().map(|d| d.as_str())).bind(sensitivity).bind(serde_json::to_value(&e)?)
                 .fetch_optional(&mut *tx).await?;
-            let Some(id) = id else {
+            let Some(inserted) = inserted else {
                 ack.duplicates += 1;
                 continue;
             };
+            let id: i64 = inserted.get("id");
             ack.accepted += 1;
             for b in &e.blobs {
                 sqlx::query("INSERT INTO blobs(sha256,retention_class) VALUES($1,$2) ON CONFLICT(sha256) DO UPDATE SET retention_class=CASE WHEN EXCLUDED.retention_class='keep' THEN 'keep' ELSE blobs.retention_class END")
@@ -148,17 +151,34 @@ impl Store {
                     .bind(id).bind(&b.sha256).execute(&mut *tx).await?;
             }
             normalize_windows.insert(window_at(start).start, window_at(start));
-            let mut window = window_at(start);
-            let end = e.time.source_end.unwrap_or(start) + Duration::minutes(30);
-            loop {
-                affected.insert(window.start, window);
-                window = window_at(window.end);
-                if window.start >= end {
-                    break;
+            // Corrections can shrink or move a span. Invalidate the union of every
+            // immutable revision's range, including the following context overlap.
+            // Fetch old ranges in INSERT's RETURNING expression, avoiding another
+            // database round trip for each event in large synthetic/live batches.
+            let ranges: Vec<(DateTime<Utc>, Option<DateTime<Utc>>)> =
+                serde_json::from_value(inserted.get("previous_ranges"))?;
+            for (start, source_end) in ranges.into_iter().chain([(start, e.time.source_end)]) {
+                let end = source_end.unwrap_or(start) + Duration::minutes(30);
+                let mut window = window_at(start);
+                loop {
+                    affected.insert(window.start, window);
+                    window = window_at(window.end);
+                    if window.start >= end {
+                        break;
+                    }
                 }
             }
+            let watermark = watermarks
+                .entry(e.connector_instance.as_str().to_owned())
+                .or_insert((e.time.observed_at, e.sequence));
+            watermark.0 = watermark.0.max(e.time.observed_at);
+            watermark.1 = watermark.1.max(e.sequence);
+        }
+        // Only accepted observations advance watermarks. Coalesce independent
+        // timestamp/sequence maxima once per connector without per-event I/O.
+        for (connector, (observed_at, sequence)) in watermarks {
             sqlx::query("INSERT INTO watermarks(connector_instance,observed_through,sequence) VALUES($1,$2,$3::text::numeric) ON CONFLICT(connector_instance) DO UPDATE SET observed_through=greatest(watermarks.observed_through,EXCLUDED.observed_through),sequence=greatest(watermarks.sequence,EXCLUDED.sequence)")
-                .bind(e.connector_instance.as_str()).bind(e.time.observed_at).bind(e.sequence.map(|n| n.to_string())).execute(&mut *tx).await?;
+                .bind(connector).bind(observed_at).bind(sequence.map(|n| n.to_string())).execute(&mut *tx).await?;
         }
         for window in affected.values() {
             let generation: i64 = sqlx::query_scalar("INSERT INTO windows(start_at,end_at) VALUES($1,$2) ON CONFLICT(start_at) DO UPDATE SET generation=windows.generation+1,dirty=true RETURNING generation")
@@ -235,12 +255,21 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+    /// Revisions outside the interval may supersede evidence inside it. Wait for
+    /// their classification too, so an old normalized revision cannot win early.
+    pub async fn pending_normalization(&self, window: Interval) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT count(*) FROM events e WHERE EXISTS (SELECT 1 FROM events related WHERE related.connector_instance=e.connector_instance AND related.source_key=e.source_key AND related.source_start<$2 AND coalesce(related.source_end,related.source_start)>=$1) AND NOT EXISTS(SELECT 1 FROM normalized n WHERE n.event_id=e.id) AND NOT EXISTS(SELECT 1 FROM quarantine q WHERE q.event_id=e.id)")
+            .bind(window.start).bind(window.end).fetch_one(&self.pool).await?)
+    }
+
+    /// Return the complete revision family for overlapping identities. The pure
+    /// compiler resolves revision order before clipping the winning revision.
     pub async fn observations(
         &self,
         window: Interval,
         normalized_only: bool,
     ) -> Result<Vec<Observation>> {
-        let rows = sqlx::query("SELECT e.id,e.received_at,e.envelope FROM events e WHERE source_start < $2 AND (source_end > $1 OR (source_end IS NULL AND source_start >= $1) OR (source_end=source_start AND source_start >= $1)) AND (NOT $3 OR EXISTS(SELECT 1 FROM normalized n WHERE n.event_id=e.id)) ORDER BY source_start,id")
+        let rows = sqlx::query("SELECT e.id,e.received_at,e.envelope FROM events e WHERE EXISTS (SELECT 1 FROM events related WHERE related.connector_instance=e.connector_instance AND related.source_key=e.source_key AND related.source_start < $2 AND (related.source_end > $1 OR (related.source_end IS NULL AND related.source_start >= $1) OR (related.source_end=related.source_start AND related.source_start >= $1))) AND (NOT $3 OR EXISTS(SELECT 1 FROM normalized n WHERE n.event_id=e.id)) ORDER BY source_start,id")
             .bind(window.start).bind(window.end).bind(normalized_only).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| {
@@ -453,7 +482,7 @@ pub async fn request_window_job(
     window: Interval,
     generation: i64,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO jobs(output_key,kind,payload) VALUES($1,$2,$3) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,request_version=jobs.request_version+1,state=CASE WHEN jobs.state='running' THEN 'running' ELSE 'ready' END,attempts=CASE WHEN jobs.state='running' THEN jobs.attempts ELSE 0 END,available_at=now(),last_error=NULL WHERE (jobs.payload->>'generation')::bigint < (EXCLUDED.payload->>'generation')::bigint")
+    sqlx::query("INSERT INTO jobs(output_key,kind,payload) VALUES($1,$2,$3) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,request_version=jobs.request_version+1,state=CASE WHEN jobs.state='running' THEN 'running' ELSE 'ready' END,attempts=CASE WHEN jobs.state='running' THEN jobs.attempts ELSE 0 END,available_at=now(),last_error=NULL WHERE (jobs.payload->>'generation')::bigint < (EXCLUDED.payload->>'generation')::bigint OR (jobs.kind='compile' AND jobs.state='failed' AND jobs.available_at<=now())")
         .bind(format!("{kind}:{}",window.start)).bind(kind).bind(json!({"window":window,"generation":generation})).execute(&mut **tx).await?;
     Ok(())
 }

@@ -533,7 +533,11 @@ fn empty_claims_abstain_and_regenerated_unicode_titles_are_bounded() {
 
 #[test]
 fn task_repair_follows_all_episode_references_and_preserves_supported_completions() {
-    let (packet, mut result) = repair_fixture();
+    let (mut packet, mut result) = repair_fixture();
+    packet.evidence[0].kind = "normal:shell.command".into();
+    packet.evidence[0].text = json!({"payload":{"command":"cargo test","exit_code":0}}).to_string();
+    result.episodes[0].claims[0].action = "run".into();
+    result.episodes[0].claims[0].object = "cargo test".into();
     result.episodes[0].claims[0].outcome = "completed".into();
     result.episodes[0].claims[0].outcome_evidence = vec![1];
     result.episodes[1].claims[0].outcome = "completed".into();
@@ -559,4 +563,142 @@ fn task_repair_follows_all_episode_references_and_preserves_supported_completion
         format!("Model description 0; {}", result.episodes[1].description)
     );
     assert!(linked.goal.is_none());
+}
+
+struct StatechartConstant(String);
+impl Provider for StatechartConstant {
+    fn name(&self) -> String {
+        "statechart/synthetic".into()
+    }
+    async fn complete(&self, _: &str, _: &str) -> Result<String, InterpretError> {
+        Ok(self.0.clone())
+    }
+}
+#[tokio::test]
+async fn statechart_non_outcome_evidence_cannot_prove_completion() {
+    // The only evidence explicitly says no order confirmation; it is a browsing comparison.
+    let p = packet("success");
+    assert!(p.evidence[0].text.contains("no order confirmation"));
+    let mut output = response("completion");
+    output["episodes"][0]["claims"][0]["action"] = json!("purchase");
+    output["episodes"][0]["claims"][0]["object"] = json!("orchid stand");
+    output["episodes"][0]["claims"][0]["outcome_evidence"] = json!([1]);
+    let actual = interpret(&p, &StatechartConstant(output.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(actual.episodes[0].claims[0].outcome, "attempted");
+    assert!(!actual.check_failures.is_empty());
+    assert!(check(&actual, &p).is_empty()); // same second check used before server save
+}
+#[tokio::test]
+async fn statechart_source_report_retains_reported_basis() {
+    let mut p = packet("success");
+    p.evidence[0].text = "Source report: Alice says she compared orchid stands. No direct observation of Alice's action.".into();
+    let mut output = response("success");
+    output["episodes"][0]["claims"][0]["actor"] = json!("Alice");
+    let actual = interpret(&p, &StatechartConstant(output.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(actual.episodes[0].claims[0].basis, Basis::ReportedBySource);
+    assert!(
+        actual.episodes[0]
+            .description
+            .contains("reported by source")
+    );
+    assert!(actual.tasks[0].description.contains("reported by source"));
+    assert!(actual.summary.contains("reported by source"));
+    assert!(!actual.check_failures.is_empty());
+    assert!(check(&actual, &p).is_empty());
+}
+
+#[tokio::test]
+async fn typed_completion_requires_the_claimed_operation() {
+    for (kind, payload, action, object, completed) in [
+        (
+            "shell.command",
+            json!({"command":"cargo test","exit_code":0}),
+            "run",
+            "cargo test",
+            true,
+        ),
+        (
+            "shell.command",
+            json!({"command":"cargo test","exit_code":1}),
+            "run",
+            "cargo test",
+            true,
+        ),
+        (
+            "shell.command",
+            json!({"command":"cargo test"}),
+            "run",
+            "cargo test",
+            false,
+        ),
+        (
+            "shell.command",
+            json!({"command":"cargo test","exit_code":0}),
+            "run",
+            "cargo build",
+            false,
+        ),
+        (
+            "shell.command",
+            json!({"command":"cargo test","exit_code":0}),
+            "purchase",
+            "cargo test",
+            false,
+        ),
+        (
+            "code.commit",
+            json!({"sha":"synthetic-sha"}),
+            "commit",
+            "synthetic-sha",
+            true,
+        ),
+        (
+            "code.commit",
+            json!({"sha":"synthetic-sha"}),
+            "commit",
+            "other-sha",
+            false,
+        ),
+    ] {
+        let mut p = packet("success");
+        p.evidence[0].kind = format!("normal:{kind}");
+        p.evidence[0].text = json!({"payload":payload}).to_string();
+        let mut output = response("completion");
+        let claim = &mut output["episodes"][0]["claims"][0];
+        claim["action"] = json!(action);
+        claim["object"] = json!(object);
+        claim["outcome_evidence"] = json!([1]);
+        let actual = interpret(&p, &StatechartConstant(output.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            actual.episodes[0].claims[0].outcome,
+            if completed { "completed" } else { "attempted" },
+            "{kind} {action} {object}"
+        );
+        assert!(check(&actual, &p).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_source_statement_cannot_bind_a_named_actor_to_observed_activity() {
+    for text in [
+        "Alice compared orchid stands.",
+        "SOURCE REPORT: Alice compared orchid stands.",
+        "Alice says she compared orchid stands.",
+    ] {
+        let mut p = packet("success");
+        p.evidence[0].text = text.into();
+        let mut output = response("success");
+        output["episodes"][0]["claims"][0]["actor"] = json!("Alice");
+        let actual = interpret(&p, &StatechartConstant(output.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(actual.episodes[0].claims[0].basis, Basis::ReportedBySource);
+        assert!(check(&actual, &p).is_empty());
+    }
 }
