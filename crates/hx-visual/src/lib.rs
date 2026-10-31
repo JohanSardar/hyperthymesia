@@ -213,7 +213,10 @@ try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWi
         let bytes = std::fs::read(png).unwrap();
         let result = engine.ocr(&bytes, "image/png").unwrap();
         assert!(
-            result.lines.iter().any(|line| line.text.contains("ORCHID")),
+            result
+                .lines
+                .iter()
+                .any(|line| line.text.contains("SYNTHETIC ORCHID 472")),
             "{result:?}"
         );
         assert!(

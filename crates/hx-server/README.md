@@ -109,7 +109,7 @@ and accept HX_TEST_DATABASE_URL. Each uses a unique schema and temporary blob
 directory, dropping its schema after success. Tests never skip silently if
 Postgres is unavailable. Failed tests may leave synthetic schemas for diagnosis.
 
-Operational backup/restore drills, production provider integration, OCR, and
+Operational backup/restore drills, production provider integration, and
 long-duration deployment monitoring are outside this crate's verification.
 
 The `synthetic_day_burst` test ingests 20,000 generated agent messages over one
@@ -126,3 +126,39 @@ which is outside this queue change. Its 60-second target is not met; this remain
 a compiler follow-up, not evidence of general workload performance:
 
     cargo test --release -p hx-server synthetic_browser_point_stress -- --ignored --nocapture
+
+## Server OCR
+
+On macOS, `serve` starts an independent OCR worker using `hx-visual`'s Apple Vision
+helper (`swiftc` must be installed). It discovers published `media.still` blobs on
+startup and while serving, including old stills and either event/blob upload
+ordering. Migration 0005 stores results per exact blob hash and engine identity
+(helper source/configuration plus macOS build). One database advisory lock limits
+OCR concurrency to one across server processes. Decoding and OCR run on a blocking
+thread, independently of the interpretation queue. PNG, JPEG and TIFF stills are
+supported by the sampling decoder; decode/engine failures retry five times with a
+30-second delay, then remain visibly `failed` in `ocr_jobs`. An operator can reset
+attempts/status after fixing the cause. Non-macOS servers retain stills for later
+backfill; no empty result is recorded as successful OCR.
+
+An 8×8 luminance hash skips frames within three bits of a recognized frame on the
+same connector/device/display/application within thirty seconds. Skips are recorded
+as `sampled` with a reference hash and no OCR result: similarity never borrows text
+or deletes source evidence. All recognized text has partial OCR coverage.
+
+`ocr_evidence` links each recognized result to every referencing still observation.
+`ocr_derived` resolves time, device, connector and effective sensitivity through the
+source at read time. Late source associations reuse exact results without another
+OCR call. New derived evidence dirties affected interpretation windows, including
+overlap. Derived evidence has a distinct, retrievable evidence ID and kind
+`ocr.text`; the source observation ID and blob hash remain explicit in its payload.
+The dashboard shows escaped OCR text beside the original thumbnail.
+
+The disclosure integration point is `ocr::derived_evidence_for_sources`: call it
+with evidence items after the server's source disclosure policy. It inherits each
+source item's inclusion, redaction and self-generated decision, then uses the same
+`PacketBudget` per-item and total limits as other evidence. OCR never creates a
+producer-controlled disclosure grant. Synthetic fake-engine tests exercise jobs,
+exact caching, sampling, lineage, retries, packet inclusion, authorization and HTML
+escaping on every platform. `hx-visual` also tests real Vision OCR on a generated
+text image only on macOS; capture permissions and actual screenshots are unused.

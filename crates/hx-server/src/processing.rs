@@ -194,7 +194,7 @@ pub async fn prepare_input_with(
         return Err(Deferred::NormalizationPending.into());
     }
     let observations = store.observations(expanded, true).await?;
-    let evidence: Vec<EvidenceItem> = observations
+    let mut evidence: Vec<EvidenceItem> = observations
         .iter()
         .filter_map(|o| {
             let class = match (o.envelope.sensitivity, sensitive) {
@@ -224,6 +224,7 @@ pub async fn prepare_input_with(
             self_generated: self_generated(&o.envelope),
         })
         .collect();
+    evidence.extend(crate::ocr::derived_evidence_for_sources(store, &evidence).await?);
     let entity_rows=sqlx::query("SELECT assertion::text AS assertion,ARRAY(SELECT DISTINCT e.connector_instance FROM events e WHERE e.id=ANY(a.evidence)) AS namespaces FROM entity_assertions a WHERE sensitivity='normal' AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id=ANY(a.evidence) AND e.sensitivity!='normal') ORDER BY id DESC LIMIT 100").fetch_all(&store.pool).await?;
     let entities: Vec<String> = entity_rows.iter().map(|r| r.get("assertion")).collect();
     let prior=sqlx::query("SELECT r.interpretation,r.input_namespaces FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 ORDER BY w.end_at DESC LIMIT 1").bind(w.start).fetch_optional(&store.pool).await?;
