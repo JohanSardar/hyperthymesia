@@ -15,3 +15,6 @@ mod accessibility;
 mod input;
 
 mod gap;
+
+#[cfg(test)]
+mod statechart_regressions;
