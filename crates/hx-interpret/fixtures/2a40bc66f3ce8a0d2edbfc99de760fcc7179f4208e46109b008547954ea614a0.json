@@ -1,0 +1,53 @@
+{
+  "episodes": [
+    {
+      "claims": [
+        {
+          "action": "compare",
+          "actor": "subject",
+          "basis": "observed",
+          "evidence": [
+            999
+          ],
+          "object": "project:Orchid",
+          "outcome": "unknown",
+          "outcome_evidence": []
+        }
+      ],
+      "confidence": 0.8,
+      "description": "Synthetic comparison",
+      "evidence": [
+        1
+      ],
+      "id": "e1",
+      "intervals": [
+        {
+          "end": "2026-01-01T10:10:00Z",
+          "start": "2026-01-01T10:00:00Z"
+        }
+      ],
+      "title": "Compare stands"
+    }
+  ],
+  "summary": "Compared orchid stands.",
+  "tasks": [
+    {
+      "aliases": [],
+      "confidence": 0.8,
+      "description": "Synthetic task",
+      "episode_ids": [
+        "e1"
+      ],
+      "goal": null,
+      "id": "t1",
+      "intervals": [
+        {
+          "end": "2026-01-01T10:10:00Z",
+          "start": "2026-01-01T10:00:00Z"
+        }
+      ],
+      "open": true,
+      "title": "Orchid"
+    }
+  ]
+}

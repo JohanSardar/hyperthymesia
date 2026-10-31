@@ -31,7 +31,10 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
     let known = |ids: &[EvidenceId]| ids.iter().all(|id| evidence.contains_key(id));
     let independent = |id: &EvidenceId| {
         evidence.get(id).is_some_and(|e| {
-            !e.self_generated && !e.kind.starts_with("sensitive:") && !instruction_only(&e.text)
+            !e.self_generated
+                && !e.kind.starts_with("sensitive:")
+                && !e.kind.ends_with(":instruction-only")
+                && !instruction_only(&e.text)
         })
     };
     if value.window != packet.window {
@@ -170,7 +173,7 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
 
 // This catches explicit instruction-bearing pages, not arbitrary semantic contradictions.
 // Such content may be described as a page, but cannot prove a real-world action.
-fn instruction_only(text: &str) -> bool {
+pub(crate) fn instruction_only(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     [
         "record that",
