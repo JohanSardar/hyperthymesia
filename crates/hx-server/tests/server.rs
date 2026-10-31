@@ -1378,3 +1378,247 @@ async fn backfilled_evidence_is_placed_at_source_time() {
     assert!(w.contains(input.packet.evidence[0].at));
     f.close().await;
 }
+
+/// Exercise authenticated ingest all the way to the provider prompt, using only
+/// generated laptop observations. Observed/received time deliberately differs.
+#[tokio::test]
+async fn laptop_disclosure_reaches_provider_with_source_time_and_focus_support() {
+    use hx_server::{
+        disclosure::DisclosurePolicy,
+        processing::{SensitiveEgress, prepare_input_with_policy},
+    };
+    struct RecordingProvider(std::sync::Mutex<Vec<String>>);
+    impl hx_interpret::Provider for RecordingProvider {
+        fn name(&self) -> String {
+            "synthetic-recording".into()
+        }
+        async fn complete(
+            &self,
+            _system: &str,
+            user: &str,
+        ) -> Result<String, hx_interpret::InterpretError> {
+            self.0.lock().unwrap().push(user.into());
+            Ok(json!({"episodes":[],"tasks":[],"summary":"Synthetic fixture."}).to_string())
+        }
+    }
+    let f = Fixture::new().await;
+    let secret = f
+        .store
+        .create_token(
+            "synthetic-laptop",
+            vec![
+                "macos-agent:fixture".into(),
+                "macos-media:fixture".into(),
+                "companion:browser:fixture".into(),
+            ],
+            vec!["ingest".into()],
+        )
+        .await
+        .unwrap();
+    let source = event("source", 8).time.observed_at;
+    let make = |key: &str, connector: &str, kind: &str, payload: Value| {
+        let mut e = event(key, 8);
+        e.connector_instance = ConnectorInstance::new(connector);
+        e.kind = Kind::new(kind);
+        e.sensitivity = Sensitivity::Restricted;
+        e.device = Some(hx_schema::DeviceId::new("fixture"));
+        e.time.source_start = Some(source);
+        e.time.source_end = Some(source + Duration::seconds(30));
+        e.time.observed_at = source + Duration::hours(7);
+        e.payload = payload;
+        e
+    };
+    let focus = make(
+        "focus",
+        "macos-agent:fixture",
+        "focus.span",
+        json!({"app_bundle_id":"test.editor","app_name":"Synthetic Editor","window_title":"WINDOW_TITLE_SENTINEL"}),
+    );
+    let mut title_free = focus.clone();
+    title_free.observation_id = ObservationId::generate();
+    title_free.source_key = SourceKey::new("title-free-focus");
+    title_free.payload["window_title"] = Value::Null;
+    title_free.time.source_start = Some(source + Duration::seconds(30));
+    title_free.time.source_end = Some(source + Duration::seconds(60));
+    let text = make(
+        "text",
+        "macos-agent:fixture",
+        "text.snapshot",
+        json!({"surface":"synthetic editor","source":"accessibility","text":"TEXT_SENTINEL","text_sha256":hx_store::hash(b"TEXT_SENTINEL"),"completeness":"partial"}),
+    );
+    let mut ocr = text.clone();
+    ocr.observation_id = ObservationId::generate();
+    ocr.source_key = SourceKey::new("ocr");
+    ocr.connector_instance = ConnectorInstance::new("macos-media:fixture");
+    ocr.payload["source"] = json!("ocr");
+    ocr.payload["text"] = json!("OCR_SENTINEL");
+    ocr.payload["text_sha256"] = json!(hx_store::hash(b"OCR_SENTINEL"));
+    let gap = make(
+        "gap",
+        "macos-agent:fixture",
+        "policy.gap",
+        json!({"reason":"GAP_SENTINEL"}),
+    );
+    let media = make(
+        "media",
+        "macos-media:fixture",
+        "media.still",
+        json!({"display":"fixture","trigger":"periodic","width":1,"height":1,"window_title":"MEDIA_SENTINEL"}),
+    );
+    let companion = make(
+        "companion",
+        "companion:browser:fixture",
+        "browser.navigation",
+        json!({"title":"COMPANION_SENTINEL"}),
+    );
+    let unauthorized = make(
+        "spoof",
+        "macos-agent:other-device",
+        "text.snapshot",
+        text.payload.clone(),
+    );
+    let (status, body) = request(
+        &f.store,
+        "POST",
+        "/v1/events",
+        &secret,
+        serde_json::to_vec(&UploadBatch {
+            batch_id: ulid::Ulid::generate(),
+            envelopes: vec![
+                focus,
+                title_free,
+                text,
+                ocr,
+                gap,
+                media,
+                companion,
+                unauthorized,
+            ],
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ack: hx_store::UploadAck = serde_json::from_slice(&body).unwrap();
+    assert_eq!(ack.accepted, 7);
+    assert_eq!(ack.rejected.len(), 1);
+    assert!(ack.rejected[0].reason.contains("namespace"));
+    let w = hx_store::window_at(source);
+    f.store.normalize_window(w).await.unwrap();
+    assert_eq!(count(&f.store, "quarantine").await, 0);
+    let policy = DisclosurePolicy::laptop();
+    let input = prepare_input_with_policy(&f.store, w, "recording", SensitiveEgress::Full, &policy)
+        .await
+        .unwrap();
+    assert_eq!(input.packet.evidence.len(), 5);
+    assert_eq!(
+        input.manifest["disclosure_policy"]["digest"],
+        policy.digest()
+    );
+    assert_eq!(
+        input.manifest["disclosure_policy"]["version"],
+        hx_server::disclosure::POLICY_VERSION
+    );
+    for item in &input.packet.evidence {
+        assert!(item.at == source || item.at == source + Duration::seconds(30));
+        assert_eq!(
+            item.effective_class,
+            if item.at == source + Duration::seconds(30) {
+                Sensitivity::Normal
+            } else {
+                Sensitivity::Sensitive
+            }
+        );
+    }
+    let support: Vec<hx_schema::Interval> = serde_json::from_str(
+        input
+            .packet
+            .timeline_text
+            .lines()
+            .find_map(|line| line.strip_prefix("time_support="))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(support.contains(&hx_schema::Interval {
+        start: source,
+        end: source + Duration::seconds(30)
+    }));
+    assert!(support.contains(&hx_schema::Interval {
+        start: source + Duration::seconds(30),
+        end: source + Duration::seconds(60)
+    }));
+    let provider = RecordingProvider(Default::default());
+    hx_interpret::interpret(&input.packet, &provider)
+        .await
+        .unwrap();
+    let prompts = provider.0.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 1);
+    let prompt = &prompts[0];
+    for sentinel in [
+        "WINDOW_TITLE_SENTINEL",
+        "TEXT_SENTINEL",
+        "OCR_SENTINEL",
+        "COMPANION_SENTINEL",
+        "Synthetic Editor",
+    ] {
+        assert!(prompt.contains(sentinel), "missing {sentinel}");
+    }
+    assert!(!prompt.contains("GAP_SENTINEL"));
+    assert!(!prompt.contains("MEDIA_SENTINEL"));
+    let redacted =
+        prepare_input_with_policy(&f.store, w, "recording", SensitiveEgress::Redact, &policy)
+            .await
+            .unwrap();
+    let redacted = serde_json::to_string(&redacted.packet).unwrap();
+    for sentinel in [
+        "WINDOW_TITLE_SENTINEL",
+        "TEXT_SENTINEL",
+        "OCR_SENTINEL",
+        "COMPANION_SENTINEL",
+    ] {
+        assert!(!redacted.contains(sentinel), "leaked {sentinel}");
+    }
+    assert!(redacted.contains("Synthetic Editor")); // title-free normal span
+    let restricted = DisclosurePolicy::from_json(
+        r#"{"rules":[
+        {"connector_prefix":"macos-","kind":"*","class":"restricted"},
+        {"connector_prefix":"companion:","kind":"*","class":"restricted"}
+    ]}"#,
+    )
+    .unwrap();
+    for denied in [&DisclosurePolicy::default(), &restricted] {
+        let blocked =
+            prepare_input_with_policy(&f.store, w, "recording", SensitiveEgress::Full, denied)
+                .await
+                .unwrap();
+        assert!(blocked.packet.evidence.is_empty());
+        assert!(!blocked.packet.timeline_text.contains("Synthetic Editor"));
+        assert_ne!(blocked.packet.input_digest, input.packet.input_digest);
+    }
+    // Even an explicit owner grant cannot export gap content or media records.
+    let broad = DisclosurePolicy::from_json(
+        r#"{"rules":[
+        {"connector_prefix":"macos-","kind":"*","class":"normal"},
+        {"connector_prefix":"companion:","kind":"*","class":"normal"}
+    ]}"#,
+    )
+    .unwrap();
+    let granted =
+        prepare_input_with_policy(&f.store, w, "recording", SensitiveEgress::Full, &broad)
+            .await
+            .unwrap();
+    assert_eq!(granted.packet.evidence.len(), 5);
+    let granted = serde_json::to_string(&granted.packet).unwrap();
+    assert!(!granted.contains("GAP_SENTINEL"));
+    assert!(!granted.contains("MEDIA_SENTINEL"));
+    // Egress projection must not mutate the immutable producer classification.
+    assert!(
+        f.store
+            .observations(w, true)
+            .await
+            .unwrap()
+            .iter()
+            .all(|o| o.envelope.sensitivity == Sensitivity::Restricted)
+    );
+    f.close().await;
+}

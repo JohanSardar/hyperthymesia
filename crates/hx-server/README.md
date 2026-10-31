@@ -31,8 +31,10 @@ credential hash.
 Interpretation uses a stub provider unless `HX_PROVIDER=claude` selects the
 `claude -p` CLI (model from `HX_MODEL`, default `sonnet`). Restricted evidence
 never reaches a provider. Sensitive evidence is sent in full text by default;
-`HX_EGRESS_SENSITIVE=redact` sends only its kind and time. The policy is part of
-the input digest, so changing it re-interprets windows.
+`HX_EGRESS_SENSITIVE=redact` sends only its kind and time. Both egress settings
+and disclosure rules are part of the input digest. To apply a policy change to already interpreted windows, run
+`interpret` again for the desired range; changing the file alone does not enqueue
+old windows.
 
 The serve process normalizes and compiles queued windows, schedules interpretation
 at four-hour UTC boundaries, and enqueues a second interpretation at window end
@@ -42,6 +44,56 @@ readable while new work runs. Changed entity memory invalidates existing windows
 changed carried tasks invalidate later windows. Run gc regularly with the same
 data directory as serve; chunk files expire after thirty days, stills remain,
 and pins prevent deletion. Raw envelopes and expired blob manifests remain.
+
+## Server-owner disclosure policy
+
+`HX_DISCLOSURE` selects a server-owned JSON rules file. When unset, the built-in
+`hx-disclosure/v1` laptop policy applies to token-authorized installations:
+
+- `macos-agent:`: title-free `focus.span`, `presence.span`, `input.bucket`,
+  `clock.calibration`, and `collector.health` are normal. A `focus.span` with a
+  non-null window title is sensitive as a whole record; its source interval still
+  supports the timeline. `ui.*` and `text.*` are sensitive.
+- `macos-media:`: derived `text.*` (including OCR `text.snapshot`) is sensitive;
+  `collector.health` is normal.
+- `companion:browser:`, `companion:editor:`, and `companion:shell:`: events are
+  sensitive, including open-ended companion kinds.
+
+These prefixes identify the owner's laptop agent family; issue ingest tokens
+only for trusted devices, preferably exact device prefixes. Every event must
+first pass token scope and connector namespace checks at ingest. The disclosure
+policy is applied only to stored, validated observations; raw producer labels
+and stored envelopes are never rewritten. Other namespaces/kinds retain their
+producer labels and existing unknown-kind restrictions. `policy.gap` retains its
+label and never contributes content to the provider. `media.still` and
+`media.chunk` are always excluded from provider input, even with a normal rule;
+blob bytes/references are never added to the packet. Only derived text is eligible.
+
+Rules use literal connector prefixes and exact kinds or a single trailing `*`.
+The **first matching rule wins**: put specific exceptions before broad rules.
+An optional `field_present` matches a non-null top-level payload field. A file
+replaces all built-in rules; missing matches keep the producer class. For example:
+
+```json
+{
+  "rules": [
+    {"connector_prefix": "macos-agent:work-laptop", "kind": "text.*", "class": "restricted"},
+    {"connector_prefix": "macos-agent:work-laptop", "kind": "focus.span", "field_present": "window_title", "class": "sensitive"},
+    {"connector_prefix": "macos-agent:work-laptop", "kind": "focus.span", "class": "normal"}
+  ]
+}
+```
+
+Use `HX_DISCLOSURE=off` or a file containing `{"rules":[]}` to disable all
+reclassification. Invalid or unreadable configuration fails preparation before a
+provider call. This setting cannot be supplied by an upload. Sensitive grants
+still obey `HX_EGRESS_SENSITIVE=redact`. Evidence records carry `effective_class`
+separately from the existing kind prefix, which controls full-text vs redacted
+transport. Each input manifest stores the complete rules, policy version and
+SHA-256 digest; these participate in the interpretation input digest, including
+when two policies happen to produce identical packets. Rules operate at record
+level, so an owner granting normal for title-bearing focus explicitly discloses
+the title too.
 
 ## API and disclosure
 
@@ -70,7 +122,8 @@ and pins prevent deletion. Raw envelopes and expired blob manifests remain.
   Evidence pages escape text and embed only local PNG/JPEG stills. Captured HTML,
   SVG, scripts, remote images and remote fonts are never rendered.
 
-Interpretation input excludes sensitive/restricted observations and entities.
+Interpretation input excludes effectively restricted observations and non-normal
+entities. Sensitive observation text follows `HX_EGRESS_SENSITIVE`.
 Self-generated evidence is tagged; captured source content remains data. An
 immutable manifest records the bounded packet, versions, namespace lineage,
 provider identity and input generation; its digest is supplied to the interpreter.

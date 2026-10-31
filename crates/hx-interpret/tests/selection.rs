@@ -26,6 +26,7 @@ fn synthetic() -> (Timeline, Vec<EvidenceItem>) {
             let id = thread * 40 + message + 1;
             ids.push(id);
             evidence.push(EvidenceItem {
+            effective_class: hx_schema::Sensitivity::Normal,
                 id,
                 at: start + Duration::seconds(message * 360),
                 kind: "normal:agent.message".into(),
@@ -49,6 +50,7 @@ fn synthetic() -> (Timeline, Vec<EvidenceItem>) {
     }
     for n in 0..3500 {
         evidence.push(EvidenceItem {
+            effective_class: hx_schema::Sensitivity::Normal,
             id: 2000 + n,
             at: if n < 500 { start - Duration::seconds(1800 - n * 3) } else { start + Duration::seconds((n - 500) * 14399 / 2999) },
             kind: "normal:source.event".into(),
@@ -198,6 +200,7 @@ fn lead_in_never_establishes_target_coverage_or_leaks_sensitive_metadata() {
     timeline.points.clear();
     let evidence = vec![
         EvidenceItem {
+            effective_class: hx_schema::Sensitivity::Normal,
             id: 1,
             at: timeline.window.start - Duration::minutes(1),
             kind: "normal:agent.message".into(),
@@ -205,6 +208,7 @@ fn lead_in_never_establishes_target_coverage_or_leaks_sensitive_metadata() {
             self_generated: false,
         },
         EvidenceItem {
+            effective_class: hx_schema::Sensitivity::Sensitive,
             id: 2,
             at: timeline.window.start,
             kind: "sensitive:agent.message".into(),

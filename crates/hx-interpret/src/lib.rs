@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceItem {
+    /// Server-owned data class, independent of the text/redaction wire prefix.
+    #[serde(default)]
+    pub effective_class: hx_schema::Sensitivity,
     pub id: EvidenceId,
     pub at: DateTime<Utc>,
     /// `normal:<kind>` or `sensitive:<kind>`. Any other prefix is dropped from the packet.

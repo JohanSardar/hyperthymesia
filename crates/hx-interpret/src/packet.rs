@@ -133,6 +133,7 @@ impl EvidenceItem {
             return None;
         }
         Some(Self {
+            effective_class: sensitivity,
             id,
             at,
             kind: format!(
@@ -216,7 +217,8 @@ pub fn build_packet_with_budget(
         ))
     });
     for mut e in sorted {
-        if !(e.kind.starts_with("normal:") || e.kind.starts_with("sensitive:"))
+        if e.effective_class == Sensitivity::Restricted
+            || !(e.kind.starts_with("normal:") || e.kind.starts_with("sensitive:"))
             || e.at < timeline.window.start - chrono::Duration::minutes(30)
             || e.at >= timeline.window.end
             || !seen.insert(e.id)

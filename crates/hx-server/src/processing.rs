@@ -1,3 +1,4 @@
+use crate::disclosure::{DisclosurePolicy, POLICY_VERSION};
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use hx_compile::Timeline;
@@ -183,6 +184,23 @@ pub async fn prepare_input_with(
     provider_name: &str,
     sensitive: SensitiveEgress,
 ) -> Result<PreparedInput> {
+    prepare_input_with_policy(
+        store,
+        w,
+        provider_name,
+        sensitive,
+        &DisclosurePolicy::from_env()?,
+    )
+    .await
+}
+/// Explicit owner policy for deterministic replay without process-global env changes.
+pub async fn prepare_input_with_policy(
+    store: &Store,
+    w: Interval,
+    provider_name: &str,
+    sensitive: SensitiveEgress,
+    disclosure: &DisclosurePolicy,
+) -> Result<PreparedInput> {
     let (_, generation) = compile_window(store, w).await?;
     let expanded = Interval {
         start: w.start - Duration::minutes(30),
@@ -197,16 +215,31 @@ pub async fn prepare_input_with(
     let evidence: Vec<EvidenceItem> = observations
         .iter()
         .filter_map(|o| {
-            let class = match (o.envelope.sensitivity, sensitive) {
+            // Every stored observation passed Store::ingest's token scope and namespace
+            // checks. Policy grants apply only inside that authenticated boundary.
+            if matches!(
+                o.envelope.kind.as_str(),
+                "policy.gap" | "media.still" | "media.chunk"
+            ) {
+                return None;
+            }
+            let effective_class = disclosure.effective_class(&o.envelope);
+            let class = match (effective_class, sensitive) {
                 (Sensitivity::Normal, _) | (Sensitivity::Sensitive, SensitiveEgress::Full) => {
                     "normal"
                 }
                 (Sensitivity::Sensitive, SensitiveEgress::Redact) => "sensitive",
                 (Sensitivity::Restricted, _) => return None,
             };
-            hx_schema::kinds::is_core(o.envelope.kind.as_str()).then_some((o, class))
+            (hx_schema::kinds::is_core(o.envelope.kind.as_str())
+                || o.envelope
+                    .connector_instance
+                    .as_str()
+                    .starts_with("companion:"))
+            .then_some((o, class, effective_class))
         })
-        .map(|(o, class)| EvidenceItem {
+        .map(|(o, class, effective_class)| EvidenceItem {
+            effective_class,
             id: o.id,
             at: o
                 .envelope
@@ -258,7 +291,7 @@ pub async fn prepare_input_with(
     safe_timeline.window = w;
     let mut packet = hx_interpret::build_packet(&safe_timeline, &evidence, &entities, &open_tasks);
     packet.window = w;
-    let manifest = json!({"window":w,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"packet":packet,"input_namespaces":namespaces});
+    let manifest = json!({"window":w,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"disclosure_policy":{"version":POLICY_VERSION,"digest":disclosure.digest(),"policy":disclosure},"packet":packet,"input_namespaces":namespaces});
     packet.input_digest = hx_store::hash(&serde_json::to_vec(&manifest)?);
     Ok(PreparedInput {
         packet,

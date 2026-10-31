@@ -152,6 +152,7 @@ fn privacy_caps_and_digest() {
     )
     .unwrap();
     let unknown = EvidenceItem {
+        effective_class: hx_schema::Sensitivity::Restricted,
         id: 2,
         at: window().start,
         kind: "page".into(),
