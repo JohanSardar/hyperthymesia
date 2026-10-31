@@ -168,6 +168,7 @@ pub async fn derived_evidence_for_sources(
         let cap = hx_interpret::PacketBudget::default().max_item_chars;
         let text: String = text.chars().take(cap).collect();
         out.push(EvidenceItem {
+            effective_class: source.effective_class,
             id: row.get("id"), at: source.at,
             kind: format!("{}:ocr.text", source.kind.split(':').next().unwrap_or("sensitive")),
             text: json!({"source_event_id":source.id,"source_observation_id":row.get::<String,_>("observation_id"),"sha256":row.get::<String,_>("sha256"),"connector_instance":row.get::<String,_>("connector_instance"),"engine_version":row.get::<String,_>("engine_version"),"text":text,"coverage":result.coverage}).to_string(),

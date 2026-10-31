@@ -1,5 +1,6 @@
 //! Authenticated ingest, evidence API, and a local, escaped day view.
 pub mod dashboard;
+pub mod disclosure;
 pub mod ocr;
 pub mod processing;
 use axum::{
