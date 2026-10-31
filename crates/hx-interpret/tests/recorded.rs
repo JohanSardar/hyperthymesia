@@ -94,7 +94,11 @@ async fn recorded_end_to_end_and_adversarial_cases() {
         "self_generated",
     ] {
         let packet = packet(case);
-        let provider = RecordedProvider::fixtures(&packet.input_digest).unwrap();
+        let provider = RecordedProvider::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures"),
+            &packet.input_digest,
+        )
+        .unwrap();
         // Explicit fixture authoring opt-in; normal tests only replay committed files.
         if std::env::var_os("HX_WRITE_SYNTHETIC_FIXTURES").is_some() {
             provider.record(&response(case).to_string()).unwrap();
@@ -257,7 +261,8 @@ fn caps_unicode_evidence_and_preserves_interleaving() {
         })
         .collect();
     let capped = build_packet(&timeline, &evidence, &[], &[]);
-    assert_eq!(capped.evidence.len(), 128);
+    assert!(capped.evidence.len() > 128);
+    assert!(serde_json::to_vec(&capped).unwrap().len() <= 400_000);
     let mut changed = evidence.clone();
     changed[199].text.push_str("changed outside the projection");
     assert_ne!(
@@ -314,4 +319,29 @@ async fn retries_are_bounded() {
     ));
     assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert!(RecordedProvider::fixtures("../escape").is_err());
+}
+
+/// Answers with a flawed object, then a flawed fenced object, then prose.
+struct DriftingProvider(std::sync::atomic::AtomicUsize);
+impl Provider for DriftingProvider {
+    fn name(&self) -> String {
+        "drifting".into()
+    }
+    async fn complete(&self, _: &str, _: &str) -> Result<String, InterpretError> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(match n {
+            0 => response("unknown").to_string(),
+            1 => format!("```json\n{}\n```", response("unknown")),
+            _ => "I could not produce JSON.".into(),
+        })
+    }
+}
+#[tokio::test]
+async fn fenced_output_parses_and_a_failed_last_retry_keeps_the_repaired_answer() {
+    let provider = DriftingProvider(std::sync::atomic::AtomicUsize::new(0));
+    let result = interpret(&packet("success"), &provider).await.unwrap();
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+    // Both parsed answers cited unknown evidence; the prose attempt adds an output failure.
+    assert!(result.check_failures.iter().any(|f| f.item == "output"));
+    assert!(result.check_failures.len() >= 3);
 }
