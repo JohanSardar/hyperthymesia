@@ -94,7 +94,11 @@ async fn recorded_end_to_end_and_adversarial_cases() {
         "self_generated",
     ] {
         let packet = packet(case);
-        let provider = RecordedProvider::fixtures(&packet.input_digest).unwrap();
+        let provider = RecordedProvider::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures"),
+            &packet.input_digest,
+        )
+        .unwrap();
         // Explicit fixture authoring opt-in; normal tests only replay committed files.
         if std::env::var_os("HX_WRITE_SYNTHETIC_FIXTURES").is_some() {
             provider.record(&response(case).to_string()).unwrap();
@@ -257,7 +261,8 @@ fn caps_unicode_evidence_and_preserves_interleaving() {
         })
         .collect();
     let capped = build_packet(&timeline, &evidence, &[], &[]);
-    assert_eq!(capped.evidence.len(), 128);
+    assert!(capped.evidence.len() > 128);
+    assert!(serde_json::to_vec(&capped).unwrap().len() <= 400_000);
     let mut changed = evidence.clone();
     changed[199].text.push_str("changed outside the projection");
     assert_ne!(
