@@ -208,7 +208,11 @@ pub async fn prepare_input_with(
         })
         .map(|(o, class)| EvidenceItem {
             id: o.id,
-            at: o.envelope.time.observed_at,
+            at: o
+                .envelope
+                .time
+                .source_start
+                .unwrap_or(o.envelope.time.observed_at),
             kind: format!("{class}:{}", o.envelope.kind),
             text: o.envelope.payload.to_string().chars().take(4096).collect(),
             self_generated: self_generated(&o.envelope),

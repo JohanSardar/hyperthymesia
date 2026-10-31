@@ -1357,3 +1357,25 @@ async fn sensitive_egress_policy_controls_text_and_restricted_never_leaves() {
     assert!(!redacted.contains("RESTRICTED_SENTINEL"));
     f.close().await;
 }
+
+#[tokio::test]
+async fn backfilled_evidence_is_placed_at_source_time() {
+    let f = Fixture::new().await;
+    let mut late = event("late", 8);
+    late.time.observed_at += chrono::Duration::hours(7);
+    ingest(&f.store, vec![late]).await;
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM events")
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+    for id in ids {
+        f.store.normalize(id).await.unwrap();
+    }
+    let w = hx_store::window_at(event("packet", 8).time.observed_at);
+    let input = hx_server::processing::prepare_input(&f.store, w, "stub")
+        .await
+        .unwrap();
+    assert_eq!(input.packet.evidence.len(), 1);
+    assert!(w.contains(input.packet.evidence[0].at));
+    f.close().await;
+}
