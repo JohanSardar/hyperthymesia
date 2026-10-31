@@ -297,7 +297,12 @@ impl Store {
         .await?;
         let current: i64 = window.get("generation");
         let canonical: Option<i64> = window.get("canonical_revision");
-        sqlx::query("INSERT INTO revisions(start_at,input_generation,interpretation,output_key,input_namespaces) VALUES($1,$2,$3,$4,$5) ON CONFLICT(output_key) DO NOTHING").bind(w.start).bind(generation).bind(&value).bind(output_key).bind(namespaces).execute(&mut *tx).await?;
+        if value.get("agent_run").is_some() && current != generation {
+            return Ok((canonical.unwrap_or_default(), false));
+        }
+        let mut content = value.clone();
+        let agent_run = content.as_object_mut().and_then(|v| v.remove("agent_run"));
+        sqlx::query("INSERT INTO revisions(start_at,input_generation,interpretation,output_key,input_namespaces,agent_run) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(output_key) DO NOTHING").bind(w.start).bind(generation).bind(&content).bind(output_key).bind(namespaces).bind(agent_run).execute(&mut *tx).await?;
         let revision = sqlx::query(
             "SELECT id,input_generation,start_at,interpretation FROM revisions WHERE output_key=$1",
         )

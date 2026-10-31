@@ -1,6 +1,8 @@
 //! Authenticated ingest, evidence API, and a local, escaped day view.
 pub mod dashboard;
 pub mod disclosure;
+pub mod fx;
+pub mod mcp;
 pub mod ocr;
 pub mod processing;
 use axum::{
@@ -86,6 +88,11 @@ pub fn router(store: Store) -> Router {
         .route("/", get(dashboard::today))
         .route("/day/{day}", get(dashboard::day))
         .route("/evidence/{id}", get(dashboard::evidence_page))
+        .route(
+            "/revision/{revision}/evidence/{id}",
+            get(dashboard::revision_evidence),
+        )
+        .route("/revision/{revision}/run", get(dashboard::run_page))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(store)
 }
@@ -253,9 +260,9 @@ pub async fn timeline_value(
     let compiled = hx_compile::compile(&visible, w);
     // A canonical interpretation may combine namespaces. Serve it only when every
     // input namespace is authorized, rather than attempting to redact derived prose.
-    let rows=sqlx::query("SELECT r.id,r.input_generation,r.interpretation,w.end_at FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at<$2 AND w.end_at>$1 AND NOT EXISTS(SELECT 1 FROM unnest(r.input_namespaces) n WHERE NOT EXISTS(SELECT 1 FROM unnest($3::text[]) p WHERE starts_with(n,p))) ORDER BY w.start_at")
+    let rows=sqlx::query("SELECT r.id,r.input_generation,r.interpretation,r.agent_run IS NOT NULL AS has_agent_run,w.end_at FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at<$2 AND w.end_at>$1 AND NOT EXISTS(SELECT 1 FROM unnest(r.input_namespaces) n WHERE NOT EXISTS(SELECT 1 FROM unnest($3::text[]) p WHERE starts_with(n,p))) ORDER BY w.start_at")
         .bind(w.start).bind(w.end).bind(&token.prefixes).fetch_all(&store.pool).await?;
-    let revisions:Vec<Value>=rows.iter().map(|r|json!({"revision_id":r.get::<i64,_>("id"),"input_generation":r.get::<i64,_>("input_generation"),"interpretation":r.get::<Value,_>("interpretation")})).collect();
+    let revisions:Vec<Value>=rows.iter().map(|r|json!({"revision_id":r.get::<i64,_>("id"),"input_generation":r.get::<i64,_>("input_generation"),"interpretation":r.get::<Value,_>("interpretation"),"has_agent_run":r.get::<bool,_>("has_agent_run")})).collect();
     let interpreted = rows
         .iter()
         .map(|r| r.get::<DateTime<Utc>, _>("end_at"))
