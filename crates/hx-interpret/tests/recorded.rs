@@ -560,3 +560,58 @@ fn task_repair_follows_all_episode_references_and_preserves_supported_completion
     );
     assert!(linked.goal.is_none());
 }
+
+#[tokio::test]
+async fn a_failed_repair_keeps_the_earlier_valid_repaired_answer() {
+    struct FailRepair {
+        calls: std::sync::atomic::AtomicUsize,
+        output: String,
+    }
+    impl Provider for FailRepair {
+        fn name(&self) -> String {
+            "synthetic/fail-repair".into()
+        }
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String, InterpretError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(self.output.clone())
+            } else {
+                Err(InterpretError::Provider("synthetic failure".into()))
+            }
+        }
+    }
+    let (packet, mut value) = repair_fixture();
+    value.episodes[0].claims[0].outcome = "completed".into();
+    let output =
+        serde_json::json!({"episodes":value.episodes,"tasks":value.tasks,"summary":value.summary})
+            .to_string();
+    let provider = FailRepair {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        output,
+    };
+    let result = interpret(&packet, &provider).await.unwrap();
+    assert_eq!(result.episodes[0].claims[0].outcome, "attempted");
+    assert!(!result.check_failures.is_empty());
+    assert!(check(&result, &packet).is_empty());
+}
+
+#[test]
+fn a_source_report_cannot_be_an_observed_action() {
+    let (mut packet, mut value) = repair_fixture();
+    for e in &mut packet.evidence {
+        e.kind = "normal:agent.message".into();
+    }
+    let failures = check_and_repair(&mut value, &packet);
+    assert!(failures.iter().any(|f| f.reason.contains("source report")));
+    assert_eq!(value.episodes[0].claims[0].basis, Basis::ReportedBySource);
+    assert!(check(&value, &packet).is_empty());
+}
+
+#[test]
+fn agent_episode_time_must_be_supported_by_its_own_citations() {
+    let (mut packet, mut value) = repair_fixture();
+    packet
+        .timeline_text
+        .push_str("time_support_by_evidence={}\n");
+    check_and_repair(&mut value, &packet);
+    assert!(value.episodes.is_empty());
+}
