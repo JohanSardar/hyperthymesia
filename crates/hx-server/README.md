@@ -250,8 +250,9 @@ server. Automatic upgrades, session saves, prompt history, titles and sounds are
 disabled. `--system` accepts text, so the compiled-in versioned prompt file's
 contents are passed verbatim, with its version and SHA-256 recorded.
 
-A run has 24 total model steps across up to three scoped repairs, 80 total broker
-calls and a 180-second total timeout. Output streams are capped at 2 MiB each.
+A run has 120 total model steps across up to three scoped repairs (`HX_FX_MAX_STEPS`),
+240 total broker calls and a 1,200-second total timeout (`HX_FX_TIMEOUT_S`). A dense
+real four-hour window exhausted the original 24-step budget before producing output. Output streams are capped at 2 MiB each.
 Provider failures and timeouts keep the previous canonical revision. A valid
 repaired response is retained if a later repair fails. Subscription rate limits
 defer jobs for five minutes without consuming attempts. Publication checks the

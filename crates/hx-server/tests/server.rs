@@ -2232,12 +2232,12 @@ home=pathlib.Path(os.environ['HOME']); work=pathlib.Path.cwd()
 settings=json.loads((home/'.fx/settings.json').read_text())
 assert settings['context'] is False and settings['permission']['*']=='deny'
 assert settings['permission']['mcp_hyperthymesia_*']=='allow'
-assert 0<settings['max_agent_steps']<=24
+assert 0<settings['max_agent_steps']<=120
 assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude').exists()
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
-assert 'hx-replica/v1' in sys.argv[sys.argv.index('--system')+1]
+assert 'hx-replica/v3' in sys.argv[sys.argv.index('--system')+1]
 assert sys.stdin.read().strip()
 if mode=='timeout': time.sleep(3)
 if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
@@ -2274,6 +2274,7 @@ print(json.dumps({'exit_code':0,'model':'gpt-6.1-sol','steps':2,'final_output':a
         binary,
         credential,
         timeout: std::time::Duration::from_secs(10),
+        max_steps: hx_server::fx::DEFAULT_MAX_STEPS,
     }
 }
 
