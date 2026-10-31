@@ -154,7 +154,7 @@ impl EvidenceItem {
     }
 }
 
-/// Memory/task inputs must already have passed the server egress policy.
+/// The timeline and memory/task inputs must already have passed the server egress policy.
 /// No sensitivity metadata exists for these frozen inputs.
 pub fn build_packet(
     timeline: &Timeline,
@@ -317,13 +317,14 @@ pub fn build_packet_with_budget(
         .lanes
         .iter()
         .flat_map(|lane| &lane.intervals)
+        // The caller compiles only egress-cleared observations, so a span is citable once
+        // any of its evidence made the packet; selection merely sampled the rest.
         .filter(|span| {
-            !span.evidence.is_empty()
-                && span.evidence.iter().all(|id| {
-                    allowed
-                        .get(id)
-                        .is_some_and(|e| e.at >= timeline.window.start)
-                })
+            span.evidence.iter().any(|id| {
+                allowed
+                    .get(id)
+                    .is_some_and(|e| e.at >= timeline.window.start)
+            })
         })
         .map(|span| span.interval)
         .collect();

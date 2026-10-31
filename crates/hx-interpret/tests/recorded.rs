@@ -320,3 +320,28 @@ async fn retries_are_bounded() {
     assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert!(RecordedProvider::fixtures("../escape").is_err());
 }
+
+/// Answers with a flawed object, then a flawed fenced object, then prose.
+struct DriftingProvider(std::sync::atomic::AtomicUsize);
+impl Provider for DriftingProvider {
+    fn name(&self) -> String {
+        "drifting".into()
+    }
+    async fn complete(&self, _: &str, _: &str) -> Result<String, InterpretError> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(match n {
+            0 => response("unknown").to_string(),
+            1 => format!("```json\n{}\n```", response("unknown")),
+            _ => "I could not produce JSON.".into(),
+        })
+    }
+}
+#[tokio::test]
+async fn fenced_output_parses_and_a_failed_last_retry_keeps_the_repaired_answer() {
+    let provider = DriftingProvider(std::sync::atomic::AtomicUsize::new(0));
+    let result = interpret(&packet("success"), &provider).await.unwrap();
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+    // Both parsed answers cited unknown evidence; the prose attempt adds an output failure.
+    assert!(result.check_failures.iter().any(|f| f.item == "output"));
+    assert!(result.check_failures.len() >= 3);
+}
