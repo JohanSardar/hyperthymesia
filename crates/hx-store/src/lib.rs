@@ -434,7 +434,14 @@ impl Store {
     }
     pub async fn evidence(&self, id: i64) -> Result<Option<Value>> {
         let value:Option<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',e.id,'envelope',e.envelope,'sensitivity',e.sensitivity,'blobs',coalesce((SELECT jsonb_agg(jsonb_build_object('sha256',b.sha256,'evidence_expired',b.evidence_expired)) FROM event_blobs eb JOIN blobs b USING(sha256) WHERE eb.event_id=e.id),'[]'::jsonb)) FROM events e WHERE id=$1").bind(id).fetch_optional(&self.pool).await?;
-        Ok(value)
+        if let Some(mut value) = value {
+            let derived: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'envelope',envelope,'sensitivity',sensitivity) FROM ocr_derived WHERE source_event_id=$1 ORDER BY id")
+                .bind(id).fetch_all(&self.pool).await?;
+            value["derived_evidence"] = json!(derived);
+            return Ok(Some(value));
+        }
+        Ok(sqlx::query_scalar("SELECT jsonb_build_object('id',d.id,'envelope',d.envelope,'sensitivity',d.sensitivity,'source_event_id',d.source_event_id,'blobs',jsonb_build_array(jsonb_build_object('sha256',b.sha256,'evidence_expired',b.evidence_expired))) FROM ocr_derived d JOIN blobs b USING(sha256) WHERE d.id=$1")
+            .bind(id).fetch_optional(&self.pool).await?)
     }
 }
 

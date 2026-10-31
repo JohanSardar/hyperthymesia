@@ -149,9 +149,24 @@ pub async fn evidence_page(
             }
         }
     }
+    let mut ocr_text = Vec::new();
+    if let Some(derived) = value["derived_evidence"].as_array() {
+        for item in derived {
+            if let Some(lines) = item["envelope"]["payload"]["ocr"]["lines"].as_array() {
+                ocr_text.push((
+                    item["id"].as_i64().unwrap_or_default(),
+                    lines
+                        .iter()
+                        .filter_map(|l| l["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
+            }
+        }
+    }
     Ok(shell(
         "Evidence",
-        html! {h1 {"Evidence " (id)} pre {(serde_json::to_string_pretty(&value).unwrap_or_default())} @for src in thumbnails {img src=(src) alt="Captured still";}},
+        html! {h1 {"Evidence " (id)} pre {(serde_json::to_string_pretty(&value).unwrap_or_default())} @for src in thumbnails {img src=(src) alt="Captured still";} @for (ocr_id, text) in ocr_text { section {h2 {a href=(format!("/evidence/{ocr_id}")) {"OCR text"}} pre {(text)}} }},
     ))
 }
 

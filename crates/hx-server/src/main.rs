@@ -104,6 +104,19 @@ async fn main() -> Result<()> {
                 store: store.clone(),
                 provider: processing::coordinator_provider(ProviderConfig::from_env()),
             };
+            let ocr_worker = if cfg!(target_os = "macos") {
+                let store = store.clone();
+                Some(tokio::spawn(async move {
+                    if hx_server::ocr::worker(store).await.is_err() {
+                        tracing::error!("OCR worker unavailable");
+                    }
+                }))
+            } else {
+                tracing::warn!(
+                    "OCR requires a macOS server; pending stills are retained for backfill"
+                );
+                None
+            };
             let worker = tokio::spawn(async move {
                 let mut next_schedule = tokio::time::Instant::now();
                 loop {
@@ -128,6 +141,9 @@ async fn main() -> Result<()> {
                 })
                 .await;
             worker.abort();
+            if let Some(worker) = ocr_worker {
+                worker.abort();
+            }
             result?;
         }
     }
