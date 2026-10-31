@@ -19,3 +19,7 @@ ts	phase	decision	why	evidence	result
 2026-10-30T23:36:04Z	E2E	merge PR5 with rusqlite 0.39 pin + normal: evidence prefix + env-selected provider	sqlx 0.9 optional sqlite driver conflicts with rusqlite 0.41 links; interpret drops unprefixed evidence	workspace check.sh green; 25 server tests	VERIFIED
 2026-10-30T23:36:04Z	E2E	delegate server throughput + connector catch-up to Sol	real data: 13180 compile jobs for 6 windows, 5 jobs/s, T3 40 syncs 0 envelopes	hx_e2e jobs table; connector outputs	OPEN
 2026-10-30T23:36:04Z	E2E	merge PR6 connector catch-up	real T3 17k events/6min, claude-code 22.8k/3min, git complete; tests+CI green	hx_e2e events counts	VERIFIED
+2026-10-31T16:46:11Z	E2E	merge PR7 server throughput	backlog 13k compile jobs collapsed to 7; tests 30+1 ignored; CI green	hx_e2e jobs table	VERIFIED
+2026-10-31T16:46:11Z	E2E	sensitive evidence egress full text (user decision)	connectors label agent text sensitive; server dropped it so LLM saw nothing	live claude run abstained on empty packet; new test	VERIFIED
+2026-10-31T16:46:11Z	E2E	evidence at source time	backfilled observed_at is hours after source_start; packet window filter dropped all	live run then cited items; regression test	VERIFIED
+2026-10-31T16:46:11Z	E2E	delegate interpreter evidence selection to Sol (synthetic data only)	128-item earliest-first cap filled by lead-in; live Claude abstained	revision 22 summary	OPEN
