@@ -31,3 +31,4 @@ ts	phase	decision	why	evidence	result
 2026-10-31T20:22:40Z	C	merge PR11 server disclosure policy	hx-agent labels everything restricted, so laptop capture never reached the LLM	kinds match agent emitters; 75 tests + clippy; CI green	VERIFIED
 2026-10-31T20:22:40Z	C	merge PR12 server OCR + still lineage fix	stills were dropped before OCR and OCR text inherited restricted	new test laptop_policy_turns_restricted_stills_into_ocr_text_only; CI green	VERIFIED
 2026-10-31T20:22:40Z	E2E	laptop capture live	needs user-granted Accessibility/Screen/Input permissions	no macos-* events on server yet	OPEN
+2026-10-31T21:43:35Z	C	fx acceptance 1: ChatGPT-sub gpt-6.1-sol xhigh fast	spec requires proving model/effort/fast before building on fx	fx 0.0.16 trace: provider_options model=gpt-6.1-sol fast_mode=true effort=xhigh reasoning=selected fast=selected	VERIFIED
