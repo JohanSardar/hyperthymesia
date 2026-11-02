@@ -387,7 +387,13 @@ pub fn build_packet_with_budget(
     for (index, lane) in timeline.lanes.iter().enumerate() {
         for span in &lane.intervals {
             lines.push(format!(
-                "lane {index} {} {} uncertain_edges={} evidence={:?} {}",
+                "lane {index} kind={}{} {} {} uncertain_edges={} evidence={:?} {}",
+                lane.id.kind,
+                if lane.id.kind == "attention" {
+                    " basis=inferred"
+                } else {
+                    ""
+                },
                 span.interval.start,
                 span.interval.end,
                 span.uncertain_edges,
