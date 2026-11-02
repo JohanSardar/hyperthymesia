@@ -133,38 +133,45 @@ async fn interpret_window_key<P: Provider>(
         )
         .await;
     }
-    let _guard = interpretation_guard(store, w).await?;
-    let PreparedInput {
-        packet,
-        manifest,
-        generation,
-        namespaces,
-    } = prepare_input(store, w, &provider.name()).await?;
-    if primary {
-        ensure_settled(store, w, generation).await?;
+    let guard = interpretation_guard(store, w).await?;
+    // Roll back explicitly: a dropped transaction releases the advisory lock only
+    // when the pool later reuses its connection, so an immediate rerun saw it held.
+    let result = async {
+        let PreparedInput {
+            packet,
+            manifest,
+            generation,
+            namespaces,
+        } = prepare_input(store, w, &provider.name()).await?;
+        if primary {
+            ensure_settled(store, w, generation).await?;
+        }
+        if revision_exists(store, w, generation, &manifest_identity(&manifest)).await? {
+            return Ok(false);
+        }
+        let interpretation = hx_interpret::interpret(&packet, provider)
+            .await
+            .map_err(|error| {
+                let category = match &error {
+                    hx_interpret::InterpretError::Provider(_) => Failure::Provider,
+                    hx_interpret::InterpretError::Parse(_) => Failure::ModelOutput,
+                };
+                anyhow::Error::new(error).context(category)
+            })?;
+        let failures = hx_interpret::check(&interpretation, &packet);
+        if !failures.is_empty() {
+            return Err(Failure::EvidenceChecks.into());
+        }
+        let mut value = serde_json::to_value(interpretation)?;
+        value["input_manifest"] = manifest;
+        Ok(store
+            .publish_revision_manifest(w, generation, value, output_key, &namespaces)
+            .await?
+            .1)
     }
-    if revision_exists(store, w, generation, &manifest_identity(&manifest)).await? {
-        return Ok(false);
-    }
-    let interpretation = hx_interpret::interpret(&packet, provider)
-        .await
-        .map_err(|error| {
-            let category = match &error {
-                hx_interpret::InterpretError::Provider(_) => Failure::Provider,
-                hx_interpret::InterpretError::Parse(_) => Failure::ModelOutput,
-            };
-            anyhow::Error::new(error).context(category)
-        })?;
-    let failures = hx_interpret::check(&interpretation, &packet);
-    if !failures.is_empty() {
-        return Err(Failure::EvidenceChecks.into());
-    }
-    let mut value = serde_json::to_value(interpretation)?;
-    value["input_manifest"] = manifest;
-    Ok(store
-        .publish_revision_manifest(w, generation, value, output_key, &namespaces)
-        .await?
-        .1)
+    .await;
+    guard.rollback().await?;
+    result
 }
 pub(crate) fn self_generated(e: &hx_schema::Envelope) -> bool {
     e.connector_instance.as_str().starts_with("hyperthymesia:")
