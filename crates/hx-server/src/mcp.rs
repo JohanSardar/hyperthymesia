@@ -133,6 +133,27 @@ impl Broker {
         }
         Ok((observations, evidence))
     }
+    /// Observations for exactly these evidence ids, without the exploration row cap.
+    pub async fn observations(&self, ids: &[i64]) -> Result<Vec<hx_compile::Observation>> {
+        let rows = sqlx::query(
+            "SELECT id,received_at,envelope FROM events WHERE id = ANY($1) ORDER BY source_start,id",
+        )
+        .bind(ids)
+        .fetch_all(&self.store.pool)
+        .await?;
+        let mut observations = vec![];
+        for row in rows {
+            let e: Envelope = serde_json::from_value(row.get("envelope"))?;
+            if self.visible(&e) && e.kind.as_str() != "media.still" {
+                observations.push(hx_compile::Observation {
+                    id: row.get("id"),
+                    received_at: row.get("received_at"),
+                    envelope: e,
+                });
+            }
+        }
+        Ok(observations)
+    }
     fn range(&self, args: &Value) -> Result<Interval> {
         let start = args
             .get("from")
