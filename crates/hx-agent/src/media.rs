@@ -4,7 +4,7 @@ use crate::{
     policy::Policy,
     runtime::Submission,
 };
-use hx_macos_sys::{Focus, ScreenStream, VideoWriter};
+use hx_macos_sys::{Focus, Frame, ScreenStream, VideoWriter};
 use hx_schema::{kinds::*, *};
 use std::{
     sync::{
@@ -26,6 +26,31 @@ struct Chunk {
 struct Session {
     stream: ScreenStream,
     focus: Focus,
+    stills: StillFrames<Frame>,
+}
+/// The interval owns the latest approved sample independently of SCK arrivals.
+struct StillFrames<T> {
+    latest: Option<T>,
+    last_attempt: Option<Instant>,
+}
+impl<T> StillFrames<T> {
+    fn new() -> Self {
+        Self {
+            latest: None,
+            last_attempt: None,
+        }
+    }
+    fn sample(&mut self, now: Instant, cadence_s: u64) -> Option<&T> {
+        if self.latest.is_none()
+            || self.last_attempt.is_some_and(|last| {
+                now.duration_since(last) < Duration::from_secs(cadence_s.max(1))
+            })
+        {
+            return None;
+        }
+        self.last_attempt = Some(now);
+        self.latest.as_ref()
+    }
 }
 fn run_inner(
     config: Config,
@@ -52,7 +77,6 @@ fn run_inner(
     }
     let mut session: Option<Session> = None;
     let mut chunk: Option<Chunk> = None;
-    let mut last_still = Instant::now() - Duration::from_secs(3600);
     let mut hour = Instant::now();
     let mut spent = 0u64;
     let mut last_hash = String::new();
@@ -65,7 +89,14 @@ fn run_inner(
             f.title = hx_macos_sys::window_title(f);
         }
         let screen = hx_macos_sys::permissions().screen;
-        let allowed = !paused.load(Ordering::Relaxed)
+        let active = capture_active(
+            hx_macos_sys::idle_seconds(),
+            config.idle_threshold_s,
+            hx_macos_sys::session_locked().unwrap_or(true),
+            hx_macos_sys::display_asleep(),
+        );
+        let allowed = active
+            && !paused.load(Ordering::Relaxed)
             && !hx_macos_sys::secure_input()
             && screen
             && focus.as_ref().is_some_and(|f| {
@@ -109,7 +140,7 @@ fn run_inner(
             } else {
                 CollectorStatus::Failed
             };
-            send_health(&mut producer,&tx,status,if !granted {"PermissionDenied: use explicit onboard command"}else if !allowed {"content suppressed: policy, unavailable focused-window identity, pause or Secure Input"}else {"foreground-window capture only; full-display coverage unavailable"}.into(),session.as_ref().map_or(0,|s|s.stream.dropped()))?;
+            send_health(&mut producer,&tx,status,if !granted {"PermissionDenied: use explicit onboard command"}else if !allowed {"content suppressed: inactive device, policy, unavailable focused-window identity, pause or Secure Input"}else {"foreground-window capture only; full-display coverage unavailable"}.into(),session.as_ref().map_or(0,|s|s.stream.dropped()))?;
         }
         let changed = session
             .as_ref()
@@ -128,8 +159,8 @@ fn run_inner(
                         session = Some(Session {
                             stream,
                             focus: f.clone(),
+                            stills: StillFrames::new(),
                         });
-                        last_still = Instant::now() - Duration::from_secs(3600);
                         last_hash.clear();
                     }
                     Err(error) => {
@@ -142,7 +173,7 @@ fn run_inner(
             hour = Instant::now();
             spent = 0;
         }
-        if let Some(s) = &session {
+        if let Some(s) = &mut session {
             while let Some(frame) = s.stream.pop() {
                 // Recheck native focus immediately before encoding or writing any frame.
                 let mut now = hx_macos_sys::frontmost();
@@ -152,6 +183,13 @@ fn run_inner(
                 if now.as_ref() != Some(&s.focus)
                     || paused.load(Ordering::Relaxed)
                     || hx_macos_sys::secure_input()
+                    || !capture_active(
+                        hx_macos_sys::idle_seconds(),
+                        config.idle_threshold_s,
+                        hx_macos_sys::session_locked().unwrap_or(true),
+                        hx_macos_sys::display_asleep(),
+                    )
+                    || !policy.allows(&s.focus.bundle_id, s.focus.title.as_deref())
                     || !hx_macos_sys::permissions().screen
                 {
                     continue;
@@ -193,70 +231,88 @@ fn run_inner(
                         )?;
                     }
                 }
-                let profile = Profile::select(hx_macos_sys::power(), &config);
-                let cadence = config.still_cadence_s.max(match profile {
-                    Profile::Full => 1,
-                    Profile::Balanced => 30,
-                    Profile::Saver => 120,
-                });
-                if last_still.elapsed() >= Duration::from_secs(cadence) {
-                    last_still = Instant::now();
-                    match frame.jpeg() {
-                        Ok(bytes) => {
-                            let hash = sha256_hex(&bytes);
-                            if hash == last_hash {
-                                continue;
-                            }
-                            if spent.saturating_add(bytes.len() as u64)
-                                > config.still_budget_bytes_per_hour
-                            {
-                                send_health(
-                                    &mut producer,
-                                    &tx,
-                                    CollectorStatus::Running,
-                                    "still skipped: hourly byte budget".into(),
-                                    1,
-                                )?;
-                                continue;
-                            }
-                            spent += bytes.len() as u64;
-                            let trigger = if last_hash.is_empty() {
-                                StillTrigger::FocusChange
-                            } else {
-                                StillTrigger::ContentChange
-                            };
-                            last_hash = hash.clone();
-                            let mut e = producer.core(
-                                format!("still:{}", ulid::Ulid::generate()),
-                                "0",
-                                Operation::Observe,
-                                CorePayload::MediaStill(MediaStill {
-                                    display: "main:foreground_window_only".into(),
-                                    trigger,
-                                    width: s.stream.width,
-                                    height: s.stream.height,
-                                    app_bundle_id: Some(s.focus.bundle_id.clone()),
-                                    window_title: s.focus.title.clone(),
-                                }),
-                            );
-                            e.time.mono_start.as_mut().expect("native stamp").nanos = frame.nanos;
-                            let blob = BlobRef {
-                                sha256: hash,
-                                media_type: "image/jpeg".into(),
-                                bytes: bytes.len() as u64,
-                            };
-                            e.blobs.push(blob.clone());
-                            tx.blocking_send(Submission {
-                                envelope: e,
-                                reply: None,
-                                focus: Some(s.focus.clone()),
-                                secure: false,
-                                blobs: vec![(blob, bytes)],
-                            })?;
+                s.stills.latest = Some(frame);
+            }
+            // SCK may stop sending complete frames after the last visual change.
+            // Keep the newest approved sample so the interval can observe a change
+            // that happened between ticks. The hash below suppresses static frames.
+            let mut now = hx_macos_sys::frontmost();
+            if let Some(f) = now.as_mut() {
+                f.title = hx_macos_sys::window_title(f);
+            }
+            if now.as_ref() != Some(&s.focus)
+                || paused.load(Ordering::Relaxed)
+                || hx_macos_sys::secure_input()
+                || !hx_macos_sys::permissions().screen
+                || !capture_active(
+                    hx_macos_sys::idle_seconds(),
+                    config.idle_threshold_s,
+                    hx_macos_sys::session_locked().unwrap_or(true),
+                    hx_macos_sys::display_asleep(),
+                )
+                || !policy.allows(&s.focus.bundle_id, s.focus.title.as_deref())
+            {
+                s.stills.latest = None;
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            let profile = Profile::select(hx_macos_sys::power(), &config);
+            let cadence = config.still_cadence_s.max(match profile {
+                Profile::Full => 1,
+                Profile::Balanced => 30,
+                Profile::Saver => 120,
+            });
+            if let Some(frame) = s.stills.sample(Instant::now(), cadence) {
+                match frame.jpeg() {
+                    Ok(bytes) => {
+                        let hash = sha256_hex(&bytes);
+                        let Some(trigger) = still_trigger(&last_hash, &hash) else {
+                            continue;
+                        };
+                        if spent.saturating_add(bytes.len() as u64)
+                            > config.still_budget_bytes_per_hour
+                        {
+                            send_health(
+                                &mut producer,
+                                &tx,
+                                CollectorStatus::Running,
+                                "still skipped: hourly byte budget".into(),
+                                1,
+                            )?;
+                            continue;
                         }
-                        Err(error) => {
-                            send_health(&mut producer, &tx, CollectorStatus::Failed, error, 1)?
-                        }
+                        spent += bytes.len() as u64;
+                        last_hash = hash.clone();
+                        let mut e = producer.core(
+                            format!("still:{}", ulid::Ulid::generate()),
+                            "0",
+                            Operation::Observe,
+                            CorePayload::MediaStill(MediaStill {
+                                display: "main:foreground_window_only".into(),
+                                trigger,
+                                width: s.stream.width,
+                                height: s.stream.height,
+                                app_bundle_id: Some(s.focus.bundle_id.clone()),
+                                window_title: s.focus.title.clone(),
+                            }),
+                        );
+                        e.time = frame_time(e.time, frame.nanos);
+                        let blob = BlobRef {
+                            sha256: hash,
+                            media_type: "image/jpeg".into(),
+                            bytes: bytes.len() as u64,
+                        };
+                        e.blobs.push(blob.clone());
+                        tx.blocking_send(Submission {
+                            envelope: e,
+                            reply: None,
+                            focus: Some(s.focus.clone()),
+                            secure: false,
+                            blobs: vec![(blob, bytes)],
+                        })?;
+                    }
+                    Err(error) => {
+                        send_health(&mut producer, &tx, CollectorStatus::Failed, error, 1)?
                     }
                 }
             }
@@ -369,6 +425,18 @@ pub(crate) fn run(
     result
 }
 
+fn capture_active(idle_s: f64, threshold_s: u32, locked: bool, asleep: bool) -> bool {
+    idle_s.is_finite() && idle_s < threshold_s as f64 && !locked && !asleep
+}
+fn still_trigger(previous_hash: &str, hash: &str) -> Option<StillTrigger> {
+    if previous_hash == hash {
+        None
+    } else if previous_hash.is_empty() {
+        Some(StillTrigger::FocusChange)
+    } else {
+        Some(StillTrigger::Periodic)
+    }
+}
 fn health_due(elapsed: Duration, last_screen: Option<bool>, screen: bool) -> bool {
     elapsed >= Duration::from_secs(45) || last_screen != Some(screen)
 }
@@ -398,6 +466,55 @@ fn frame_time(mut now: ObservationTime, nanos: u64) -> ObservationTime {
 #[cfg(test)]
 mod statechart_regressions {
     use super::*;
+    #[test]
+    fn periodic_still_uses_retained_change_and_skips_static_window() {
+        let cadence = Config::default().still_cadence_s;
+        assert_eq!(cadence, 60);
+        assert_eq!(
+            still_trigger("", "initial"),
+            Some(StillTrigger::FocusChange)
+        );
+        let start = Instant::now();
+        let mut frames = StillFrames::new();
+        assert_eq!(frames.sample(start, cadence), None);
+        frames.latest = Some("initial");
+        assert_eq!(frames.sample(start, cadence), Some(&"initial"));
+        // A new sample arrives at 10s, then SCK sends no complete samples.
+        frames.latest = Some("changed at 10s");
+        assert_eq!(
+            frames.sample(start + Duration::from_secs(10), cadence),
+            None
+        );
+        let retained = frames
+            .sample(start + Duration::from_secs(60), cadence)
+            .unwrap();
+        assert_eq!(
+            still_trigger("initial", retained),
+            Some(StillTrigger::Periodic)
+        );
+        assert_eq!(
+            frames.sample(start + Duration::from_secs(61), cadence),
+            None
+        );
+        let retained = frames
+            .sample(start + Duration::from_secs(420), cadence)
+            .unwrap();
+        assert_eq!(still_trigger("changed at 10s", retained), None);
+        // Clearing a suppressed session's retained sample prevents reuse.
+        frames.latest = None;
+        assert_eq!(
+            frames.sample(start + Duration::from_secs(480), cadence),
+            None
+        );
+    }
+    #[test]
+    fn idle_locked_and_sleeping_devices_suppress_media() {
+        assert!(capture_active(10., 300, false, false));
+        assert!(!capture_active(300., 300, false, false));
+        assert!(!capture_active(0., 300, true, false));
+        assert!(!capture_active(0., 300, false, true));
+        assert!(!capture_active(f64::NAN, 300, false, false));
+    }
     #[test]
     fn screen_permission_loss_is_reported_before_heartbeat() {
         assert!(health_due(Duration::from_secs(1), Some(true), false));

@@ -26,7 +26,7 @@ impl Default for Config {
             event_budget_bytes: 64 * 1024 * 1024,
             media_budget_bytes: 1024 * 1024 * 1024,
             idle_threshold_s: 300,
-            still_cadence_s: 30,
+            still_cadence_s: 60,
             still_budget_bytes_per_hour: 64 * 1024 * 1024,
             saver_thermal_threshold: 2,
         }
