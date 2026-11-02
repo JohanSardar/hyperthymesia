@@ -127,6 +127,10 @@ async fn exhausted_interpretations_recover_without_new_input() {
         provider: Fails,
     };
     assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    sqlx::query("UPDATE windows SET input_changed_at=now()-interval '1 hour'")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
     for _ in 0..10 {
         sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret' AND state='ready'")
             .execute(&f.store.pool)
@@ -202,6 +206,11 @@ async fn workers_serialize_jobs_for_the_same_window() {
         provider: hx_server::processing::StubProvider,
     };
     assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    // Make both cadences eligible; this test isolates per-window claim fencing.
+    sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret'")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
     let (a, b) = tokio::join!(
         hx_jobs::claim(&f.store.pool, 120),
         hx_jobs::claim(&f.store.pool, 120)
@@ -227,7 +236,12 @@ async fn workers_serialize_jobs_for_the_same_window() {
             .unwrap()
     );
     assert!(hx_jobs::finish(&f.store.pool, first, None).await.unwrap());
-    assert!(hx_jobs::claim(&f.store.pool, 120).await.unwrap().is_some());
+    let next = hx_jobs::claim(&f.store.pool, 120).await.unwrap();
+    let debug: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(jobs)) FROM jobs")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert!(next.is_some(), "{debug}");
     f.close().await;
 }
 #[tokio::test]

@@ -321,9 +321,29 @@ pub async fn interpret_window(
     output_key: &str,
     config: &Config,
 ) -> Result<bool> {
+    interpret_window_with_settle(store, window, output_key, config, false).await
+}
+
+pub(crate) async fn interpret_window_with_settle(
+    store: &Store,
+    window: Interval,
+    output_key: &str,
+    config: &Config,
+    primary: bool,
+) -> Result<bool> {
+    let _guard = crate::processing::interpretation_guard(store, window).await?;
     let (_, generation) = crate::processing::compile_window(store, window).await?;
+    if primary {
+        crate::processing::ensure_settled(store, window, generation).await?;
+    }
     let policy = DisclosurePolicy::from_env()?;
     let sensitive = SensitiveEgress::from_env();
+    let identity = json!({"input_generation":generation,"provider":"fx","model":MODEL,
+        "prompt_version":PROMPT_VERSION,"sensitive_egress":sensitive,
+        "disclosure_policy":{"digest":policy.digest()}});
+    if crate::processing::revision_exists(store, window, generation, &identity).await? {
+        return Ok(false);
+    }
     let broker = Broker::new(store.clone(), policy.clone(), sensitive, window);
     let goal = format!(
         "Reconstruct {} to {}. Use Hyperthymesia MCP tools. Every claim must cite evidence returned by tools in this run.",
