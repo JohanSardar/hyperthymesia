@@ -128,6 +128,7 @@ pub enum Deferred {
     InputChanged,
     RateLimited,
     ProviderBusy,
+    Until(DateTime<Utc>),
 }
 impl std::fmt::Display for Deferred {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -136,13 +137,14 @@ impl std::fmt::Display for Deferred {
             Self::InputChanged => "input generation changed",
             Self::RateLimited => "subscription rate limited",
             Self::ProviderBusy => "subscription credential busy",
+            Self::Until(_) => "window input settling",
         })
     }
 }
 impl std::error::Error for Deferred {}
 pub async fn defer(pool: &PgPool, job: &Job, reason: &Deferred) -> Result<bool> {
-    Ok(sqlx::query("UPDATE jobs SET state='ready',attempts=CASE WHEN request_version>leased_version THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=now()+CASE WHEN $3='subscription rate limited' THEN interval '5 minutes' WHEN $3='subscription credential busy' THEN interval '5 seconds' ELSE interval '1 second' END,lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
-        .bind(job.id).bind(&job.owner).bind(reason.to_string()).execute(pool).await?.rows_affected()==1)
+    Ok(sqlx::query("UPDATE jobs SET state='ready',attempts=CASE WHEN request_version>leased_version THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=coalesce($4,now()+CASE WHEN $3='subscription rate limited' THEN interval '5 minutes' WHEN $3='subscription credential busy' THEN interval '5 seconds' ELSE interval '1 second' END),lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
+        .bind(job.id).bind(&job.owner).bind(reason.to_string()).bind(match reason { Deferred::Until(at) => Some(*at), _ => None }).execute(pool).await?.rows_affected()==1)
 }
 // Never persist arbitrary Display strings: SQL/provider/serde errors can contain source text.
 #[derive(Debug)]
