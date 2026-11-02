@@ -2244,7 +2244,7 @@ assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
-assert 'hx-replica/v3' in sys.argv[sys.argv.index('--system')+1]
+assert 'hx-replica/v4' in sys.argv[sys.argv.index('--system')+1]
 assert sys.stdin.read().strip()
 if mode=='timeout': time.sleep(3)
 if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
@@ -2261,6 +2261,21 @@ data=json.loads(result['content'][0]['text'])
 assert 'SYNTHETIC_RESTRICTED_CANARY' not in json.dumps(data)
 e=data['evidence'][0]; point={'start':e['at'],'end':e['at']}
 answer={'episodes':[{'id':'synthetic-episode','intervals':[point],'title':'Synthetic visit','description':'Synthetic visit','claims':[{'actor':'owner','action':'visited','object':'synthetic page','outcome':'unknown','basis':'observed','evidence':[e['id']],'outcome_evidence':[]}],'evidence':[e['id']],'confidence':0.8}], 'tasks':[], 'summary':'Synthetic visit'}
+if mode=='attention':
+ lanes=data['attention']
+ span=next(s for lane in lanes for s in lane['intervals'] if s['label']=='probably_away')
+ assert span['attrs']['basis']=='inferred'
+ supports=json.loads(next(line.split('=',1)[1] for line in data['timeline'].splitlines() if line.startswith('time_support=')))
+ assert span['interval'] in supports
+ ids=span['evidence']
+ assert ids and set(ids)<=set(e['id'] for e in data['attention_evidence'])
+ assert all('payload' not in e['text'] for e in data['attention_evidence'])
+ second=rpc('tools/call',{'name':'timeline','arguments':{'from':start,'to':'2026-01-01T04:00:00Z'}})
+ assert json.loads(second['content'][0]['text'])['attention']==lanes
+ episode=answer['episodes'][0]
+ episode.update(intervals=[span['interval']],title='Probably away',description='Inferred absence from healthy capture',evidence=ids)
+ episode['claims'][0].update(action='was probably away',object='Mac',basis='inferred',evidence=ids)
+ answer['summary']='Probably away'
 if mode=='invalid': answer='this is not JSON'
 if mode=='repair-failure':
  counter=pathlib.Path('COUNTER')
@@ -2284,6 +2299,135 @@ print(json.dumps({'exit_code':0,'model':'gpt-6.1-sol','steps':2,'final_output':a
         timeout: std::time::Duration::from_secs(10),
         max_steps: hx_server::fx::DEFAULT_MAX_STEPS,
     }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_attention_intervals_are_citable_time_support() {
+    let f = Fixture::new().await;
+    let base = event("attention-base", 1).time.observed_at;
+    let capture = |key: &str, seconds: i64, kind: &str, payload: Value| {
+        let mut e = event(key, 1);
+        e.device = Some(hx_schema::DeviceId::new("synthetic-device"));
+        e.kind = Kind::new(kind);
+        e.time = ObservationTime::point(base + Duration::seconds(seconds));
+        e.payload = payload;
+        e
+    };
+    let mut events = vec![
+        capture(
+            "focus",
+            0,
+            "focus.span",
+            json!({"app_bundle_id":"synthetic.app","app_name":"Synthetic","window_title":"Stuck page"}),
+        ),
+        capture(
+            "input-first",
+            0,
+            "input.bucket",
+            json!({"bucket_ms":1000,"keys":1,"clicks":0,"mouse_px":0,"scroll_events":0}),
+        ),
+        capture(
+            "input-last",
+            240,
+            "input.bucket",
+            json!({"bucket_ms":1000,"keys":1,"clicks":0,"mouse_px":0,"scroll_events":0}),
+        ),
+        still("attention-still", 0, Sensitivity::Normal, &synthetic_png(0)),
+    ];
+    for second in (0..270).step_by(30) {
+        for collector in ["input", "focus", "media"] {
+            events.push(capture(
+                &format!("health-{collector}-{second}"),
+                second,
+                "collector.health",
+                json!({"collector":collector,"status":"running","dropped":0}),
+            ));
+        }
+    }
+    // More than 32 records ensures attention does not use the raw response sample.
+    for second in 1..240 {
+        events.push(capture(
+            &format!("zero-{second}"),
+            second,
+            "input.bucket",
+            json!({"bucket_ms":1000,"keys":0,"clicks":0,"mouse_px":0,"scroll_events":0}),
+        ));
+    }
+    ingest(&f.store, events).await;
+    let w = hx_store::window_at(base);
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "attention");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-attention", &config)
+            .await
+            .unwrap()
+    );
+    let row = sqlx::query(
+        "SELECT interpretation,agent_run FROM revisions WHERE output_key='synthetic-attention'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    let value: Value = row.get("interpretation");
+    let run: Value = row.get("agent_run");
+    assert_eq!(value["episodes"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["episodes"][0]["claims"][0]["basis"], "inferred");
+    assert_eq!(value["check_failures"], json!([]));
+    assert_eq!(
+        run["calls"].as_array().unwrap().len(),
+        2,
+        "validation should need no repair turn"
+    );
+    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v4");
+
+    // Gap payloads stay private, but the interrupted time must be unknown.
+    let mut gap = capture(
+        "private-gap",
+        30,
+        "policy.gap",
+        json!({"reason":"SYNTHETIC_GAP_CANARY"}),
+    );
+    gap.time.source_end = Some(base + Duration::seconds(240));
+    gap.sensitivity = Sensitivity::Restricted;
+    ingest(&f.store, vec![gap]).await;
+    let broker = hx_server::mcp::Broker::new(
+        f.store.clone(),
+        hx_server::disclosure::DisclosurePolicy::default(),
+        hx_server::processing::SensitiveEgress::Full,
+        w,
+    );
+    let args = json!({"from":base,"to":base + Duration::seconds(270)});
+    let result = broker.call("timeline", args.clone()).await.unwrap();
+    assert!(!result.to_string().contains("SYNTHETIC_GAP_CANARY"));
+    let lanes: Vec<hx_compile::Lane> = serde_json::from_value(result["attention"].clone()).unwrap();
+    let interrupted = lanes
+        .iter()
+        .flat_map(|lane| &lane.intervals)
+        .find(|span| span.interval.contains(base + Duration::seconds(120)))
+        .unwrap();
+    assert_eq!(interrupted.label, "unknown");
+
+    // A capped scan cannot certify silence: all returned attention stays unknown.
+    let dense: Vec<_> = (0..2100)
+        .map(|i| {
+            let mut e = event(&format!("attention-dense-{i}"), 1);
+            e.time = ObservationTime::point(base + Duration::milliseconds(i));
+            e
+        })
+        .collect();
+    ingest(&f.store, dense).await;
+    let result = broker.call("window_overview", args).await.unwrap();
+    let lanes: Vec<hx_compile::Lane> = serde_json::from_value(result["attention"].clone()).unwrap();
+    assert!(!lanes.is_empty());
+    assert!(
+        lanes
+            .iter()
+            .flat_map(|lane| &lane.intervals)
+            .all(|span| span.label == "unknown")
+    );
+    f.close().await;
 }
 
 #[tokio::test]
