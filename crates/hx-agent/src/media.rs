@@ -62,14 +62,14 @@ fn run_inner(
     while !stop.load(Ordering::Relaxed) {
         let mut focus = context.lock().expect("capture context").clone();
         if let Some(f) = focus.as_mut() {
-            f.title = hx_macos_sys::window_title(f.pid);
+            f.title = hx_macos_sys::window_title(f);
         }
         let screen = hx_macos_sys::permissions().screen;
         let allowed = !paused.load(Ordering::Relaxed)
             && !hx_macos_sys::secure_input()
             && screen
             && focus.as_ref().is_some_and(|f| {
-                policy.allows(&f.bundle_id, f.title.as_deref()) && !browser(f) && f.title.is_some()
+                policy.allows(&f.bundle_id, f.title.as_deref()) && f.title.is_some()
             });
         if health_due(last_health.elapsed(), last_screen, screen) {
             last_health = Instant::now();
@@ -109,7 +109,7 @@ fn run_inner(
             } else {
                 CollectorStatus::Failed
             };
-            send_health(&mut producer,&tx,status,if !granted {"PermissionDenied: use explicit onboard command"}else if !allowed {"content suppressed: policy, unavailable focused-window identity, private-window state, pause or Secure Input"}else {"foreground-window capture only; full-display coverage unavailable"}.into(),session.as_ref().map_or(0,|s|s.stream.dropped()))?;
+            send_health(&mut producer,&tx,status,if !granted {"PermissionDenied: use explicit onboard command"}else if !allowed {"content suppressed: policy, unavailable focused-window identity, pause or Secure Input"}else {"foreground-window capture only; full-display coverage unavailable"}.into(),session.as_ref().map_or(0,|s|s.stream.dropped()))?;
         }
         let changed = session
             .as_ref()
@@ -147,7 +147,7 @@ fn run_inner(
                 // Recheck native focus immediately before encoding or writing any frame.
                 let mut now = hx_macos_sys::frontmost();
                 if let Some(f) = now.as_mut() {
-                    f.title = hx_macos_sys::window_title(f.pid);
+                    f.title = hx_macos_sys::window_title(f);
                 }
                 if now.as_ref() != Some(&s.focus)
                     || paused.load(Ordering::Relaxed)
@@ -268,12 +268,6 @@ fn run_inner(
         finish(c, &mut producer, &tx)?;
     }
     Ok(())
-}
-fn browser(f: &Focus) -> bool {
-    hx_macos_sys::skip_ax(f)
-        || ["com.apple.Safari", "org.mozilla.firefox"]
-            .iter()
-            .any(|b| f.bundle_id.starts_with(b))
 }
 fn finish(
     c: Chunk,

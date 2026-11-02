@@ -116,7 +116,7 @@ Store: **Postgres** (data, FTS, pgvector, job queue) plus content-addressed blob
 | Device state | sleep/wake, lock, display, power, thermal | on |
 | Input activity | `CGEventTap` listen-only → 1 s buckets; callback does no AX and no I/O, only a bounded handoff | on |
 | Click context | AX hit-test sampled *after* the click; labeled as an observation at its own sample time | on |
-| Native app text | bounded AX extraction (time and node deadlines via `AXUIElementSetMessagingTimeout`); **never force Chromium/Electron AX** | on |
+| Native app text | bounded AX extraction (time and node deadlines via `AXUIElementSetMessagingTimeout`); Chromium/Electron AX enabled once per PID on capture workers | on |
 | Replay video | ScreenCaptureKit (drops idle frames) → VideoToolbox HEVC, low bitrate, 60 s chunks | on |
 | OCR-grade stills | sparse stills of the foreground context on focus change plus periodic sampling while content changes, **under a configured cadence/byte budget**; skipped captures recorded as coverage limits; kept even when text exists | on |
 | OCR | **none on device**; server only | — |
@@ -138,7 +138,7 @@ Every collector has overflow counters, cancellation, restart/re-registration on 
 
 ### 4.4 Outbox, privacy, packaging
 - **Outbox:** a SQLite outbox with separate budgets for high-value events vs. bulk media. Eviction emits loss events. A blob is only deleted after the server acknowledges it.
-- **Privacy:** one shared capture policy across all collectors. **Explicit exclusions apply before any local persistence**, including stills and video. If private-window state can't be established reliably, that content is suppressed and a metadata-only gap is emitted. Secure Input pauses content collection, not metadata.
+- **Privacy:** one shared capture policy across all collectors. **Explicit exclusions apply before any local persistence**, including stills and video. Browser windows are captured regardless of private/incognito state. Secure text fields are never read through AX; pause and lock-screen gates still suppress content. Secure Input pauses content collection, not metadata.
 - **Packaging:** a signed menu-bar `.app` plus a LaunchAgent. Permission loss is detected and recorded the moment it happens. Onboarding is an explicit flow; background jobs never trigger permission prompts. Permission continuity is a known risk that varies by OS version (macOS re-prompts for screen capture).
 
 ---
