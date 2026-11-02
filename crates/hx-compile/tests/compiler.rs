@@ -5,6 +5,14 @@ use proptest::prelude::*;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
+// These fixtures and the independent reference cover the original observed
+// index. Attention inference has its own synthetic suite in attention.rs.
+fn compile(observations: &[Observation], window: Interval) -> Timeline {
+    let mut timeline = hx_compile::compile(observations, window);
+    timeline.lanes.retain(|lane| lane.id.kind != "attention");
+    timeline
+}
+
 fn fixture(name: &str) -> (Vec<Observation>, Truth) {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/traces")

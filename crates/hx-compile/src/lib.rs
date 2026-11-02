@@ -100,7 +100,7 @@ pub const COMPILER_VERSION: &str = concat!("hx-compile/", env!("CARGO_PKG_VERSIO
 
 /// Compile observations into a timeline for `window`.
 pub fn compile(observations: &[Observation], window: Interval) -> Timeline {
-    compiler::compile(observations, window)
+    compile_with_attention_config(observations, window, AttentionConfig::default())
 }
 
 /// Union of observed foreground exposure per lane, for durations in the API.
@@ -122,4 +122,15 @@ pub fn exposure_by_label(timeline: &Timeline, lane_kind: &str) -> Vec<(String, c
         .collect()
 }
 
+mod attention;
+pub use attention::AttentionConfig;
 mod compiler;
+
+/// Compile with explicit, reproducible attention thresholds.
+pub fn compile_with_attention_config(
+    observations: &[Observation],
+    window: Interval,
+    config: AttentionConfig,
+) -> Timeline {
+    compiler::compile(observations, window, config)
+}

@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub const PROMPT_VERSION: &str = "hx-replica/v3";
-pub const PROMPT: &str = include_str!("../prompts/replica-v3.txt");
+pub const PROMPT_VERSION: &str = "hx-replica/v4";
+pub const PROMPT: &str = include_str!("../prompts/replica-v4.txt");
 pub const FX_VERSION: &str = "0.0.16";
 pub const MODEL: &str = "gpt-6.1-sol";
 /// Defaults sized for a dense real four-hour window; override per deployment.
@@ -232,7 +232,7 @@ async fn run_limited(
             &json!({"mcpServers":{"hyperthymesia":{"type":"http","url":format!("http://{addr}/mcp"),"bearer_token_env":"HX_MCP_TOKEN","operation_timeout_ms":15000}}}),
         )?,
     )?;
-    std::fs::write(work.join("replica-v3.txt"), PROMPT)?;
+    std::fs::write(work.join("replica-v4.txt"), PROMPT)?;
     let command = || {
         let mut cmd = tokio::process::Command::new(&config.binary);
         cmd.env_clear()
@@ -394,11 +394,16 @@ pub(crate) async fn interpret_window_with_settle(
         let audit = broker.audit.lock().await;
         ensure!(!audit.exhausted, "MCP budget exhausted");
         let evidence: Vec<_> = audit.evidence.values().cloned().collect();
+        let attention = audit.attention.clone();
         drop(audit);
         // Rebuild support from every cited record; a window-wide capped scan drops later spans.
         let ids: Vec<i64> = evidence.iter().map(|e| e.id).collect();
         let observations = broker.observations(&ids).await?;
         let mut timeline = hx_compile::compile(&observations, window);
+        // Replaying a sample would mistake omitted input/outages for silence.
+        // Validate exactly the deterministic attention intervals returned by MCP.
+        timeline.lanes.retain(|lane| lane.id.kind != "attention");
+        timeline.lanes.extend(attention);
         for item in &evidence {
             if item.kind.ends_with(":ocr.text") && item.at >= window.start && item.at < window.end {
                 timeline.points.push(hx_compile::Point {
@@ -435,6 +440,31 @@ pub(crate) async fn interpret_window_with_settle(
                     end: point.at,
                 });
         }
+        // Attention may cite health just before the window. It remains valid
+        // support even when packet sampling would omit those lead-in records.
+        let mut support: Vec<_> = by_evidence
+            .values()
+            .flatten()
+            .filter_map(|s| {
+                if s.start == s.end {
+                    window.contains(s.start).then_some(*s)
+                } else {
+                    s.intersect(&window)
+                }
+            })
+            .collect();
+        support.sort();
+        support.dedup();
+        packet.timeline_text = packet
+            .timeline_text
+            .lines()
+            .filter(|line| !line.starts_with("time_support="))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        packet.timeline_text.push_str(&format!(
+            "time_support={}\n",
+            serde_json::to_string(&support)?
+        ));
         packet.timeline_text.push_str(&format!(
             "time_support_by_evidence={}\n",
             serde_json::to_string(&by_evidence)?

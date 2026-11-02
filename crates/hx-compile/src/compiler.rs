@@ -106,7 +106,11 @@ fn point(t: &mut Timeline, o: &Observation, label: String) {
     });
 }
 
-pub(super) fn compile(observations: &[Observation], window: Interval) -> Timeline {
+pub(super) fn compile(
+    observations: &[Observation],
+    window: Interval,
+    config: AttentionConfig,
+) -> Timeline {
     let mut t = Timeline {
         window,
         compiler_version: COMPILER_VERSION.into(),
@@ -454,6 +458,8 @@ pub(super) fn compile(observations: &[Observation], window: Interval) -> Timelin
             );
         }
     }
+    t.lanes
+        .extend(crate::attention::derive(&active, window, config));
     for lane in &mut t.lanes {
         lane.intervals
             .sort_by_key(|s| (s.interval, s.evidence.clone()));
