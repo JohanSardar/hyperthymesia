@@ -331,7 +331,10 @@ pub(crate) async fn interpret_window_with_settle(
     config: &Config,
     primary: bool,
 ) -> Result<bool> {
-    let _guard = crate::processing::interpretation_guard(store, window).await?;
+    let guard = crate::processing::interpretation_guard(store, window).await?;
+    // Roll back explicitly: a dropped transaction releases the advisory lock only
+    // when the pool later reuses its connection, so an immediate rerun saw it held.
+    let result = async {
     let (_, generation) = crate::processing::compile_window(store, window).await?;
     if primary {
         crate::processing::ensure_settled(store, window, generation).await?;
@@ -511,6 +514,10 @@ pub(crate) async fn interpret_window_with_settle(
         .publish_revision_manifest(window, generation, value, output_key, &namespaces)
         .await?
         .1)
+    }
+    .await;
+    guard.rollback().await?;
+    result
 }
 
 #[cfg(test)]

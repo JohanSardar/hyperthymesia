@@ -276,11 +276,47 @@ fn supports_completion(e: &EvidenceItem, claim: &Claim) -> bool {
 // Unbound statements about somebody else are testimony. A named actor needs
 // source-owned subject attribution; a model-provided name is not that binding.
 fn observes_actor(e: &EvidenceItem, claim: &Claim) -> bool {
+    if owner_actor(&claim.actor) && owner_device_capture(e) {
+        return true;
+    }
     !source_report(e)
         && (claim.actor == "subject"
             || serde_json::from_str::<serde_json::Value>(&e.text)
                 .ok()
                 .is_some_and(|value| value["subject"].as_str() == Some(claim.actor.as_str())))
+}
+
+fn owner_actor(actor: &str) -> bool {
+    matches!(actor, "subject" | "owner")
+}
+
+/// The owner's own Mac observing its foreground, input and screen is a direct
+/// observation of the owner. Text shown on screen stays testimony about its
+/// content, but "the owner had this in front of them" is observed.
+fn owner_device_capture(e: &EvidenceItem) -> bool {
+    const CAPTURE: [&str; 6] = [
+        "focus.span",
+        "text.snapshot",
+        "media.still",
+        "ui.click",
+        "input.bucket",
+        "presence.span",
+    ];
+    let Some(kind) = e.kind.strip_prefix("normal:") else {
+        return false;
+    };
+    if !CAPTURE.contains(&kind) {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&e.text)
+        .ok()
+        .is_some_and(|value| {
+            value["connector_instance"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("macos-agent:"))
+                && value["subject"].is_null()
+                && value["actor"].is_null()
+        })
 }
 
 fn source_report(e: &EvidenceItem) -> bool {
