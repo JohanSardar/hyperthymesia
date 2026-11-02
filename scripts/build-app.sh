@@ -25,8 +25,17 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>NSInputMonitoringUsageDescription</key><string>Measure input activity without recording key identities.</string>
 </dict></plist>
 PLIST
-codesign --force --sign - "$app/Contents/MacOS/hx-agent"
-codesign --force --sign - "$app"
+# A certificate signature keeps macOS privacy grants across rebuilds; ad-hoc grants
+# are pinned to one binary hash. Override with HX_SIGN_IDENTITY (use - for ad-hoc).
+identity="${HX_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development:/ {print $2; exit}')}"
+if [[ -z "$identity" ]]; then
+  identity=-
+  print -u2 -- "warning: no Apple Development identity; ad-hoc signing resets permissions on every rebuild"
+fi
+flags=(--force --sign "$identity")
+[[ "$identity" != - ]] && flags+=(--options runtime)
+codesign "${flags[@]}" "$app/Contents/MacOS/hx-agent"
+codesign "${flags[@]}" "$app"
 codesign --verify --deep --strict "$app"
 print -r -- "$app"
 python3 - "$app" "$PWD/dist/com.hyperthymesia.agent.plist" <<'PY'
