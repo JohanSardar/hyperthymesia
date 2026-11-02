@@ -707,11 +707,13 @@ pub fn session_locked() -> Option<bool> {
             dictionary,
         )
     };
-    dictionary
-        .get(&CFString::from_str("CGSSessionScreenIsLocked"))?
-        .downcast::<objc2_core_foundation::CFBoolean>()
-        .ok()
-        .map(|v| v.value())
+    // The key is present only while the screen is locked.
+    Some(
+        dictionary
+            .get(&CFString::from_str("CGSSessionScreenIsLocked"))
+            .and_then(|v| v.downcast::<objc2_core_foundation::CFBoolean>().ok())
+            .is_some_and(|v| v.value()),
+    )
 }
 
 impl Drop for MainLoop {
