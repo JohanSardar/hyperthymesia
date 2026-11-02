@@ -685,6 +685,43 @@ async fn typed_completion_requires_the_claimed_operation() {
 }
 
 #[tokio::test]
+async fn owner_device_capture_is_a_direct_observation_and_keeps_prose() {
+    let capture = |connector: &str, title: &str| {
+        json!({"actor":null,"subject":null,"connector_instance":connector,
+            "payload":{"app_name":"Google Chrome","window_title":title}})
+        .to_string()
+    };
+    for (connector, title, observed) in [
+        ("macos-agent:synthetic-mac", "Orchid stands", true),
+        // Screen content that quotes somebody is still the owner's own foreground.
+        (
+            "macos-agent:synthetic-mac",
+            "Alice says orchids are cheap",
+            true,
+        ),
+        ("codex:synthetic", "Orchid stands", false),
+    ] {
+        let mut p = packet("success");
+        p.evidence[0].kind = "normal:focus.span".into();
+        p.evidence[0].text = capture(connector, title);
+        let mut output = response("success");
+        output["episodes"][0]["claims"][0]["actor"] = json!("owner");
+        let actual = interpret(&p, &StatechartConstant(output.to_string()))
+            .await
+            .unwrap();
+        let claim = &actual.episodes[0].claims[0];
+        assert_eq!(
+            claim.basis == Basis::Observed,
+            observed,
+            "{connector} {title}"
+        );
+        if observed {
+            assert_eq!(actual.episodes[0].title, "Compare stands");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_source_statement_cannot_bind_a_named_actor_to_observed_activity() {
     for text in [
         "Alice compared orchid stands.",
