@@ -36,32 +36,58 @@ fn span(p: &mut Producer, presence: bool) -> Envelope {
     )
 }
 #[test]
-fn private_browser_content_is_blocked_with_content_free_gap() {
-    let policy = Policy::new(&Config::default()).unwrap();
-    let focus = Focus {
-        bundle_id: "com.apple.Safari".into(),
-        name: "Synthetic".into(),
-        pid: 1,
-        title: Some("Synthetic secret".into()),
-        electron: false,
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let mut out = Outbox::open(&dir.path().join("db"), 100_000, 100).unwrap();
-    let mut p = producer();
-    let mut text = p.calibration();
-    text.kind = Kind::new("text.snapshot");
-    text.payload = serde_json::json!({"text":"synthetic secret"});
-    assert!(!persist(&mut out, &policy, Some(&focus), false, &text, &[]).unwrap());
-    let gap = PolicyGap::default()
-        .observe(policy.excludes_native(&focus), p.time(), &mut p)
-        .expect("unverifiable private state needs a gap");
-    assert!(persist(&mut out, &policy, Some(&focus), false, &gap, &[]).unwrap());
-    assert!(
-        !serde_json::to_string(&gap.payload)
-            .unwrap()
-            .contains("secret")
-    );
-    assert_eq!(out.stats().unwrap().0, 1);
+fn browser_and_electron_content_is_allowed_but_privacy_gates_remain() {
+    for (bundle_id, electron) in [
+        ("com.apple.Safari", false),
+        ("org.mozilla.firefox", false),
+        ("com.google.Chrome.beta", false),
+        ("com.todesktop.synthetic", true),
+        ("com.anthropic.claudefordesktop", true),
+        ("com.tinyspeck.slackmacgap", true),
+        ("com.microsoft.VSCode", true),
+        ("com.todesktop.230313mzl4w4u92", true),
+    ] {
+        let policy = Policy::new(&Config::default()).unwrap();
+        let focus = Focus {
+            bundle_id: bundle_id.into(),
+            name: "Synthetic".into(),
+            pid: 1,
+            title: Some("Synthetic window".into()),
+            electron,
+        };
+        assert!(!policy.excludes_native(&focus));
+        let mut p = producer();
+        assert!(
+            PolicyGap::default()
+                .observe(false, p.time(), &mut p)
+                .is_none()
+        );
+        for kind in ["text.snapshot", "ui.click", "media.still", "media.chunk"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut out = Outbox::open(&dir.path().join("db"), 100_000, 100).unwrap();
+            let mut event = p.calibration();
+            event.kind = Kind::new(kind);
+            event.payload = serde_json::json!({"text":"synthetic content"});
+            assert!(!persist(&mut out, &policy, Some(&focus), true, &event, &[]).unwrap());
+            assert!(!persist(&mut out, &policy, None, false, &event, &[]).unwrap());
+            for config in [
+                Config {
+                    excluded_bundle_ids: vec![bundle_id.into()],
+                    ..Config::default()
+                },
+                Config {
+                    excluded_title_regexes: vec!["Synthetic".into()],
+                    ..Config::default()
+                },
+            ] {
+                let excluded = Policy::new(&config).unwrap();
+                assert!(excluded.excludes_native(&focus));
+                assert!(!persist(&mut out, &excluded, Some(&focus), false, &event, &[]).unwrap());
+            }
+            assert!(persist(&mut out, &policy, Some(&focus), false, &event, &[]).unwrap());
+            assert_eq!(out.stats().unwrap().0, 1);
+        }
+    }
 }
 #[test]
 fn browser_companion_policy_gap_passes_content_gate() {

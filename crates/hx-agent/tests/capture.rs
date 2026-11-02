@@ -200,9 +200,15 @@ fn companion_wrap_preserves_source_and_adds_native_provenance() {
     assert!(e.coverage.is_some());
 }
 #[test]
-fn nested_private_companion_payload_is_suppressed() {
+fn private_companion_payload_is_allowed() {
     let policy = Policy::new(&Config::default()).unwrap();
-    assert!(!policy.allows_payload(&serde_json::json!({"tab":{"incognito":true}})));
+    for payload in [
+        serde_json::json!({"tab":{"incognito":true}}),
+        serde_json::json!({"window":{"private":true}}),
+        serde_json::json!({"is_private":true}),
+    ] {
+        assert!(policy.allows_payload(&payload));
+    }
 }
 #[test]
 fn native_messaging_framing_accepts_fragmented_reads_and_rejects_truncation() {
@@ -450,21 +456,29 @@ fn producer_sequences_continue_after_ack_and_restart() {
     );
 }
 #[test]
-fn browser_without_private_window_signal_is_not_persisted() {
-    let (_dir, mut out) = db();
-    let p = Policy::new(&Config::default()).unwrap();
-    let focus = hx_macos_sys::Focus {
-        bundle_id: "com.google.Chrome".into(),
-        name: "Chrome".into(),
-        pid: 1,
-        title: None,
-        electron: false,
-    };
-    let mut c = companion();
-    c.payload = serde_json::json!({"url":"https://example.org"});
-    let e = Producer::new("test".into()).unwrap().companion(c).unwrap();
-    assert!(!persist(&mut out, &p, Some(&focus), false, &e, &[]).unwrap());
-    assert_eq!(out.stats().unwrap().0, 0);
+fn browser_companion_content_does_not_require_public_window_signal() {
+    for payload in [
+        serde_json::json!({"url":"https://example.org"}),
+        serde_json::json!({"url":"https://example.org", "incognito":true}),
+        serde_json::json!({"url":"https://example.org", "private":true}),
+        serde_json::json!({"url":"https://example.org", "is_private":true}),
+    ] {
+        let (_dir, mut out) = db();
+        let p = Policy::new(&Config::default()).unwrap();
+        let focus = hx_macos_sys::Focus {
+            bundle_id: "com.google.Chrome".into(),
+            name: "Chrome".into(),
+            pid: 1,
+            title: None,
+            electron: false,
+        };
+        let mut c = companion();
+        c.payload = payload;
+        let e = Producer::new("test".into()).unwrap().companion(c).unwrap();
+        assert!(!persist(&mut out, &p, Some(&focus), true, &e, &[]).unwrap());
+        assert!(persist(&mut out, &p, Some(&focus), false, &e, &[]).unwrap());
+        assert_eq!(out.stats().unwrap().0, 1);
+    }
 }
 
 #[test]

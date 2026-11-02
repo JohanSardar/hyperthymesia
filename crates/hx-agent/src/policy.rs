@@ -23,17 +23,10 @@ impl Policy {
     }
     pub fn excludes_native(&self, focus: &hx_macos_sys::Focus) -> bool {
         !self.allows(&focus.bundle_id, focus.title.as_deref())
-            || hx_macos_sys::unverifiable_private_state(focus)
     }
     pub fn allows_payload(&self, value: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::Object(map) => {
-                if map.iter().any(|(k, v)| {
-                    ["incognito", "private", "is_private"].contains(&k.as_str())
-                        && v.as_bool() != Some(false)
-                }) {
-                    return false;
-                }
                 if map.iter().any(|(k, v)| {
                     ["bundle_id", "app_bundle_id", "bundleId"].contains(&k.as_str())
                         && v.as_str()
@@ -89,36 +82,12 @@ pub fn persist(
             .connector_instance
             .as_str()
             .starts_with("companion:"));
-    let browser_unknown = envelope
-        .connector_instance
-        .as_str()
-        .starts_with("companion:browser:")
-        && !has_public_window_signal(&envelope.payload);
     if content
         && (secure
-            || browser_unknown
-            || (!envelope
-                .connector_instance
-                .as_str()
-                .starts_with("companion:")
-                && focus.is_some_and(hx_macos_sys::unverifiable_private_state))
             || !focus.is_some_and(|f| policy.allows(&f.bundle_id, f.title.as_deref()))
             || !policy.allows_payload(&envelope.payload))
     {
         return Ok(false);
     }
     outbox.capture(envelope, blobs)
-}
-
-fn has_public_window_signal(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Object(map) => {
-            map.iter().any(|(k, v)| {
-                ["incognito", "private", "is_private"].contains(&k.as_str())
-                    && v.as_bool() == Some(false)
-            }) || map.values().any(has_public_window_signal)
-        }
-        serde_json::Value::Array(values) => values.iter().any(has_public_window_signal),
-        _ => false,
-    }
 }

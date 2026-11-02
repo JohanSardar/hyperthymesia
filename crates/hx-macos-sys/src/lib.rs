@@ -5,15 +5,16 @@ use objc2::{MainThreadMarker, Message, rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{NSApplication, NSWorkspace};
 use objc2_application_services::{AXIsProcessTrusted, AXUIElement};
 use objc2_core_foundation::{
-    CFArray, CFRetained, CFRunLoop, CFString, CFType, kCFRunLoopDefaultMode,
+    CFArray, CFBoolean, CFRetained, CFRunLoop, CFString, CFType, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::*;
 use objc2_foundation::{NSDate, NSNotificationCenter, NSObjectProtocol, NSString};
 use serde::Serialize;
 use std::{
+    collections::HashSet,
     ptr::NonNull,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -131,19 +132,40 @@ fn focus_from_app(app: &objc2_app_kit::NSRunningApplication) -> Focus {
         }),
     }
 }
-pub fn skip_ax(focus: &Focus) -> bool {
-    focus.electron
-        || [
-            "com.google.Chrome",
-            "com.microsoft.edgemac",
-            "com.brave.Browser",
-            "org.chromium.Chromium",
-            "com.operasoftware.Opera",
-            "company.thebrowser.Browser",
-            "com.vivaldi.Vivaldi",
-        ]
-        .iter()
-        .any(|b| focus.bundle_id.starts_with(b))
+fn chromium(focus: &Focus) -> bool {
+    [
+        "com.google.Chrome",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "org.chromium.Chromium",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "com.vivaldi.Vivaldi",
+    ]
+    .iter()
+    .any(|b| focus.bundle_id.starts_with(b))
+}
+/// Opt Chromium/Electron into exposing their AX tree. Called only by capture
+/// workers, with the same short messaging timeout used for attribute reads.
+fn enable_accessibility(focus: &Focus) {
+    if !(focus.electron || chromium(focus)) || !permissions().accessibility {
+        return;
+    }
+    static ENABLED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    let mut pids = ENABLED.get_or_init(Mutex::default).lock().expect("AX pids");
+    if !pids.insert(focus.pid) {
+        return;
+    }
+    // Serialize initialization so concurrent title/text workers cannot read the
+    // tree before the first worker has finished enabling it. Unsupported
+    // attributes are harmless; never retry a slow app on every sample.
+    unsafe {
+        let app = AXUIElement::new_application(focus.pid);
+        app.set_messaging_timeout(0.025);
+        for name in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+            app.set_attribute_value(&CFString::from_str(name), CFBoolean::new(true));
+        }
+    }
 }
 fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
     let mut value = std::ptr::null();
@@ -167,8 +189,9 @@ fn focused_window(pid: i32) -> Option<CFRetained<AXUIElement>> {
     let app = unsafe { AXUIElement::new_application(pid) };
     attribute(&app, "AXFocusedWindow")?.downcast().ok()
 }
-pub fn window_title(pid: i32) -> Option<String> {
-    string_attr(&*focused_window(pid)?, "AXTitle")
+pub fn window_title(focus: &Focus) -> Option<String> {
+    enable_accessibility(focus);
+    string_attr(&*focused_window(focus.pid)?, "AXTitle")
 }
 #[derive(Debug)]
 pub struct Text {
@@ -182,9 +205,10 @@ pub fn window_text(
     deadline: Duration,
     byte_cap: usize,
 ) -> Option<Text> {
-    if skip_ax(focus) || unverifiable_private_state(focus) || secure_input() {
+    if secure_input() {
         return None;
     }
+    enable_accessibility(focus);
     let start = Instant::now();
     let mut stack = vec![focused_window(focus.pid)?];
     let mut text = String::new();
@@ -268,10 +292,11 @@ pub struct Hit {
     pub role: Option<String>,
     pub label: Option<String>,
 }
-pub fn hit_test(x: f64, y: f64) -> Option<Hit> {
+pub fn hit_test(focus: &Focus, x: f64, y: f64) -> Option<Hit> {
     if !permissions().accessibility || secure_input() {
         return None;
     }
+    enable_accessibility(focus);
     unsafe {
         let system = AXUIElement::new_system_wide();
         system.set_messaging_timeout(0.025);
@@ -621,7 +646,7 @@ unsafe extern "C-unwind" fn ax_callback(
 }
 impl AxObserver {
     pub fn new(focus: &Focus) -> Option<Self> {
-        if !permissions().accessibility || skip_ax(focus) {
+        if !permissions().accessibility {
             return None;
         }
         unsafe {
@@ -683,22 +708,6 @@ impl Drop for AxObserver {
 mod media;
 pub use media::{Frame, ScreenStream, VideoWriter};
 
-/// Browsers without a trusted private-window signal are metadata-only at the OS layer.
-pub fn unverifiable_private_state(focus: &Focus) -> bool {
-    [
-        "com.apple.Safari",
-        "org.mozilla.firefox",
-        "com.google.Chrome",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "org.chromium.Chromium",
-        "com.operasoftware.Opera",
-        "company.thebrowser.Browser",
-        "com.vivaldi.Vivaldi",
-    ]
-    .iter()
-    .any(|b| focus.bundle_id.starts_with(b))
-}
 pub fn session_locked() -> Option<bool> {
     let dictionary = CGSessionCopyCurrentDictionary()?;
     let dictionary = unsafe {
@@ -748,7 +757,7 @@ mod tests {
         assert_eq!(boot_id().unwrap(), boot_id().unwrap());
     }
     #[test]
-    fn chromium_and_electron_are_never_forced_into_ax() {
+    fn chromium_variants_need_accessibility_opt_in() {
         let mut f = Focus {
             bundle_id: "com.google.Chrome.beta".into(),
             name: String::new(),
@@ -756,12 +765,8 @@ mod tests {
             title: None,
             electron: false,
         };
-        assert!(skip_ax(&f));
-        f.bundle_id = "native.app".into();
-        assert!(!skip_ax(&f));
-        f.electron = true;
-        assert!(skip_ax(&f));
+        assert!(chromium(&f));
         f.bundle_id = "com.apple.Safari".into();
-        assert!(unverifiable_private_state(&f));
+        assert!(!chromium(&f));
     }
 }
