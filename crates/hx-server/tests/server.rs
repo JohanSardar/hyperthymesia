@@ -2255,7 +2255,8 @@ def rpc(method,params):
  return json.load(urllib.request.urlopen(req))['result']
 rpc('initialize',{})
 assert len(rpc('tools/list',{})['tools'])==8
-result=rpc('tools/call',{'name':'window_overview','arguments':{'from':'2026-01-01T00:00:00Z','to':'2026-01-01T04:00:00Z'}})
+start='2026-01-01T03:58:00Z' if mode=='late' else '2026-01-01T00:00:00Z'
+result=rpc('tools/call',{'name':'window_overview','arguments':{'from':start,'to':'2026-01-01T04:00:00Z'}})
 data=json.loads(result['content'][0]['text'])
 assert 'SYNTHETIC_RESTRICTED_CANARY' not in json.dumps(data)
 e=data['evidence'][0]; point={'start':e['at'],'end':e['at']}
@@ -2283,6 +2284,49 @@ print(json.dumps({'exit_code':0,'model':'gpt-6.1-sol','steps':2,'final_output':a
         timeout: std::time::Duration::from_secs(10),
         max_steps: hx_server::fx::DEFAULT_MAX_STEPS,
     }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_validation_supports_citations_beyond_the_exploration_row_cap() {
+    let f = Fixture::new().await;
+    // More than the 2,000-row exploration cap, all before the cited record.
+    let mut envelopes: Vec<Envelope> = (0..2100)
+        .map(|i| {
+            let mut e = event(&format!("fx-dense-{i}"), 1);
+            e.time = ObservationTime::point(
+                Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap()
+                    + chrono::Duration::milliseconds(i),
+            );
+            e
+        })
+        .collect();
+    let mut late = event("fx-late", 3);
+    late.time = ObservationTime::point(Utc.with_ymd_and_hms(2026, 1, 1, 3, 59, 0).unwrap());
+    envelopes.push(late);
+    ingest(&f.store, envelopes).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "late");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-late", &config)
+            .await
+            .unwrap()
+    );
+    let value: Value = sqlx::query_scalar(
+        "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-late'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        value["episodes"].as_array().unwrap().len(),
+        1,
+        "{}",
+        value["check_failures"]
+    );
+    f.close().await;
 }
 
 #[tokio::test]

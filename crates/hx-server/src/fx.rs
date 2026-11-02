@@ -395,12 +395,9 @@ pub(crate) async fn interpret_window_with_settle(
         ensure!(!audit.exhausted, "MCP budget exhausted");
         let evidence: Vec<_> = audit.evidence.values().cloned().collect();
         drop(audit);
-        let (observations, _) = broker.records(window).await?;
-        let ids: std::collections::HashSet<_> = evidence.iter().map(|e| e.id).collect();
-        let observations: Vec<_> = observations
-            .into_iter()
-            .filter(|o| ids.contains(&o.id))
-            .collect();
+        // Rebuild support from every cited record; a window-wide capped scan drops later spans.
+        let ids: Vec<i64> = evidence.iter().map(|e| e.id).collect();
+        let observations = broker.observations(&ids).await?;
         let mut timeline = hx_compile::compile(&observations, window);
         for item in &evidence {
             if item.kind.ends_with(":ocr.text") && item.at >= window.start && item.at < window.end {
