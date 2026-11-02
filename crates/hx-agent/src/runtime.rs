@@ -77,6 +77,7 @@ fn io_worker_at(
                 if envelope.kind.as_str()=="collector.health" {envelope.payload["queue_age_ms"]=serde_json::json!(outbox.queue_age_ms()?);
                     if let Some(name)=envelope.payload["collector"].as_str(){latest_health.insert(name.into(),envelope.payload.clone());std::fs::write(dir.join("health.json.tmp"),serde_json::to_vec(&latest_health)?)?;std::fs::rename(dir.join("health.json.tmp"),dir.join("health.json"))?;}
                 }
+                if let Err(e)=envelope.validate() {eprintln!("dropped invalid {} record: {e}",envelope.kind.as_str());if let Some(reply)=reply {let _=reply.send(false);}continue;}
                 let result=crate::policy::persist(&mut outbox,&policy,focus.as_ref(),secure,&envelope,&blobs);if let Some(reply)=reply {let _=reply.send(matches!(&result,Ok(true)));}
                 if let Err(e)=result {eprintln!("outbox: {e}");stop.store(true,Ordering::Relaxed);return Err(e);}},None=>break},
             ()=tokio::time::sleep_until(next)=>{if !config.token.is_empty() && let Err(e)=uploader.once(&mut outbox).await {eprintln!("upload retained for retry: {e}");}next=tokio::time::Instant::now()+uploader.delay();}
