@@ -81,6 +81,7 @@ impl ScreenStream {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let pid = focus.pid;
         let title = focus.title.clone();
+        let bounds = window_bounds(focus).ok_or("focused window bounds unavailable")?;
         let block = RcBlock::new(
             move |content: *mut SCShareableContent, error: *mut NSError| {
                 let result = (|| -> Result<_, String> {
@@ -93,18 +94,25 @@ impl ScreenStream {
                     }
                     unsafe {
                         let content = &*content;
-                        let window = content
-                            .windows()
+                        let windows = content.windows();
+                        let candidates: Vec<_> = windows
                             .iter()
-                            .find(|w| {
-                                w.isOnScreen()
-                                    && w.windowLayer() == 0
-                                    && w.owningApplication().is_some_and(|a| a.processID() == pid)
-                                    && title.as_ref().is_none_or(|t| {
-                                        w.title().is_some_and(|v| v.to_string() == *t)
-                                    })
+                            .map(|w| super::window_match::WindowCandidate {
+                                pid: w.owningApplication().map_or(-1, |a| a.processID()),
+                                layer: w.windowLayer() as i32,
+                                on_screen: w.isOnScreen(),
+                                bounds: w.frame(),
+                                title: w.title().map(|t| t.to_string()),
                             })
-                            .ok_or("no matching focused window")?;
+                            .collect();
+                        let index = super::window_match::select_window(
+                            &candidates,
+                            pid,
+                            bounds,
+                            title.as_deref(),
+                        )
+                        .ok_or("no matching focused window")?;
+                        let window = windows.objectAtIndex(index);
                         let display = content
                             .displays()
                             .iter()

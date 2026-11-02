@@ -123,6 +123,18 @@ Store: **Postgres** (data, FTS, pgvector, job queue) plus content-addressed blob
 | Raw keystrokes | never | — |
 | Audio | not in v1 | — |
 
+Foreground-window selection uses the owning PID, on-screen layer-zero bounds,
+and greatest overlap with the AX focused-window frame; titles only break geometry
+ties. AX extraction discovers web areas with a separate bounded search, reads page
+content before browser chrome, and removes consecutive duplicate labels and blank lines.
+
+Stills use `still_cadence_s` (default 60 seconds), with the existing power-profile
+minimums and hourly byte budget. The interval samples the newest approved SCK frame,
+even if it arrived between ticks, and emits the existing `periodic` trigger after the
+initial focus still. Identical JPEG hashes are skipped. Idle, locked, sleeping, paused,
+Secure Input, unavailable permissions/identity, and excluded contexts suppress media;
+retained samples are discarded when the capture session is suppressed or changes focus.
+
 ### 4.2 Execution model
 - The main thread owns the Cocoa/CFRunLoop.
 - The event tap runs on its own run loop.

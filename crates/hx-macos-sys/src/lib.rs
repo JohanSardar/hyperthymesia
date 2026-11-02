@@ -3,9 +3,10 @@ use block2::RcBlock;
 use crossbeam_queue::ArrayQueue;
 use objc2::{MainThreadMarker, Message, rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{NSApplication, NSWorkspace};
-use objc2_application_services::{AXIsProcessTrusted, AXUIElement};
+use objc2_application_services::{AXIsProcessTrusted, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFRetained, CFRunLoop, CFString, CFType, kCFRunLoopDefaultMode,
+    CFArray, CFBoolean, CFRetained, CFRunLoop, CFString, CFType, CGPoint, CGRect, CGSize,
+    kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::*;
 use objc2_foundation::{NSDate, NSNotificationCenter, NSObjectProtocol, NSString};
@@ -17,7 +18,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -189,6 +190,25 @@ fn focused_window(pid: i32) -> Option<CFRetained<AXUIElement>> {
     let app = unsafe { AXUIElement::new_application(pid) };
     attribute(&app, "AXFocusedWindow")?.downcast().ok()
 }
+fn window_bounds(focus: &Focus) -> Option<CGRect> {
+    enable_accessibility(focus);
+    let window = focused_window(focus.pid)?;
+    let position = attribute(&window, "AXPosition")?
+        .downcast::<AXValue>()
+        .ok()?;
+    let size = attribute(&window, "AXSize")?.downcast::<AXValue>().ok()?;
+    let mut point = CGPoint::new(0.0, 0.0);
+    let mut dimensions = CGSize::new(0.0, 0.0);
+    // AXValue checks the encoded type before writing these correctly sized buffers.
+    unsafe {
+        if !position.value(AXValueType::CGPoint, NonNull::from(&mut point).cast())
+            || !size.value(AXValueType::CGSize, NonNull::from(&mut dimensions).cast())
+        {
+            return None;
+        }
+    }
+    Some(CGRect::new(point, dimensions))
+}
 pub fn window_title(focus: &Focus) -> Option<String> {
     enable_accessibility(focus);
     string_attr(&*focused_window(focus.pid)?, "AXTitle")
@@ -209,83 +229,53 @@ pub fn window_text(
         return None;
     }
     enable_accessibility(focus);
-    let start = Instant::now();
-    let mut stack = vec![focused_window(focus.pid)?];
-    let mut text = String::new();
-    let mut nodes = 0;
-    let mut truncated = false;
-    while let Some(node) = stack.pop() {
-        if nodes >= node_cap || start.elapsed() >= deadline || text.len() >= byte_cap {
-            return Some(Text {
-                text,
-                truncated: true,
-                nodes,
-            });
-        }
-        nodes += 1;
-        // Password controls are never read, even when Secure Input is not enabled.
-        if string_attr(&node, "AXSubrole").as_deref() == Some("AXSecureTextField") {
-            continue;
-        }
-        for key in ["AXTitle", "AXValue", "AXDescription"] {
-            if start.elapsed() >= deadline {
-                return Some(Text {
-                    text,
-                    truncated: true,
-                    nodes,
-                });
-            }
-            if let Some(value) = string_attr(&node, key) {
-                for ch in value.chars() {
-                    if text.len() + ch.len_utf8() >= byte_cap {
-                        truncated = true;
-                        break;
-                    }
-                    text.push(ch);
-                }
-                if text.len() < byte_cap {
-                    text.push('\n');
-                }
-            }
-        }
-        let limit = node_cap.saturating_sub(nodes + stack.len());
+    Some(text_walk::walk(
+        focused_window(focus.pid)?,
+        node_cap,
+        deadline,
+        byte_cap,
+    ))
+}
+impl text_walk::Node for CFRetained<AXUIElement> {
+    fn string(&self, key: &str) -> Option<String> {
+        string_attr(self, key)
+    }
+    fn children(&self, limit: usize) -> (Vec<Self>, bool) {
         let mut count = 0isize;
         unsafe {
-            node.attribute_value_count(
+            self.attribute_value_count(
                 &CFString::from_str("AXChildren"),
                 NonNull::from(&mut count),
             );
         }
-        if count > 0 {
-            if count as usize > limit {
-                truncated = true;
-            }
-            let mut raw = std::ptr::null();
-            unsafe {
-                node.copy_attribute_values(
-                    &CFString::from_str("AXChildren"),
-                    0,
-                    (count as usize).min(limit) as isize,
-                    NonNull::from(&mut raw),
-                );
-            }
-            if let Some(raw) = NonNull::new(raw.cast_mut()) {
-                let children = unsafe {
-                    CFRetained::cast_unchecked::<CFArray<CFType>>(CFRetained::from_raw(raw))
-                };
-                for child in children.iter() {
-                    if let Ok(child) = child.downcast::<AXUIElement>() {
-                        stack.push(child);
-                    }
-                }
-            }
+        if count <= 0 {
+            return (vec![], false);
         }
+        if limit == 0 {
+            return (vec![], true);
+        }
+        let mut raw = std::ptr::null();
+        unsafe {
+            self.copy_attribute_values(
+                &CFString::from_str("AXChildren"),
+                0,
+                (count as usize).min(limit) as isize,
+                NonNull::from(&mut raw),
+            );
+        }
+        let Some(raw) = NonNull::new(raw.cast_mut()) else {
+            return (vec![], true);
+        };
+        let children =
+            unsafe { CFRetained::cast_unchecked::<CFArray<CFType>>(CFRetained::from_raw(raw)) };
+        (
+            children
+                .iter()
+                .filter_map(|c| c.downcast::<AXUIElement>().ok())
+                .collect(),
+            count as usize > limit,
+        )
     }
-    Some(Text {
-        text,
-        truncated,
-        nodes,
-    })
 }
 #[derive(Debug)]
 pub struct Hit {
@@ -706,6 +696,8 @@ impl Drop for AxObserver {
     }
 }
 mod media;
+mod text_walk;
+mod window_match;
 pub use media::{Frame, ScreenStream, VideoWriter};
 
 pub fn session_locked() -> Option<bool> {
@@ -715,11 +707,13 @@ pub fn session_locked() -> Option<bool> {
             dictionary,
         )
     };
-    dictionary
-        .get(&CFString::from_str("CGSSessionScreenIsLocked"))?
-        .downcast::<objc2_core_foundation::CFBoolean>()
-        .ok()
-        .map(|v| v.value())
+    // The key is present only while the screen is locked.
+    Some(
+        dictionary
+            .get(&CFString::from_str("CGSSessionScreenIsLocked"))
+            .and_then(|v| v.downcast::<objc2_core_foundation::CFBoolean>().ok())
+            .is_some_and(|v| v.value()),
+    )
 }
 
 impl Drop for MainLoop {
