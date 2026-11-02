@@ -428,21 +428,7 @@ pub(crate) async fn interpret_window_with_settle(
                 max_item_chars: 16_384,
             },
         );
-        let mut by_evidence = std::collections::BTreeMap::<i64, Vec<Interval>>::new();
-        for span in timeline.lanes.iter().flat_map(|lane| &lane.intervals) {
-            for id in &span.evidence {
-                by_evidence.entry(*id).or_default().push(span.interval);
-            }
-        }
-        for point in &timeline.points {
-            by_evidence
-                .entry(point.evidence)
-                .or_default()
-                .push(Interval {
-                    start: point.at,
-                    end: point.at,
-                });
-        }
+        let by_evidence = citation_support(&timeline, &observations, window);
         // Attention may cite health just before the window. It remains valid
         // support even when packet sampling would omit those lead-in records.
         let mut support: Vec<_> = by_evidence
@@ -520,9 +506,103 @@ pub(crate) async fn interpret_window_with_settle(
     result
 }
 
+/// Time support per cited record, clipped to the window. A record supports both its
+/// compiled interval and its own declared wall interval: compiled ends derive from the
+/// monotonic clock, so they can differ by milliseconds from the source end that tools
+/// show the model, and exact boundary matching would reject faithful citations.
+fn citation_support(
+    timeline: &hx_compile::Timeline,
+    observations: &[hx_compile::Observation],
+    window: Interval,
+) -> std::collections::BTreeMap<i64, Vec<Interval>> {
+    let clip = |s: Interval| {
+        if s.start == s.end {
+            window.contains(s.start).then_some(s)
+        } else {
+            s.intersect(&window)
+        }
+    };
+    let mut by_evidence = std::collections::BTreeMap::<i64, Vec<Interval>>::new();
+    let mut add = |id: i64, s: Interval| {
+        if let Some(s) = clip(s) {
+            let entry = by_evidence.entry(id).or_default();
+            if !entry.contains(&s) {
+                entry.push(s);
+            }
+        }
+    };
+    for span in timeline.lanes.iter().flat_map(|lane| &lane.intervals) {
+        for id in &span.evidence {
+            add(*id, span.interval);
+        }
+    }
+    for point in &timeline.points {
+        add(
+            point.evidence,
+            Interval {
+                start: point.at,
+                end: point.at,
+            },
+        );
+    }
+    for o in observations {
+        if let (Some(start), Some(end)) = (o.envelope.time.source_start, o.envelope.time.source_end)
+            && start <= end
+        {
+            add(o.id, Interval { start, end });
+        }
+    }
+    by_evidence
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn citations_support_raw_wall_times_clipped_to_the_window() {
+        // A focus span opened before the window whose monotonic duration ends 3 ms
+        // after its declared wall end, as real macOS spans do.
+        let envelope: hx_schema::Envelope = serde_json::from_value(json!({
+            "envelope_version": 1,
+            "observation_id": "01J0000000000000000000000A",
+            "connector_instance": "macos-agent:synthetic",
+            "source_key": "focus:synthetic",
+            "revision": "1",
+            "operation": "upsert",
+            "kind": "focus.span",
+            "schema_version": 1,
+            "time": {
+                "source_start": "2026-01-01T09:58:00Z",
+                "source_end": "2026-01-01T10:05:00Z",
+                "resolution_ms": 0,
+                "observed_at": "2026-01-01T10:05:00Z",
+                "mono_start": {"domain": "mach_continuous", "boot_id": "synthetic-boot", "nanos": 0},
+                "mono_end": {"domain": "mach_continuous", "boot_id": "synthetic-boot", "nanos": 420_003_000_000u64}
+            },
+            "links": [],
+            "sensitivity": "normal",
+            "payload": {"app_name": "Synthetic Browser", "app_bundle_id": "com.example.browser", "window_title": "Synthetic page", "pid": 1, "display": null},
+            "blobs": []
+        }))
+        .unwrap();
+        let window = Interval {
+            start: "2026-01-01T10:00:00Z".parse().unwrap(),
+            end: "2026-01-01T14:00:00Z".parse().unwrap(),
+        };
+        let observations = vec![hx_compile::Observation {
+            id: 7,
+            received_at: window.start,
+            envelope,
+        }];
+        let timeline = hx_compile::compile(&observations, window);
+        let support = citation_support(&timeline, &observations, window);
+        let declared = Interval {
+            start: window.start,
+            end: "2026-01-01T10:05:00Z".parse().unwrap(),
+        };
+        assert!(support[&7].contains(&declared), "{:?}", support[&7]);
+        assert!(support[&7].iter().all(|s| s.start >= window.start));
+    }
     #[test]
     fn isolated_credential_refresh_survives_cleanup_and_serializes_jobs() {
         let dir = tempfile::tempdir().unwrap();
