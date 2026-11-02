@@ -68,9 +68,11 @@ policy-gap/health integration with the actual `hx-compile` implementation.
 
 Visual capture currently includes only the known foreground window on the main
 display, with partial coverage explicitly labeled. Broad full-display capture
-needs a continuously refreshed privacy map. Browsers without a trusted private
-window signal are metadata-only at the native layer; Chromium/Electron AX is never
-forced. Interrupted staging videos are detected and retained, but automatic
+needs a continuously refreshed privacy map. Browser windows, including private
+and incognito windows, are captured under the same policy as other apps.
+Chromium/Electron AX is enabled once per PID on capture workers with short
+messaging timeouts. Secure text fields, Secure Input, user exclusions, pause,
+and lock-screen gates remain in effect. Interrupted staging videos are detected and retained, but automatic
 recovery of incomplete encoder files is not implemented. Authorized native capture,
 menu interaction, sleep/wake behavior, an extended soak, and OCR legibility require
 hardware qualification. UTC accuracy is unmeasured and labeled accordingly.

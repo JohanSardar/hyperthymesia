@@ -362,9 +362,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                     NativeEvent::Activation => {
                         changed = true;
                         if let Some(mut activated) = signal.focus {
-                            if !hx_macos_sys::skip_ax(&activated) {
-                                activated.title = ax.title(activated.pid);
-                            }
+                            activated.title = ax.title(&activated);
                             if let Some(span) = focus_span.take() {
                                 emit(
                                     close_span_at(&span, &mut producer, event_time.clone()),
@@ -459,10 +457,8 @@ pub fn run(options: RunOptions) -> Result<()> {
             let tick = last_tick.elapsed() >= Duration::from_secs(1);
             if tick || changed {
                 let mut current = hx_macos_sys::frontmost();
-                if let Some(f) = current.as_mut()
-                    && !hx_macos_sys::skip_ax(f)
-                {
-                    f.title = ax.title(f.pid);
+                if let Some(f) = current.as_mut() {
+                    f.title = ax.title(f);
                 }
                 if current != focus {
                     if current.is_none()
@@ -552,12 +548,9 @@ pub fn run(options: RunOptions) -> Result<()> {
                     let _ = c.reply.send(false);
                 }
             }
-            let native_allowed = content_allowed
-                && focus.as_ref().is_some_and(|f| {
-                    !hx_macos_sys::unverifiable_private_state(f) && !hx_macos_sys::skip_ax(f)
-                });
             let profile = Profile::select(hx_macos_sys::power(), &cfg);
-            if native_allowed && last_text.elapsed() >= Duration::from_secs(profile.text_interval())
+            if content_allowed
+                && last_text.elapsed() >= Duration::from_secs(profile.text_interval())
             {
                 last_text = Instant::now();
                 if let Some(f) = &focus
@@ -732,7 +725,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                         CollectorStatus::PermissionDenied
                     } else if !implemented {
                         CollectorStatus::Failed
-                    } else if ["text", "ui", "media"].contains(&collector) && !native_allowed {
+                    } else if ["text", "ui", "media"].contains(&collector) && !content_allowed {
                         CollectorStatus::Paused
                     } else {
                         CollectorStatus::Running
