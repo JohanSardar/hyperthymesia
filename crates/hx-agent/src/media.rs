@@ -446,8 +446,16 @@ fn chunk_interval(
     finish: ObservationTime,
 ) -> ObservationTime {
     let mut time = start;
-    time.source_end = last_frame.source_start;
-    time.mono_end = last_frame.mono_start;
+    // Wall times derive from separate clock reads, so a one-frame chunk can
+    // land nanoseconds before its start. Never emit a negative interval.
+    time.source_end = last_frame.source_start.max(time.source_start);
+    time.mono_end = match (&time.mono_start, last_frame.mono_start) {
+        (Some(s), Some(mut e)) if e.boot_id == s.boot_id && e.domain == s.domain => {
+            e.nanos = e.nanos.max(s.nanos);
+            Some(e)
+        }
+        (_, e) => e,
+    };
     time.observed_at = finish.observed_at;
     time
 }
@@ -466,6 +474,24 @@ fn frame_time(mut now: ObservationTime, nanos: u64) -> ObservationTime {
 #[cfg(test)]
 mod statechart_regressions {
     use super::*;
+    #[test]
+    fn chunk_interval_never_ends_before_it_starts() {
+        let at = chrono::Utc::now();
+        let stamp = |nanos| hx_schema::MonoStamp {
+            domain: hx_schema::ClockDomain::MachContinuous,
+            boot_id: hx_schema::BootId::new("synthetic-boot"),
+            nanos,
+        };
+        let mut start = ObservationTime::point(at);
+        start.mono_start = Some(stamp(1_000));
+        // The same single frame, read again a few nanoseconds of wall-clock jitter earlier.
+        let mut last = ObservationTime::point(at - chrono::Duration::nanoseconds(3));
+        last.mono_start = Some(stamp(999));
+        let time = chunk_interval(start, last, ObservationTime::point(at));
+        assert_eq!(time.validate(), Ok(()));
+        assert_eq!(time.source_end, Some(at));
+        assert_eq!(time.mono_end.map(|s| s.nanos), Some(1_000));
+    }
     #[test]
     fn periodic_still_uses_retained_change_and_skips_static_window() {
         let cadence = Config::default().still_cadence_s;
