@@ -41,6 +41,12 @@ docker compose up -d          # Postgres + pgvector on localhost:55432
 ./scripts/check.sh            # fmt, clippy -D warnings, tests
 ```
 
+Interpretation uses one durable primary slot and one 24-hour catch-up slot per window.
+The primary waits until the window ends and its input has settled for
+`HX_INTERPRET_SETTLE_S` seconds (default `600`). New ingest, OCR, and prior context
+restart settling. Catch-up runs only when input changed since the served revision;
+all providers skip an already recorded input generation, prompt, model, and disclosure policy.
+
 Requires Rust 1.99 (pinned in `rust-toolchain.toml`), Docker, and macOS for the capture agent.
 
 ## License

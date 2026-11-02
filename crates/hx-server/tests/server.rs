@@ -1045,8 +1045,11 @@ async fn synthetic_burst(browser_points: bool) {
         provider: hx_server::processing::StubProvider,
     };
     assert!(live <= 7);
+    // Model elapsed settle time explicitly instead of waiting ten minutes.
+    settle_for_test(&f.store).await;
     let mut normalized_compiled = None;
     while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
+        settle_for_test(&f.store).await;
         if normalized_compiled.is_none() {
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM jobs WHERE kind IN ('normalize','compile') AND state!='done'",
@@ -1155,6 +1158,10 @@ async fn pending_overlap_defers_interpretation_without_spending_attempts() {
     let mut e = event("overlap", 7);
     e.time = ObservationTime::point(e.time.observed_at + Duration::minutes(45));
     ingest(&f.store, vec![e]).await;
+    sqlx::query("UPDATE windows SET input_changed_at=now()-interval '1 hour'")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
     // Isolate the interpreter first so the actual overlap readiness guard is exercised.
     sqlx::query("UPDATE jobs SET available_at=now()+interval '1 hour'")
         .execute(&f.store.pool)
@@ -2355,6 +2362,21 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
         .unwrap();
         assert!(body.contains("synthetic"));
     }
+    // An identical revision skips even when launching fx would fail.
+    let mut unavailable = config.clone();
+    unavailable.binary = scratch.path().join("does-not-exist");
+    assert!(
+        !hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-duplicate", &unavailable)
+            .await
+            .unwrap()
+    );
+    assert_eq!(count(&f.store, "revisions").await, 1);
+    // Exercise failures on genuinely new input; identical input now short-circuits.
+    sqlx::query("UPDATE windows SET generation=generation+1 WHERE start_at=$1")
+        .bind(w.start)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
     for mode in ["invalid", "failure", "timeout", "rate"] {
         let mut config = fake_fx(scratch.path(), mode);
         if mode == "timeout" {
@@ -2526,6 +2548,306 @@ async fn mcp_ocr_only_dense_results_new_sources_and_prior_revision_filter() {
     assert!(serde_json::to_vec(&result).unwrap().len() <= hx_server::mcp::MAX_RESULT_BYTES);
     for item in result["evidence"].as_array().unwrap() {
         assert!(serde_json::from_str::<Value>(item["text"].as_str().unwrap()).is_ok());
+    }
+    f.close().await;
+}
+
+struct CountingProvider(std::sync::atomic::AtomicUsize);
+impl hx_interpret::Provider for CountingProvider {
+    fn name(&self) -> String {
+        "counting/model-v1".into()
+    }
+    async fn complete(&self, _: &str, _: &str) -> Result<String, hx_interpret::InterpretError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({"episodes":[],"tasks":[],"summary":"Synthetic."}).to_string())
+    }
+}
+
+async fn compile_for_test(
+    runner: &hx_server::processing::Runner<CountingProvider>,
+    w: hx_schema::Interval,
+) {
+    runner.store.normalize_window(w).await.unwrap();
+    hx_jobs::Handler::handle(
+        runner,
+        &hx_jobs::Job {
+            id: 0,
+            kind: "compile".into(),
+            payload: json!({"window":w}),
+            owner: "synthetic".into(),
+            attempts: 1,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE jobs SET state='done' WHERE kind IN ('compile','normalize')")
+        .execute(&runner.store.pool)
+        .await
+        .unwrap();
+}
+async fn settle_for_test(store: &Store) {
+    sqlx::query("UPDATE windows SET input_changed_at=now()-interval '1 hour'")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret' AND state='ready'")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn interpretation_storm_coalesces_settles_skips_and_reruns_once() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new().await;
+    let w = hx_store::window_at(event("batch", 8).time.observed_at);
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: CountingProvider(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    for i in 0..108 {
+        ingest(&f.store, vec![event(&format!("batch-{i}"), 8)]).await;
+        compile_for_test(&runner, w).await;
+    }
+    let slots: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind='interpret' AND state='ready'")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(slots, 2);
+    let g = f.store.generation(w).await.unwrap();
+    let generations: Vec<i64> = sqlx::query_scalar(
+        "SELECT (payload->>'generation')::bigint FROM jobs WHERE kind='interpret'",
+    )
+    .fetch_all(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(generations, vec![g, g]);
+    // Even an early claim (e.g. finish requeued a superseded lease) must settle.
+    sqlx::query(
+        "UPDATE jobs SET available_at=now() WHERE queue='interactive' AND kind='interpret'",
+    )
+    .execute(&f.store.pool)
+    .await
+    .unwrap();
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert_eq!(runner.provider.0.load(Ordering::SeqCst), 0);
+    let attempts: i32 = sqlx::query_scalar(
+        "SELECT attempts FROM jobs WHERE kind='interpret' AND queue='interactive'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert_eq!(attempts, 0);
+    settle_for_test(&f.store).await;
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap()); // unchanged revision24
+    assert_eq!(runner.provider.0.load(Ordering::SeqCst), 1);
+    // Manual and old queued requests use the same pre-provider identity check.
+    assert!(
+        !hx_server::processing::interpret_window(&f.store, w, &runner.provider)
+            .await
+            .unwrap()
+    );
+    assert_eq!(runner.provider.0.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&f.store, "revisions").await, 1);
+    for i in 108..120 {
+        ingest(&f.store, vec![event(&format!("batch-{i}"), 8)]).await;
+        compile_for_test(&runner, w).await;
+    }
+    settle_for_test(&f.store).await;
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert!(!hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert_eq!(runner.provider.0.load(Ordering::SeqCst), 2);
+    assert_eq!(count(&f.store, "revisions").await, 2);
+    let published: i64 = sqlx::query_scalar("SELECT r.input_generation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1")
+        .bind(w.start).fetch_one(&f.store.pool).await.unwrap();
+    assert_eq!(published, f.store.generation(w).await.unwrap());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn interpretation_slot_preserves_lease_and_recovers_new_generation() {
+    let f = Fixture::new().await;
+    let w = hx_store::window_at(event("lease", 8).time.observed_at);
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: CountingProvider(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    ingest(&f.store, vec![event("lease-1", 8)]).await;
+    compile_for_test(&runner, w).await;
+    settle_for_test(&f.store).await;
+    let job = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    ingest(&f.store, vec![event("lease-2", 8)]).await;
+    compile_for_test(&runner, w).await;
+    assert!(hx_jobs::heartbeat(&f.store.pool, &job, 120).await.unwrap());
+    assert!(hx_jobs::finish(&f.store.pool, &job, None).await.unwrap());
+    let row = sqlx::query("SELECT state,request_version,leased_version FROM jobs WHERE id=$1")
+        .bind(job.id)
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "ready");
+    assert!(row.get::<i64, _>("request_version") > row.get::<i64, _>("leased_version"));
+    settle_for_test(&f.store).await;
+    let recovered = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    assert_eq!(job.id, recovered.id);
+    assert!(!hx_jobs::finish(&f.store.pool, &job, None).await.unwrap());
+    hx_jobs::Handler::handle(&runner, &recovered).await.unwrap();
+    hx_jobs::finish(&f.store.pool, &recovered, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn migration_collapses_legacy_backlog_without_stealing_surviving_lease() {
+    let f = Fixture::new().await;
+    let w = hx_store::window_at(event("migration", 8).time.observed_at);
+    f.store.generation(w).await.unwrap();
+    sqlx::raw_sql("DROP TRIGGER window_input_changed ON windows; DROP FUNCTION track_window_input(); ALTER TABLE windows DROP COLUMN input_changed_at; DROP INDEX revisions_input_identity;")
+        .execute(&f.store.pool).await.unwrap();
+    let mut tx = f.store.pool.begin().await.unwrap();
+    for g in 1..=108 {
+        for slot in ["interpret", "revision24"] {
+            hx_jobs::enqueue(
+                &mut tx,
+                &format!("{slot}:{}:{g}", w.start),
+                "interpret",
+                json!({"window":w}),
+                slot == "revision24",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+    let running = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    // Exactly the same SQL used by startup, inside a migration transaction.
+    let mut tx = f.store.pool.begin().await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../hx-store/migrations/0007_interpret_slots.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let live: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state IN ('ready','running','failed')")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(live, 2);
+    assert!(
+        hx_jobs::heartbeat(&f.store.pool, &running, 120)
+            .await
+            .unwrap()
+    );
+    assert!(
+        hx_jobs::finish(&f.store.pool, &running, None)
+            .await
+            .unwrap()
+    );
+    let keys: Vec<String> =
+        sqlx::query_scalar("SELECT output_key FROM jobs WHERE state='ready' ORDER BY output_key")
+            .fetch_all(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        keys,
+        vec![
+            format!("interpret:{}", w.start),
+            format!("revision24:{}", w.start)
+        ]
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn revision_identity_includes_prompt_model_and_disclosure() {
+    for field in ["prompt_version", "provider", "policy", "sensitive_egress"] {
+        let f = Fixture::new().await;
+        let w = hx_store::window_at(event("identity", 8).time.observed_at);
+        let provider = CountingProvider(std::sync::atomic::AtomicUsize::new(0));
+        let prepared = hx_server::processing::prepare_input(&f.store, w, "counting/model-v1")
+            .await
+            .unwrap();
+        let mut manifest = prepared.manifest;
+        match field {
+            "policy" => manifest["disclosure_policy"]["digest"] = json!("older-policy"),
+            "provider" => manifest["provider"] = json!("counting/model-v0"),
+            "sensitive_egress" => manifest["sensitive_egress"] = json!("redact"),
+            _ => manifest[field] = json!("older-prompt"),
+        }
+        f.store
+            .publish_revision_key(
+                w,
+                prepared.generation,
+                json!({"episodes":[],"tasks":[],"input_manifest":manifest}),
+                "older-config",
+            )
+            .await
+            .unwrap();
+        assert!(
+            hx_server::processing::interpret_window(&f.store, w, &provider)
+                .await
+                .unwrap(),
+            "{field}"
+        );
+        assert!(
+            !hx_server::processing::interpret_window(&f.store, w, &provider)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{field}"
+        );
+        f.close().await;
+    }
+}
+
+#[tokio::test]
+async fn interpretation_cadences_wait_for_window_end_and_day_boundary() {
+    let f = Fixture::new().await;
+    let w = hx_store::window_at(Utc::now());
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: CountingProvider(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    compile_for_test(&runner, w).await;
+    settle_for_test(&f.store).await;
+    // Force early claims to exercise the handler guard independently of queue dates.
+    for _ in 0..2 {
+        assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    }
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let rows = sqlx::query("SELECT payload,available_at,attempts FROM jobs WHERE kind='interpret'")
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+    for row in rows {
+        let payload: Value = row.get("payload");
+        let due: chrono::DateTime<Utc> = row.get("available_at");
+        assert_eq!(
+            due,
+            if payload["revision24"] == true {
+                w.end + Duration::hours(24)
+            } else {
+                w.end
+            }
+        );
+        assert_eq!(row.get::<i32, _>("attempts"), 0);
     }
     f.close().await;
 }

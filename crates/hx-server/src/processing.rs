@@ -108,6 +108,7 @@ pub async fn interpret_window<P: Provider>(
         store,
         w,
         provider,
+        false,
         &format!(
             "manual:{}",
             hx_store::hash(format!("{}:{}", w.start, Utc::now()).as_bytes())
@@ -119,18 +120,32 @@ async fn interpret_window_key<P: Provider>(
     store: &Store,
     w: Interval,
     provider: &P,
+    primary: bool,
     output_key: &str,
 ) -> Result<bool> {
     if provider.tool_agent() {
-        return crate::fx::interpret_window(store, w, output_key, &crate::fx::Config::from_env())
-            .await;
+        return crate::fx::interpret_window_with_settle(
+            store,
+            w,
+            output_key,
+            &crate::fx::Config::from_env(),
+            primary,
+        )
+        .await;
     }
+    let _guard = interpretation_guard(store, w).await?;
     let PreparedInput {
         packet,
         manifest,
         generation,
         namespaces,
     } = prepare_input(store, w, &provider.name()).await?;
+    if primary {
+        ensure_settled(store, w, generation).await?;
+    }
+    if revision_exists(store, w, generation, &manifest_identity(&manifest)).await? {
+        return Ok(false);
+    }
     let interpretation = hx_interpret::interpret(&packet, provider)
         .await
         .map_err(|error| {
@@ -348,30 +363,54 @@ impl<P: Provider> Handler for Runner<P> {
                 let w: Interval = serde_json::from_value(job.payload["window"].clone())?;
                 let (_, generation) = compile_window(&self.store, w).await?;
                 let mut tx = self.store.pool.begin().await?;
-                hx_jobs::enqueue(
+                let changed: chrono::DateTime<Utc> =
+                    sqlx::query_scalar("SELECT input_changed_at FROM windows WHERE start_at=$1")
+                        .bind(w.start)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                hx_store::request_interpret_job(
                     &mut tx,
-                    &format!("interpret:{}:{generation}", w.start),
-                    "interpret",
-                    json!({"window":w}),
+                    w,
+                    generation,
                     false,
-                    w.end.max(Utc::now()),
+                    w.end.max(changed + Duration::seconds(interpret_settle_s())),
                 )
                 .await?;
-                hx_jobs::enqueue(
+                hx_store::request_interpret_job(
                     &mut tx,
-                    &format!("revision24:{}:{generation}", w.start),
-                    "interpret",
-                    json!({"window":w}),
+                    w,
+                    generation,
                     true,
-                    (w.end + Duration::hours(24)).max(Utc::now()),
+                    w.end + Duration::hours(24),
                 )
                 .await?;
                 tx.commit().await?;
             }
             "interpret" => {
-                let w = serde_json::from_value(job.payload["window"].clone())?;
-                interpret_window_key(&self.store, w, &self.provider, &format!("job:{}", job.id))
-                    .await?;
+                let w: Interval = serde_json::from_value(job.payload["window"].clone())?;
+                let revision24 = job.payload["revision24"].as_bool().unwrap_or(false);
+                let ready_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+                    "SELECT CASE WHEN $2 THEN end_at+interval '24 hours' ELSE greatest(end_at,input_changed_at+make_interval(secs=>$3::double precision)) END FROM windows WHERE start_at=$1",
+                ).bind(w.start).bind(revision24).bind(interpret_settle_s() as f64)
+                    .fetch_one(&self.store.pool).await?;
+                if ready_at > Utc::now() {
+                    return Err(Deferred::Until(ready_at).into());
+                }
+                if revision24 {
+                    let unchanged: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1 AND r.input_generation=w.generation)")
+                        .bind(w.start).fetch_one(&self.store.pool).await?;
+                    if unchanged {
+                        return Ok(());
+                    }
+                }
+                interpret_window_key(
+                    &self.store,
+                    w,
+                    &self.provider,
+                    !revision24,
+                    &format!("job:{}:{}", job.id, ulid::Ulid::generate()),
+                )
+                .await?;
             }
             _ => return Err(Failure::UnsupportedJob.into()),
         }
@@ -395,5 +434,60 @@ pub async fn schedule(store: &Store) -> Result<()> {
         hx_store::request_window_job(&mut tx, "compile", w, generation).await?;
     }
     tx.commit().await?;
+    Ok(())
+}
+
+fn interpret_settle_s() -> i64 {
+    std::env::var("HX_INTERPRET_SETTLE_S")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|s| *s >= 0)
+        .unwrap_or(600)
+}
+
+// A transaction-scoped lock serializes manual runs and lease recovery as well as
+// queue workers. Dropping/cancelling the future releases it, including on crashes.
+pub(crate) async fn interpretation_guard(
+    store: &Store,
+    window: Interval,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    let mut tx = store.pool.begin().await?;
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || ':interpret:' || $1,0))")
+        .bind(window.start.to_rfc3339()).fetch_one(&mut *tx).await?;
+    if !locked {
+        return Err(Deferred::ProviderBusy.into());
+    }
+    Ok(tx)
+}
+
+pub(crate) fn manifest_identity(manifest: &serde_json::Value) -> serde_json::Value {
+    json!({"input_generation":manifest["input_generation"],
+        "prompt_version":manifest["prompt_version"],"provider":manifest["provider"],
+        "sensitive_egress":manifest["sensitive_egress"],
+        "disclosure_policy":{"digest":manifest["disclosure_policy"]["digest"]}})
+}
+
+pub(crate) async fn revision_exists(
+    store: &Store,
+    window: Interval,
+    generation: i64,
+    identity: &serde_json::Value,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM revisions WHERE start_at=$1 AND input_generation=$2 AND interpretation->'input_manifest' @> $3)")
+        .bind(window.start).bind(generation).bind(identity).fetch_one(&store.pool).await?)
+}
+
+// Recheck after preparing input: ingest/OCR may have raced the queue readiness
+// check. Never send a newly prepared generation before its own settle period.
+pub(crate) async fn ensure_settled(store: &Store, w: Interval, generation: i64) -> Result<()> {
+    let row = sqlx::query("SELECT generation,greatest(end_at,input_changed_at+make_interval(secs=>$2::double precision)) AS ready_at FROM windows WHERE start_at=$1")
+        .bind(w.start).bind(interpret_settle_s() as f64).fetch_one(&store.pool).await?;
+    if row.get::<i64, _>("generation") != generation {
+        return Err(Deferred::InputChanged.into());
+    }
+    let ready_at = row.get::<chrono::DateTime<Utc>, _>("ready_at");
+    if ready_at > Utc::now() {
+        return Err(Deferred::Until(ready_at).into());
+    }
     Ok(())
 }
