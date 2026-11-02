@@ -35,6 +35,7 @@ pub struct Broker {
 pub struct Audit {
     pub calls: Vec<Value>,
     pub evidence: BTreeMap<i64, EvidenceItem>,
+    pub attention: Vec<hx_compile::Lane>,
     pub input_namespaces: std::collections::BTreeSet<String>,
     pub exhausted: bool,
 }
@@ -106,6 +107,80 @@ impl Broker {
             return crate::ocr::derived_evidence_for_sources(&self.store, &[item]).await;
         }
         Ok(vec![item])
+    }
+    /// Compile the complete bounded capture scan, independently of the raw-record
+    /// response sample. Only safe metadata and inferred states cross MCP.
+    async fn attention(
+        &self,
+        range: Interval,
+    ) -> Result<(Vec<hx_compile::Lane>, Vec<EvidenceItem>)> {
+        let config = hx_compile::AttentionConfig::default();
+        let lookback = config
+            .reading_max_s
+            .max(config.input_gap_s)
+            .max(config.health_max_s)
+            .max(config.visual_change_s);
+        let rows = sqlx::query("SELECT id,received_at,envelope FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 ORDER BY source_start,id LIMIT 2001")
+            .bind(range.start - Duration::seconds(i64::from(lookback))).bind(range.end).fetch_all(&self.store.pool).await?;
+        let incomplete = rows.len() > 2000;
+        let mut observations = Vec::new();
+        let mut permitted = BTreeMap::new();
+        for row in rows {
+            let e: Envelope = serde_json::from_value(row.get("envelope"))?;
+            if !matches!(
+                e.kind.as_str(),
+                "collector.health"
+                    | "policy.gap"
+                    | "focus.span"
+                    | "presence.span"
+                    | "input.bucket"
+                    | "media.still"
+                    | "media.chunk"
+                    | "text.snapshot"
+            ) {
+                continue;
+            }
+            let id = row.get("id");
+            let class = self.policy.effective_class(&e);
+            if class != Sensitivity::Restricted
+                && !(class == Sensitivity::Sensitive && self.sensitive == SensitiveEgress::Redact)
+                && e.kind.as_str() != "policy.gap"
+            {
+                // Deliberately omit titles, text, gap reasons, blob addresses and content.
+                permitted.insert(id, EvidenceItem {
+                    effective_class: Sensitivity::Normal, id,
+                    at: e.time.source_start.unwrap_or(e.time.observed_at),
+                    kind: "normal:attention.support".into(),
+                    text: json!({"connector_instance":e.connector_instance,"kind":e.kind,"time":e.time,"attention_support":true}).to_string(),
+                    self_generated: false,
+                });
+            }
+            observations.push(hx_compile::Observation {
+                id,
+                received_at: row.get("received_at"),
+                envelope: e,
+            });
+        }
+        let mut lanes: Vec<_> =
+            hx_compile::compile_with_attention_config(&observations, range, config)
+                .lanes
+                .into_iter()
+                .filter(|l| l.id.kind == "attention")
+                .collect();
+        let mut ids = std::collections::BTreeSet::new();
+        for span in lanes.iter_mut().flat_map(|l| &mut l.intervals) {
+            if incomplete || span.evidence.iter().any(|id| !permitted.contains_key(id)) {
+                span.label = "unknown".into();
+            }
+            span.evidence.retain(|id| permitted.contains_key(id));
+            ids.extend(span.evidence.iter().copied());
+        }
+        Ok((
+            lanes,
+            ids.into_iter()
+                .filter_map(|id| permitted.remove(&id))
+                .collect(),
+        ))
     }
     pub async fn records(
         &self,
@@ -230,6 +305,10 @@ impl Broker {
             result
         };
         collect_evidence(&result, &mut audit.evidence);
+        if let Some(value) = result.get("attention") {
+            let lanes: Vec<hx_compile::Lane> = serde_json::from_value(value.clone())?;
+            audit.attention.extend(lanes);
+        }
         let mut ids = std::collections::BTreeSet::new();
         collect_provenance(&result, &mut ids);
         for id in ids {
@@ -365,11 +444,18 @@ impl Broker {
                         .into_iter()
                         .filter(|o| ids.contains(&o.id))
                         .collect();
-                    let timeline = hx_compile::compile(&visible, range);
-                    let packet = hx_interpret::build_packet(&timeline, &selected, &[], &[]);
+                    let mut timeline = hx_compile::compile(&visible, range);
+                    timeline.lanes.retain(|lane| lane.id.kind != "attention");
+                    let (attention, support) = self.attention(range).await?;
+                    timeline.lanes.extend(attention.iter().cloned());
+                    let mut packet_evidence = selected.clone();
+                    packet_evidence.extend(support.iter().cloned());
+                    result["attention"] = json!(attention);
+                    result["attention_evidence"] = json!(support);
+                    let packet = hx_interpret::build_packet(&timeline, &packet_evidence, &[], &[]);
                     result["timeline"] = json!(bounded(&packet.timeline_text, 10 * 1024));
                     result["coverage_note"] = json!(
-                        "Partial visible projection; omissions and missing sources mean unknown coverage, never idle."
+                        "Coverage gaps and unknown attention mean unknown; never infer idle or away outside the attention lane."
                     );
                 }
                 Ok(result)
