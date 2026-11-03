@@ -79,6 +79,14 @@ impl Digest {
     }
 }
 
+/// Text read from a screenshot, citable by its OCR evidence id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScreenText {
+    pub id: i64,
+    pub at: DateTime<Utc>,
+    pub text: String,
+}
+
 struct Focus {
     interval: Interval,
     app: String,
@@ -89,6 +97,7 @@ struct Focus {
 pub fn build_digest(
     timeline: &Timeline,
     observations: &[Observation],
+    screens: &[ScreenText],
     config: DigestConfig,
 ) -> Digest {
     let window = timeline.window;
@@ -106,42 +115,39 @@ pub fn build_digest(
         window.end.to_rfc3339()
     ));
     out.push_str(&totals(&segments, &attention, window));
-    let mut gaps = attention
+    // Unknown stretches go in a closing note: listed inline, they read as
+    // activity and the model wrote episodes about missing capture.
+    let gaps: Vec<_> = attention
         .iter()
         .filter(|(i, label, _)| {
             label == "unknown" && (i.end - i.start).num_seconds() >= config.min_gap_s
         })
-        .peekable();
+        .collect();
     for s in &segments {
-        while let Some((gap, _, ids)) = gaps.peek().filter(|(g, _, _)| g.start <= s.interval.start)
-        {
-            lines.push((shown(*gap), ids.clone()));
-            out.push_str(&format!(
-                "[{}] {}-{} GAP unknown coverage (capture not verified); never treat as idle or away\n",
-                ids_text(ids),
-                hm(gap.start),
-                hm(gap.end)
-            ));
-            gaps.next();
-        }
         lines.push((shown(s.interval), s.evidence.clone()));
         out.push_str(&segment_line(
             s,
             &focus,
             &attention,
             observations,
+            screens,
             config,
             &mut seen_lines,
         ));
     }
-    for (gap, _, ids) in gaps {
-        lines.push((shown(*gap), ids.clone()));
-        out.push_str(&format!(
-            "[{}] {}-{} GAP unknown coverage (capture not verified); never treat as idle or away\n",
-            ids_text(ids),
-            hm(gap.start),
-            hm(gap.end)
-        ));
+    if !gaps.is_empty() {
+        out.push_str(
+            "\nUnknown stretches (capture not verified: not idle, not away; write no episodes about them):\n",
+        );
+        for (gap, _, ids) in gaps {
+            lines.push((shown(*gap), ids.clone()));
+            out.push_str(&format!(
+                "[{}] {}-{}\n",
+                ids_text(ids),
+                hm(gap.start),
+                hm(gap.end)
+            ));
+        }
     }
     Digest {
         text: out,
@@ -306,6 +312,7 @@ fn segment_line(
     focus: &[Focus],
     attention: &[(Interval, String, Vec<i64>)],
     observations: &[Observation],
+    screens: &[ScreenText],
     config: DigestConfig,
     seen_lines: &mut BTreeSet<String>,
 ) -> String {
@@ -441,6 +448,25 @@ fn segment_line(
                 .join(" ")
         ));
     }
+    // Without window text, the screenshot is the only record of what was shown.
+    if text.is_empty() {
+        let mut used = 0;
+        for shot in screens
+            .iter()
+            .filter(|t| t.at >= s.interval.start && t.at < s.interval.end)
+        {
+            for l in shot.text.lines().map(str::trim) {
+                if used >= config.text_chars / 2 {
+                    break;
+                }
+                if l.chars().count() < 12 || !seen_lines.insert(l.to_owned()) {
+                    continue;
+                }
+                used += l.len();
+                text.push((String::new(), shot.id, format!("(screenshot) {l}")));
+            }
+        }
+    }
     line.push('\n');
     for (_, id, l) in &text {
         line.push_str(&format!("[{id}] {}\n", bounded(l, 240)));
@@ -517,6 +543,54 @@ fn bounded(text: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn focus(id: i64, from: &str, to: &str) -> Observation {
+        let envelope = serde_json::from_value(serde_json::json!({
+            "envelope_version": 1,
+            "observation_id": format!("01J000000000000000000000{id:02}"),
+            "connector_instance": "macos-agent:synthetic",
+            "source_key": format!("focus:{id}"),
+            "revision": "1",
+            "operation": "upsert",
+            "kind": "focus.span",
+            "schema_version": 1,
+            "device": "synthetic-device",
+            "time": {"source_start": from, "source_end": to, "resolution_ms": 1, "observed_at": to},
+            "links": [],
+            "sensitivity": "normal",
+            "payload": {"app_name": "Synthetic Browser", "app_bundle_id": "com.example.browser", "window_title": null, "pid": 1, "display": null},
+            "blobs": []
+        }))
+        .unwrap();
+        Observation {
+            id,
+            received_at: to.parse().unwrap(),
+            envelope,
+        }
+    }
+
+    #[test]
+    fn screenshot_text_fills_an_untitled_stretch() {
+        let window = Interval {
+            start: "2026-01-01T10:00:00Z".parse().unwrap(),
+            end: "2026-01-01T14:00:00Z".parse().unwrap(),
+        };
+        let observations = vec![focus(1, "2026-01-01T10:00:00Z", "2026-01-01T10:20:00Z")];
+        let timeline = hx_compile::compile(&observations, window);
+        let screens = [ScreenText {
+            id: 99,
+            at: "2026-01-01T10:05:00Z".parse().unwrap(),
+            text: "Synthetic quarterly planning notes".into(),
+        }];
+        let digest = build_digest(&timeline, &observations, &screens, DigestConfig::default());
+        assert!(
+            digest
+                .text
+                .contains("[99] (screenshot) Synthetic quarterly planning notes"),
+            "{}",
+            digest.text
+        );
+    }
 
     #[test]
     fn titles_drop_browser_chrome_and_badges() {

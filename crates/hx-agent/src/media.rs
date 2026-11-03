@@ -411,18 +411,54 @@ pub(crate) fn run(
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let result = run_inner(config.clone(), tx.clone(), context, paused, stop);
-    if let Err(error) = &result {
-        let mut producer = Producer::new(config.device_id)?.namespace("macos-media");
+    // One failed write (a full disk, a codec error) must not end screen capture for
+    // the rest of the session: report it, back off, and start a fresh capture.
+    let mut backoff = RESTART_MIN;
+    loop {
+        let started = Instant::now();
+        let result = run_inner(
+            config.clone(),
+            tx.clone(),
+            context.clone(),
+            paused.clone(),
+            stop.clone(),
+        );
+        let error = match result {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if tx.is_closed() {
+            return Err(error);
+        }
+        let mut producer = Producer::new(config.device_id.clone())?.namespace("macos-media");
         send_health(
             &mut producer,
             &tx,
             CollectorStatus::Failed,
-            error.to_string(),
+            format!("{error}; restarting capture"),
             1,
         )?;
+        if started.elapsed() >= RESTART_HEALTHY {
+            backoff = RESTART_MIN;
+        }
+        let resume = Instant::now() + backoff;
+        while Instant::now() < resume {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        backoff = next_backoff(backoff);
     }
-    result
+}
+
+const RESTART_MIN: Duration = Duration::from_secs(15);
+const RESTART_MAX: Duration = Duration::from_secs(300);
+/// A capture that ran this long before failing restarts at the minimum delay.
+const RESTART_HEALTHY: Duration = Duration::from_secs(600);
+
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(RESTART_MAX)
 }
 
 fn capture_active(idle_s: f64, threshold_s: u32, locked: bool, asleep: bool) -> bool {
@@ -474,6 +510,15 @@ fn frame_time(mut now: ObservationTime, nanos: u64) -> ObservationTime {
 #[cfg(test)]
 mod statechart_regressions {
     use super::*;
+    #[test]
+    fn capture_restarts_back_off_to_a_ceiling() {
+        let mut delay = RESTART_MIN;
+        for _ in 0..10 {
+            delay = next_backoff(delay);
+        }
+        assert_eq!(delay, RESTART_MAX);
+        assert_eq!(next_backoff(RESTART_MIN), RESTART_MIN * 2);
+    }
     #[test]
     fn chunk_interval_never_ends_before_it_starts() {
         let at = chrono::Utc::now();
