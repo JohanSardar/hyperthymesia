@@ -84,6 +84,7 @@ impl Broker {
             .bind(self.window.start - Duration::seconds(i64::from(lookback))).bind(self.window.end).fetch_all(&self.store.pool).await?;
         let mut capture = vec![];
         let mut visible = vec![];
+        let mut screens = vec![];
         let mut evidence = BTreeMap::new();
         let mut namespaces = std::collections::BTreeSet::new();
         for row in rows {
@@ -108,14 +109,26 @@ impl Broker {
                 capture.push(o.clone());
             }
             let at = e.time.source_start.unwrap_or(e.time.observed_at);
-            if !self.visible(e) || e.kind.as_str() == "media.still" || at >= self.window.end {
+            if !self.visible(e) || at >= self.window.end {
                 continue;
             }
             for item in self.project(o.id, e).await? {
+                if item.kind.ends_with(":ocr.text")
+                    && let Ok(v) = serde_json::from_str::<Value>(&item.text)
+                    && let Some(text) = v["text"].as_str()
+                {
+                    screens.push(hx_interpret::ScreenText {
+                        id: item.id,
+                        at: item.at,
+                        text: text.to_owned(),
+                    });
+                }
                 evidence.insert(item.id, item);
             }
             namespaces.insert(e.connector_instance.as_str().to_owned());
-            visible.push(o);
+            if e.kind.as_str() != "media.still" {
+                visible.push(o);
+            }
         }
         // Attention sees every capture signal, but a span resting on a record the
         // model may not see is unknown, exactly as the attention tool reports it.
@@ -134,8 +147,12 @@ impl Broker {
         let mut timeline = hx_compile::compile(&visible, self.window);
         timeline.lanes.retain(|l| l.id.kind != "attention");
         timeline.lanes.extend(attention.clone());
-        let digest =
-            hx_interpret::build_digest(&timeline, &visible, hx_interpret::DigestConfig::default());
+        let digest = hx_interpret::build_digest(
+            &timeline,
+            &visible,
+            &screens,
+            hx_interpret::DigestConfig::default(),
+        );
         let mut audit = self.audit.lock().await;
         audit.digest_support = digest.support();
         audit.digest_evidence = evidence;

@@ -146,7 +146,7 @@ pub mod digest;
 pub mod packet;
 pub mod providers;
 mod validation;
-pub use digest::{Digest, DigestConfig, Segment, build_digest};
+pub use digest::{Digest, DigestConfig, ScreenText, Segment, build_digest};
 pub use packet::{PacketBudget, build_packet, build_packet_with_budget, entity_assertions};
 pub use validation::{check, check_and_repair};
 

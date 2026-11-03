@@ -2319,9 +2319,9 @@ assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
-assert 'hx-replica/v5' in sys.argv[sys.argv.index('--system')+1]
+assert 'hx-replica/v6' in sys.argv[sys.argv.index('--system')+1]
 instr=sys.stdin.read()
-assert instr.strip() and '<digest>' in instr
+assert instr.strip() and ('<digest>' in instr or 'Repair only' in instr)
 if mode=='timeout': time.sleep(3)
 if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
 if mode=='rate': print(json.dumps({'error':'429 rate limited','exit_code':1}));sys.exit(1)
@@ -2466,7 +2466,7 @@ async fn fx_attention_intervals_are_citable_time_support() {
         2,
         "validation should need no repair turn"
     );
-    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v5");
+    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v6");
 
     // Gap payloads stay private, but the interrupted time must be unknown.
     let mut gap = capture(
