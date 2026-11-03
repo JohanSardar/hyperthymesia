@@ -169,10 +169,32 @@ async fn output(
             );
             Ok::<_, anyhow::Error>(bytes)
         };
+        // fx retries a subscription usage limit forever while reporting it on
+        // stderr; stop at the first report so the job is deferred, not stuck.
+        let watch = async move {
+            let mut stderr = stderr;
+            let mut bytes = vec![];
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = stderr.read(&mut chunk).await?;
+                if n == 0 {
+                    return Ok::<_, anyhow::Error>(bytes);
+                }
+                let seen = bytes.len().saturating_sub(64);
+                bytes.extend_from_slice(&chunk[..n]);
+                anyhow::ensure!(
+                    bytes.len() as u64 <= OUTPUT_LIMIT,
+                    "fx output budget exceeded"
+                );
+                if usage_limited(&bytes[seen..]) {
+                    return Err(hx_jobs::Deferred::RateLimited.into());
+                }
+            }
+        };
         let (_, stdout, stderr) = tokio::try_join!(
             async { send.await.map_err(anyhow::Error::from) },
             read(Box::new(stdout)),
-            read(Box::new(stderr))
+            watch
         )?;
         Ok::<_, anyhow::Error>(std::process::Output {
             status: child.wait().await?,
@@ -182,6 +204,11 @@ async fn output(
     })
     .await
     .context("fx wall-clock budget exceeded")?
+}
+
+fn usage_limited(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr);
+    text.contains("usage_limit_reached") || text.contains("HTTP 429")
 }
 
 pub async fn run(config: &Config, broker: &Broker, instruction: &str) -> Result<Value> {
