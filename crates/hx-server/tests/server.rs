@@ -2319,7 +2319,7 @@ assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
-assert 'hx-replica/v8' in sys.argv[sys.argv.index('--system')+1]
+assert 'hx-replica/v9' in sys.argv[sys.argv.index('--system')+1]
 instr=sys.stdin.read()
 assert instr.strip() and ('<digest>' in instr or 'Repair only' in instr)
 if mode=='timeout': time.sleep(3)
@@ -2370,6 +2370,20 @@ if mode=='empty-repair':
   counter.write_text('1')
   bad=json.loads(json.dumps(answer['episodes'][0])); bad['id']='synthetic-unknown'; bad['evidence']=[999999999]
   bad['claims'][0]['evidence']=[999999999]; answer['episodes'].append(bad)
+if mode=='merge-repair':
+ counter=pathlib.Path('COUNTER')
+ good=answer['episodes'][0]
+ fixed=json.loads(json.dumps(good)); fixed['id']='synthetic-second'; fixed['title']='Second visit'
+ if counter.exists():
+  assert 'Repair only these episodes' in instr and '<digest>' in instr and 'synthetic-second' in instr
+  assert 'synthetic-episode' not in instr.split('Rejected episodes:')[1]
+  intruder=json.loads(json.dumps(good)); intruder['id']='intruder'
+  answer={'episodes':[fixed,intruder],'tasks':[],'summary':''}
+ else:
+  counter.write_text('1')
+  bad=json.loads(json.dumps(fixed)); bad['evidence']=[999999999]; bad['claims'][0]['evidence']=[999999999]
+  answer['episodes'].append(bad)
+  answer['tasks']=[{'id':'synthetic-task','title':'Visits','description':'Two visits','intervals':good['intervals'],'episode_ids':['synthetic-episode','synthetic-second'],'goal':None,'aliases':[],'confidence':0.7,'open':False}]
 if mode=='repair-failure':
  counter=pathlib.Path('COUNTER')
  if counter.exists(): print(json.dumps({'error':'synthetic repair failure','exit_code':1}));sys.exit(1)
@@ -2473,7 +2487,7 @@ async fn fx_attention_intervals_are_citable_time_support() {
         2,
         "validation should need no repair turn"
     );
-    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v8");
+    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v9");
 
     // Gap payloads stay private, but the interrupted time must be unknown.
     let mut gap = capture(
@@ -2747,6 +2761,37 @@ async fn fx_keeps_the_fuller_answer_when_a_repair_comes_back_empty() {
     // The rejected episode triggered one repair; the empty repair must not replace the first answer.
     assert_eq!(value["episodes"].as_array().unwrap().len(), 1, "{value}");
     assert!(std::fs::metadata(scratch.path().join("counter")).is_ok());
+    f.close().await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_repair_replaces_only_rejected_episodes_and_keeps_the_rest() {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("fx-merge-repair", 1)]).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "merge-repair");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-merge-repair", &config)
+            .await
+            .unwrap()
+    );
+    let value: Value = sqlx::query_scalar(
+        "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-merge-repair'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    let ids: Vec<&str> = value["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["synthetic-episode", "synthetic-second"], "{value}");
+    assert_eq!(value["tasks"][0]["id"], "synthetic-task", "{value}");
     f.close().await;
 }
 

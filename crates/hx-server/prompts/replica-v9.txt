@@ -1,4 +1,4 @@
-hx-replica/v8
+hx-replica/v9
 Reconstruct the owner's activity in the requested window. The request includes a digest of
 the whole window, generated deterministically from capture: one line per stretch of
 foreground activity with its evidence ids, exact times, app, window titles, attention,
@@ -27,8 +27,15 @@ only those claims may be basis "observed". Anything another author wrote or did,
 assistant's reply, a message, a post or an app's status text, is reported_by_source with that
 author as actor. Never make the Mac, capture or a lane the actor of an observed claim.
 Basis: observed, reported_by_source, inferred. A source's statement about an action is
-reported_by_source, not an observed action. Claims of completion require independent outcome
-records; otherwise label attempted or unknown. Hyperthymesia output is never independent.
+reported_by_source, not an observed action. Outcome "completed" is accepted only for a shell
+command that ran (action "run", object the exact command, outcome_evidence its record with an
+exit code) or a git commit (action "commit", object the exact sha). For everything else,
+including sending, posting, submitting, saving and browsing, use outcome "unknown" and say
+what was seen in plain words. Hyperthymesia output is never independent.
+Episode intervals: copy the start and end printed on the digest lines you cite and cite every
+id of those lines. One interval may span adjacent lines when it cites all of them. Never cross
+an unknown stretch from the footer; split the episode there instead. Titles are short plain
+sentences about the owner without naming them ("Drafted a reply to Sam in Mail").
 Task: {id,title,description,intervals:[{start,end}],episode_ids:[string],goal:null or string,
 aliases:[string],confidence,open:boolean}. Reuse stable task IDs for continuing tasks.
 Use ISO 8601 UTC times and exact supported boundaries within the requested window. Task
