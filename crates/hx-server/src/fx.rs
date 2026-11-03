@@ -12,8 +12,10 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub const PROMPT_VERSION: &str = "hx-replica/v4";
-pub const PROMPT: &str = include_str!("../prompts/replica-v4.txt");
+pub const PROMPT_VERSION: &str = "hx-replica/v5";
+pub const PROMPT: &str = include_str!("../prompts/replica-v5.txt");
+/// Lookups after the digest; enough to check a few unclear stretches.
+pub const DIGEST_LOOKUPS: usize = 10;
 pub const FX_VERSION: &str = "0.0.16";
 pub const MODEL: &str = "gpt-6.1-sol";
 /// Defaults sized for a dense real four-hour window; override per deployment.
@@ -232,7 +234,7 @@ async fn run_limited(
             &json!({"mcpServers":{"hyperthymesia":{"type":"http","url":format!("http://{addr}/mcp"),"bearer_token_env":"HX_MCP_TOKEN","operation_timeout_ms":15000}}}),
         )?,
     )?;
-    std::fs::write(work.join("replica-v4.txt"), PROMPT)?;
+    std::fs::write(work.join("replica-v5.txt"), PROMPT)?;
     let command = || {
         let mut cmd = tokio::process::Command::new(&config.binary);
         cmd.env_clear()
@@ -347,9 +349,12 @@ pub(crate) async fn interpret_window_with_settle(
     if crate::processing::revision_exists(store, window, generation, &identity).await? {
         return Ok(false);
     }
-    let broker = Broker::new(store.clone(), policy.clone(), sensitive, window);
+    let mut broker = Broker::new(store.clone(), policy.clone(), sensitive, window);
+    broker.lookup_limit = DIGEST_LOOKUPS;
+    let digest = broker.digest().await?;
     let goal = format!(
-        "Reconstruct {} to {}. Use Hyperthymesia MCP tools. Every claim must cite evidence returned by tools in this run.",
+        "Reconstruct {} to {}. The digest below covers the whole window; every id in it is citable evidence. \
+         Use at most {DIGEST_LOOKUPS} Hyperthymesia MCP lookups, only for stretches the digest leaves unclear.\n\n<digest>\n{digest}</digest>",
         window.start, window.end
     );
     let mut instruction = goal.clone();
@@ -396,8 +401,11 @@ pub(crate) async fn interpret_window_with_settle(
         responses.push(response);
         let audit = broker.audit.lock().await;
         ensure!(!audit.exhausted, "MCP budget exhausted");
-        let evidence: Vec<_> = audit.evidence.values().cloned().collect();
+        let mut cited = audit.digest_evidence.clone();
+        cited.extend(audit.evidence.clone());
+        let evidence: Vec<_> = cited.into_values().collect();
         let attention = audit.attention.clone();
+        let digest_support = audit.digest_support.clone();
         drop(audit);
         // Rebuild support from every cited record; a window-wide capped scan drops later spans.
         let ids: Vec<i64> = evidence.iter().map(|e| e.id).collect();
@@ -428,7 +436,15 @@ pub(crate) async fn interpret_window_with_settle(
                 max_item_chars: 16_384,
             },
         );
-        let by_evidence = citation_support(&timeline, &observations, window);
+        let mut by_evidence = citation_support(&timeline, &observations, window);
+        for (id, spans) in &digest_support {
+            let entry = by_evidence.entry(*id).or_default();
+            for s in spans.iter().filter_map(|s| s.intersect(&window)) {
+                if !entry.contains(&s) {
+                    entry.push(s);
+                }
+            }
+        }
         // Attention may cite health just before the window. It remains valid
         // support even when packet sampling would omit those lead-in records.
         let mut support: Vec<_> = by_evidence
@@ -495,7 +511,7 @@ pub(crate) async fn interpret_window_with_settle(
     let namespaces: Vec<String> = audit.input_namespaces.iter().cloned().collect();
     let mut value = serde_json::to_value(interpretation)?;
     value["input_manifest"] = json!({"window":window,"input_generation":generation,"provider":"fx","fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
-    value["agent_run"] = json!({"fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
+    value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     Ok(store
         .publish_revision_manifest(window, generation, value, output_key, &namespaces)
         .await?
