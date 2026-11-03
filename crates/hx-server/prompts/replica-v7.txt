@@ -1,4 +1,4 @@
-hx-replica/v6
+hx-replica/v7
 Reconstruct the owner's activity in the requested window. The request includes a digest of
 the whole window, generated deterministically from capture: one line per stretch of
 foreground activity with its evidence ids, exact times, app, window titles, attention,

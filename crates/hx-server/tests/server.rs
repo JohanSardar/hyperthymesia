@@ -2319,7 +2319,7 @@ assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
-assert 'hx-replica/v6' in sys.argv[sys.argv.index('--system')+1]
+assert 'hx-replica/v7' in sys.argv[sys.argv.index('--system')+1]
 instr=sys.stdin.read()
 assert instr.strip() and ('<digest>' in instr or 'Repair only' in instr)
 if mode=='timeout': time.sleep(3)
@@ -2363,6 +2363,13 @@ if mode=='attention':
  episode['claims'][0].update(action='was probably away',object='Mac',basis='inferred',evidence=ids)
  answer['summary']='Probably away'
 if mode=='invalid': answer='this is not JSON'
+if mode=='empty-repair':
+ counter=pathlib.Path('COUNTER')
+ if counter.exists(): answer={'episodes':[],'tasks':[],'summary':''}
+ else:
+  counter.write_text('1')
+  bad=json.loads(json.dumps(answer['episodes'][0])); bad['id']='synthetic-unknown'; bad['evidence']=[999999999]
+  bad['claims'][0]['evidence']=[999999999]; answer['episodes'].append(bad)
 if mode=='repair-failure':
  counter=pathlib.Path('COUNTER')
  if counter.exists(): print(json.dumps({'error':'synthetic repair failure','exit_code':1}));sys.exit(1)
@@ -2466,7 +2473,7 @@ async fn fx_attention_intervals_are_citable_time_support() {
         2,
         "validation should need no repair turn"
     );
-    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v6");
+    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v7");
 
     // Gap payloads stay private, but the interrupted time must be unknown.
     let mut gap = capture(
@@ -2714,6 +2721,32 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     .unwrap();
     assert_eq!(value["episodes"][0]["claims"][0]["outcome"], "attempted");
     assert!(!value["check_failures"].as_array().unwrap().is_empty());
+    f.close().await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_keeps_the_fuller_answer_when_a_repair_comes_back_empty() {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("fx-empty-repair", 1)]).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "empty-repair");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-empty-repair", &config)
+            .await
+            .unwrap()
+    );
+    let value: Value = sqlx::query_scalar(
+        "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-empty-repair'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    // The rejected episode triggered one repair; the empty repair must not replace the first answer.
+    assert_eq!(value["episodes"].as_array().unwrap().len(), 1, "{value}");
+    assert!(std::fs::metadata(scratch.path().join("counter")).is_ok());
     f.close().await;
 }
 
