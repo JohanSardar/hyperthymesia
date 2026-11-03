@@ -135,6 +135,13 @@ pub fn build_digest(
             &mut seen_lines,
         ));
     }
+    // A line minus the unknown stretches inside it is as supported as the whole
+    // line; the model is told to leave those stretches out of episodes.
+    for s in &segments {
+        for piece in without(shown(s.interval), gaps.iter().map(|(g, _, _)| shown(*g))) {
+            lines.push((piece, s.evidence.clone()));
+        }
+    }
     if !gaps.is_empty() {
         out.push_str(
             "\nUnknown stretches (capture not verified: not idle, not away; write no episodes about them):\n",
@@ -507,6 +514,35 @@ fn ids_text(ids: &[i64]) -> String {
     }
 }
 
+/// `whole` minus `holes`, as the remaining non-empty pieces in order.
+fn without(whole: Interval, holes: impl Iterator<Item = Interval>) -> Vec<Interval> {
+    let mut pieces = vec![whole];
+    for hole in holes {
+        pieces = pieces
+            .into_iter()
+            .flat_map(|p| {
+                if hole.end <= p.start || hole.start >= p.end {
+                    return vec![p];
+                }
+                [
+                    Interval {
+                        start: p.start,
+                        end: hole.start,
+                    },
+                    Interval {
+                        start: hole.end,
+                        end: p.end,
+                    },
+                ]
+                .into_iter()
+                .filter(|i| i.start < i.end)
+                .collect()
+            })
+            .collect();
+    }
+    pieces
+}
+
 /// An interval truncated to the whole seconds the digest prints.
 fn shown(i: Interval) -> Interval {
     let floor = |t: DateTime<Utc>| t - Duration::nanoseconds(i64::from(t.timestamp_subsec_nanos()));
@@ -567,6 +603,22 @@ mod tests {
             received_at: to.parse().unwrap(),
             envelope,
         }
+    }
+
+    #[test]
+    fn unknown_stretches_cut_a_line_into_supported_pieces() {
+        let t = |s: &str| format!("2026-01-01T{s}Z").parse().unwrap();
+        let iv = |a: &str, b: &str| Interval {
+            start: t(a),
+            end: t(b),
+        };
+        assert_eq!(
+            without(
+                iv("10:00:00", "10:10:00"),
+                [iv("10:02:00", "10:03:00"), iv("10:09:00", "10:12:00")].into_iter()
+            ),
+            vec![iv("10:00:00", "10:02:00"), iv("10:03:00", "10:09:00")]
+        );
     }
 
     #[test]
