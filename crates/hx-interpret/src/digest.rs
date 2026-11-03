@@ -54,15 +54,25 @@ pub struct Segment {
 pub struct Digest {
     pub text: String,
     pub segments: Vec<Segment>,
+    /// Each line's interval as printed (whole seconds) with the ids it lists.
+    pub lines: Vec<(Interval, Vec<i64>)>,
 }
 
 impl Digest {
     /// Segment intervals keyed by each member record, for citation validation.
     pub fn support(&self) -> BTreeMap<i64, Vec<Interval>> {
         let mut out = BTreeMap::<i64, Vec<Interval>>::new();
-        for s in &self.segments {
-            for id in &s.evidence {
-                out.entry(*id).or_default().push(s.interval);
+        let spans = self
+            .segments
+            .iter()
+            .map(|s| (s.interval, &s.evidence))
+            .chain(self.lines.iter().map(|(i, ids)| (*i, ids)));
+        for (interval, ids) in spans {
+            for id in ids {
+                let entry = out.entry(*id).or_default();
+                if !entry.contains(&interval) {
+                    entry.push(interval);
+                }
             }
         }
         out
@@ -86,6 +96,7 @@ pub fn build_digest(
     let segments = segment(&focus, config);
     let attention = attention_runs(timeline);
     let mut seen_lines = BTreeSet::new();
+    let mut lines = Vec::new();
     let mut out = String::new();
     out.push_str(&format!(
         "window {} to {} (UTC). One line per stretch of foreground activity.\n\
@@ -104,6 +115,7 @@ pub fn build_digest(
     for s in &segments {
         while let Some((gap, _, ids)) = gaps.peek().filter(|(g, _, _)| g.start <= s.interval.start)
         {
+            lines.push((shown(*gap), ids.clone()));
             out.push_str(&format!(
                 "[{}] {}-{} GAP unknown coverage (capture not verified); never treat as idle or away\n",
                 ids_text(ids),
@@ -112,6 +124,7 @@ pub fn build_digest(
             ));
             gaps.next();
         }
+        lines.push((shown(s.interval), s.evidence.clone()));
         out.push_str(&segment_line(
             s,
             &focus,
@@ -122,6 +135,7 @@ pub fn build_digest(
         ));
     }
     for (gap, _, ids) in gaps {
+        lines.push((shown(*gap), ids.clone()));
         out.push_str(&format!(
             "[{}] {}-{} GAP unknown coverage (capture not verified); never treat as idle or away\n",
             ids_text(ids),
@@ -132,6 +146,7 @@ pub fn build_digest(
     Digest {
         text: out,
         segments,
+        lines,
     }
 }
 
@@ -463,6 +478,15 @@ fn ids_text(ids: &[i64]) -> String {
             format!("{first},{},…,{last} ({} records)", ids[1], ids.len())
         }
         _ => ids.iter().map(i64::to_string).collect::<Vec<_>>().join(","),
+    }
+}
+
+/// An interval truncated to the whole seconds the digest prints.
+fn shown(i: Interval) -> Interval {
+    let floor = |t: DateTime<Utc>| t - Duration::nanoseconds(i64::from(t.timestamp_subsec_nanos()));
+    Interval {
+        start: floor(i.start),
+        end: floor(i.end),
     }
 }
 

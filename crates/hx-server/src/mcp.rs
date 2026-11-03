@@ -30,6 +30,8 @@ pub struct Broker {
     pub sensitive: SensitiveEgress,
     pub window: Interval,
     pub audit: Arc<Mutex<Audit>>,
+    /// Lookups answered before the broker asks the model to finish from what it has.
+    pub lookup_limit: usize,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Audit {
@@ -38,6 +40,12 @@ pub struct Audit {
     pub attention: Vec<hx_compile::Lane>,
     pub input_namespaces: std::collections::BTreeSet<String>,
     pub exhausted: bool,
+    /// Every visible record in the window, citable because the digest names it.
+    /// Kept out of the stored run log; only cited records matter there.
+    #[serde(skip)]
+    pub digest_evidence: BTreeMap<i64, EvidenceItem>,
+    #[serde(skip)]
+    pub digest_support: BTreeMap<i64, Vec<Interval>>,
 }
 pub fn bounded(text: &str, cap: usize) -> String {
     let mut end = text.len().min(cap);
@@ -59,7 +67,81 @@ impl Broker {
             sensitive,
             window,
             audit: Arc::default(),
+            lookup_limit: MAX_CALLS,
         }
+    }
+    /// Compile the whole window without the exploration row cap and render the
+    /// digest the model reads first. Every visible record in the window becomes
+    /// citable, and digest segments support their full interval.
+    pub async fn digest(&self) -> Result<String> {
+        let config = hx_compile::AttentionConfig::default();
+        let lookback = config
+            .reading_max_s
+            .max(config.input_gap_s)
+            .max(config.health_max_s)
+            .max(config.visual_change_s);
+        let rows = sqlx::query("SELECT id,received_at,envelope FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 ORDER BY source_start,id")
+            .bind(self.window.start - Duration::seconds(i64::from(lookback))).bind(self.window.end).fetch_all(&self.store.pool).await?;
+        let mut capture = vec![];
+        let mut visible = vec![];
+        let mut evidence = BTreeMap::new();
+        let mut namespaces = std::collections::BTreeSet::new();
+        for row in rows {
+            let e: Envelope = serde_json::from_value(row.get("envelope"))?;
+            let o = hx_compile::Observation {
+                id: row.get("id"),
+                received_at: row.get("received_at"),
+                envelope: e,
+            };
+            let e = &o.envelope;
+            if matches!(
+                e.kind.as_str(),
+                "collector.health"
+                    | "policy.gap"
+                    | "focus.span"
+                    | "presence.span"
+                    | "input.bucket"
+                    | "media.still"
+                    | "media.chunk"
+                    | "text.snapshot"
+            ) {
+                capture.push(o.clone());
+            }
+            let at = e.time.source_start.unwrap_or(e.time.observed_at);
+            if !self.visible(e) || e.kind.as_str() == "media.still" || at >= self.window.end {
+                continue;
+            }
+            for item in self.project(o.id, e).await? {
+                evidence.insert(item.id, item);
+            }
+            namespaces.insert(e.connector_instance.as_str().to_owned());
+            visible.push(o);
+        }
+        // Attention sees every capture signal, but a span resting on a record the
+        // model may not see is unknown, exactly as the attention tool reports it.
+        let mut attention: Vec<_> =
+            hx_compile::compile_with_attention_config(&capture, self.window, config)
+                .lanes
+                .into_iter()
+                .filter(|l| l.id.kind == "attention")
+                .collect();
+        for span in attention.iter_mut().flat_map(|l| &mut l.intervals) {
+            if span.evidence.iter().any(|id| !evidence.contains_key(id)) {
+                span.label = "unknown".into();
+            }
+            span.evidence.retain(|id| evidence.contains_key(id));
+        }
+        let mut timeline = hx_compile::compile(&visible, self.window);
+        timeline.lanes.retain(|l| l.id.kind != "attention");
+        timeline.lanes.extend(attention.clone());
+        let digest =
+            hx_interpret::build_digest(&timeline, &visible, hx_interpret::DigestConfig::default());
+        let mut audit = self.audit.lock().await;
+        audit.digest_support = digest.support();
+        audit.digest_evidence = evidence;
+        audit.attention.extend(attention);
+        audit.input_namespaces.extend(namespaces);
+        Ok(digest.text)
     }
     pub fn visible(&self, e: &Envelope) -> bool {
         self.policy.effective_class(e) != Sensitivity::Restricted
@@ -294,6 +376,13 @@ impl Broker {
         if audit.calls.len() >= MAX_CALLS {
             audit.exhausted = true;
             bail!("tool budget exhausted");
+        }
+        if audit.calls.len() >= self.lookup_limit {
+            let result = json!({"error":"lookup budget used; finish now from the digest and the evidence you already have"});
+            audit
+                .calls
+                .push(json!({"tool":name,"arguments":args,"result":result}));
+            return Ok(result);
         }
         let result = self.execute(name, &args).await;
         let result = result.unwrap_or_else(

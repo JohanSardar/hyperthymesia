@@ -2226,6 +2226,81 @@ async fn mcp_tools_are_bounded_and_current_policy_controls_all_context() {
     f.close().await;
 }
 
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_reads_the_digest_cites_its_printed_times_and_stops_at_the_lookup_cap() {
+    let f = Fixture::new().await;
+    // Sub-second times: the digest prints whole seconds, and those must validate.
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap() + Duration::milliseconds(250);
+    let focus = |key: &str, from: i64, to: i64, app: &str, title: &str| {
+        let mut e = event(key, 1);
+        e.device = Some(hx_schema::DeviceId::new("synthetic-device"));
+        e.kind = Kind::new("focus.span");
+        e.time = ObservationTime::point(base + Duration::seconds(from));
+        e.time.source_end = Some(base + Duration::seconds(to));
+        e.payload = json!({"app_bundle_id":"synthetic.app","app_name":app,"window_title":title,"pid":1,"display":null});
+        e
+    };
+    ingest(
+        &f.store,
+        vec![
+            focus("digest-a", 0, 300, "Synthetic Browser", "Synthetic search"),
+            focus(
+                "digest-b",
+                300,
+                1500,
+                "Synthetic Editor",
+                "Draft the launch note",
+            ),
+        ],
+    )
+    .await;
+    let w = hx_store::window_at(base);
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "digest");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-digest", &config)
+            .await
+            .unwrap()
+    );
+    let value: Value = sqlx::query_scalar(
+        "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-digest'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    // The printed whole-second times validate; only the non-Mac source wording is downgraded.
+    assert_eq!(
+        value["episodes"][0]["intervals"],
+        json!([{"start":"2026-01-01T01:05:00Z","end":"2026-01-01T01:25:00Z"}]),
+        "{}",
+        value["check_failures"]
+    );
+    let run: Value = sqlx::query_scalar(
+        "SELECT agent_run FROM revisions WHERE output_key='synthetic-fx-digest'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert!(run["digest"].as_str().unwrap().contains("Synthetic Editor"));
+    let calls = run["calls"].as_array().unwrap();
+    // Repair attempts share the cap: later attempts get no fresh lookups.
+    assert!(calls.len() > hx_server::fx::DIGEST_LOOKUPS);
+    let capped = hx_server::fx::DIGEST_LOOKUPS;
+    assert!(
+        calls[..capped]
+            .iter()
+            .all(|c| c["result"]["error"].is_null())
+    );
+    assert!(
+        calls[capped..]
+            .iter()
+            .all(|c| c["result"]["error"].as_str().unwrap().contains("budget"))
+    );
+    f.close().await;
+}
+
 #[cfg(unix)]
 fn fake_fx(dir: &std::path::Path, mode: &str) -> hx_server::fx::Config {
     use std::os::unix::fs::PermissionsExt;
@@ -2244,8 +2319,9 @@ assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
-assert 'hx-replica/v4' in sys.argv[sys.argv.index('--system')+1]
-assert sys.stdin.read().strip()
+assert 'hx-replica/v5' in sys.argv[sys.argv.index('--system')+1]
+instr=sys.stdin.read()
+assert instr.strip() and '<digest>' in instr
 if mode=='timeout': time.sleep(3)
 if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
 if mode=='rate': print(json.dumps({'error':'429 rate limited','exit_code':1}));sys.exit(1)
@@ -2255,6 +2331,16 @@ def rpc(method,params):
  return json.load(urllib.request.urlopen(req))['result']
 rpc('initialize',{})
 assert len(rpc('tools/list',{})['tools'])==8
+if mode=='digest':
+ import re
+ line=next(l for l in instr.splitlines() if l.startswith('[') and 'Synthetic Editor' in l)
+ assert 'Draft the launch note' in line, line
+ m=re.match(r'\[(\d+)[^\]]*\] (\d\d:\d\d:\d\d)-(\d\d:\d\d:\d\d) ',line)
+ i=int(m.group(1)); iv={'start':'2026-01-01T'+m.group(2)+'Z','end':'2026-01-01T'+m.group(3)+'Z'}
+ answer={'episodes':[{'id':'synthetic-digest','intervals':[iv],'title':'Drafted the launch note','description':'Wrote in the synthetic editor','claims':[{'actor':'owner','action':'edited','object':'launch note','outcome':'unknown','basis':'observed','evidence':[i],'outcome_evidence':[]}],'evidence':[i],'confidence':0.8}],'tasks':[],'summary':'Drafted the launch note'}
+ for _ in range(12): rpc('tools/call',{'name':'list_sources','arguments':{}})
+ print(json.dumps({'exit_code':0,'model':'gpt-6.1-sol','steps':2,'final_output':json.dumps(answer),'tool_calls':[{'name':'mcp_hyperthymesia_list_sources','status':'success'}]*12}))
+ sys.exit(0)
 start='2026-01-01T03:58:00Z' if mode=='late' else '2026-01-01T00:00:00Z'
 result=rpc('tools/call',{'name':'window_overview','arguments':{'from':start,'to':'2026-01-01T04:00:00Z'}})
 data=json.loads(result['content'][0]['text'])
@@ -2380,7 +2466,7 @@ async fn fx_attention_intervals_are_citable_time_support() {
         2,
         "validation should need no repair turn"
     );
-    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v4");
+    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v5");
 
     // Gap payloads stay private, but the interrupted time must be unknown.
     let mut gap = capture(
