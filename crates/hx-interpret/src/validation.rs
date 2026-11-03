@@ -18,6 +18,19 @@ fn valid_intervals(intervals: &[Interval], window: Interval) -> bool {
         && sorted.windows(2).all(|pair| pair[0].end <= pair[1].start)
 }
 
+fn merged(intervals: impl Iterator<Item = Interval>) -> Vec<Interval> {
+    let mut sorted: Vec<_> = intervals.collect();
+    sorted.sort_by_key(|i| i.start);
+    let mut out: Vec<Interval> = Vec::new();
+    for i in sorted {
+        match out.last_mut() {
+            Some(last) if i.start < last.end => last.end = last.end.max(i.end),
+            _ => out.push(i),
+        }
+    }
+    out
+}
+
 /// Repairs are deterministic and every removal/downgrade is audited.
 pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<CheckFailure> {
     let mut failures = Vec::new();
@@ -167,13 +180,19 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
             episode.description = episode
                 .claims
                 .iter()
-                .map(claim_prose)
+                .map(|c| {
+                    let (body, tag) = claim_prose(c);
+                    body + &tag
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
-            episode.title = bounded_title(&episode.description);
-            if episode.title.is_empty() {
-                episode.title = "Activity unknown (no supported claims)".into();
-            }
+            episode.title = match episode.claims.first() {
+                Some(claim) => {
+                    let (body, tag) = claim_prose(claim);
+                    tagged_title(&body, &tag)
+                }
+                None => "Activity unknown (no supported claims)".into(),
+            };
             fail(
                 &episode.id,
                 "regenerated episode prose from retained claims",
@@ -187,12 +206,24 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
     value.tasks.retain_mut(|task| {
         let reason = if task.id.is_empty() || !task_ids.insert(task.id.clone()) {
             Some("rejected duplicate or empty task id")
-        } else if !valid_intervals(&task.intervals, packet.window) || !supported(&task.intervals) {
-            Some("rejected task intervals outside window or overlapping")
         } else if task.episode_ids.is_empty()
             || task.episode_ids.iter().any(|id| !episode_ids.contains(id))
         {
             Some("rejected task without valid episodes")
+        } else if !valid_intervals(&task.intervals, packet.window) || !supported(&task.intervals) {
+            // A task is its episodes, whose intervals are already verified.
+            task.intervals = merged(
+                value
+                    .episodes
+                    .iter()
+                    .filter(|e| task.episode_ids.contains(&e.id))
+                    .flat_map(|e| e.intervals.iter().copied()),
+            );
+            fail(
+                &task.id,
+                "replaced task intervals with its episodes' intervals",
+            );
+            None
         } else if !task.confidence.is_finite() || !(0.0..=1.0).contains(&task.confidence) {
             Some("rejected invalid confidence")
         } else {
@@ -339,20 +370,54 @@ fn source_report(e: &EvidenceItem) -> bool {
     .any(|marker| text.contains(marker))
 }
 
-fn claim_prose(claim: &Claim) -> String {
-    // Put the outcome first so truncating a title cannot hide an attempted outcome.
-    format!(
-        "{}: {}{} {} {}",
-        claim.outcome,
-        if claim.basis == Basis::ReportedBySource {
-            "reported by source: "
-        } else {
+/// A retained claim as a readable sentence plus the caveat it must carry. The
+/// caveat is kept separate so a shortened title can never drop it.
+fn claim_prose(claim: &Claim) -> (String, String) {
+    let words = [
+        if owner_actor(&claim.actor) {
             ""
+        } else {
+            claim.actor.as_str()
         },
-        claim.actor,
-        claim.action,
-        claim.object
-    )
+        claim.action.as_str(),
+        claim.object.as_str(),
+    ];
+    let body = words
+        .iter()
+        .flat_map(|w| w.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = body.chars();
+    let body = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => body,
+    };
+    let mut caveats = Vec::new();
+    if claim.basis == Basis::ReportedBySource {
+        caveats.push("reported by source");
+    }
+    if claim.outcome == "attempted" {
+        caveats.push("result not confirmed");
+    }
+    let tag = if caveats.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", caveats.join("; "))
+    };
+    (body, tag)
+}
+
+fn tagged_title(body: &str, tag: &str) -> String {
+    let room = 120usize.saturating_sub(tag.chars().count());
+    let body = if body.chars().count() <= room {
+        body.to_owned()
+    } else {
+        body.chars()
+            .take(room.saturating_sub(1))
+            .chain(std::iter::once('…'))
+            .collect()
+    };
+    body + tag
 }
 
 fn bounded_title(text: &str) -> String {

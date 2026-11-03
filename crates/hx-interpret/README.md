@@ -18,10 +18,14 @@ frozen immutable signature and reports repairs on a clone. Call
 Prose repair follows the structured dependencies:
 
 - Only an episode with removed or downgraded claims has its title and description
-  regenerated from retained actor/action/object/outcome fields. Titles normalize
-  whitespace and are capped at 120 Unicode characters (including an ellipsis).
-  The outcome comes first so truncation cannot hide a downgrade. An episode with
+  regenerated from retained actor/action/object/outcome fields as a sentence
+  ("Opened the report (result not confirmed)"); the owner is not named. The
+  title is the first claim, capped at 120 Unicode characters; the caveat is kept
+  whole and the sentence is shortened instead, so truncation cannot hide a
+  downgrade. An episode with
   no retained claims is labeled “Activity unknown (no supported claims)”.
+- A task whose own intervals overlap, leave the window or lack support takes the
+  merged intervals of its retained episodes instead of being dropped.
 - Only retained tasks referencing a changed episode have prose regenerated from
   their retained episodes and their goal cleared. A task referencing any removed
   episode is dropped by the existing reference check. Unaffected episode/task
