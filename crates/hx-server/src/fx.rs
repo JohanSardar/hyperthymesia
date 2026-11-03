@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub const PROMPT_VERSION: &str = "hx-replica/v7";
-pub const PROMPT: &str = include_str!("../prompts/replica-v7.txt");
+pub const PROMPT_VERSION: &str = "hx-replica/v8";
+pub const PROMPT: &str = include_str!("../prompts/replica-v8.txt");
 /// Lookups after the digest; enough to check a few unclear stretches.
-pub const DIGEST_LOOKUPS: usize = 10;
+pub const DIGEST_LOOKUPS: usize = 6;
 /// One repair pass: a second rarely changed anything but cost a full run.
 pub const REPAIR_ATTEMPTS: usize = 1;
 pub const FX_VERSION: &str = "0.0.16";
@@ -236,7 +236,7 @@ async fn run_limited(
             &json!({"mcpServers":{"hyperthymesia":{"type":"http","url":format!("http://{addr}/mcp"),"bearer_token_env":"HX_MCP_TOKEN","operation_timeout_ms":15000}}}),
         )?,
     )?;
-    std::fs::write(work.join("replica-v7.txt"), PROMPT)?;
+    std::fs::write(work.join("replica-v8.txt"), PROMPT)?;
     let command = || {
         let mut cmd = tokio::process::Command::new(&config.binary);
         cmd.env_clear()
