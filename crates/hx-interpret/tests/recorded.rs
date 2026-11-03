@@ -460,7 +460,10 @@ fn repairs_only_changed_episode_and_dependent_tasks_without_leaking_rejected_tex
         assert_eq!(result.tasks[1].description, changed.description);
         assert_eq!(
             result.summary,
-            format!("Model title 0; {}; Model title 2", changed.title)
+            format!(
+                "{}. {}. {}.",
+                result.tasks[0].title, changed.title, result.tasks[2].title
+            )
         );
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("INJECTED_ASSERTION"), "{case}");
@@ -494,14 +497,17 @@ fn removal_rebuilds_summary_but_preserves_unaffected_prose() {
             .filter(|e| !remove_episode || e.id != "e1")
             .collect();
         assert_eq!(result.episodes, retained);
-        assert_eq!(
-            result.summary,
-            if remove_episode {
-                "Model title 0; Model title 2"
-            } else {
-                "Model title 0; Model title 1; Model title 2"
-            }
-        );
+        // The removed task's episode is still summarized by its own title.
+        let titles: Vec<String> = if remove_episode {
+            vec![result.tasks[0].title.clone(), result.tasks[1].title.clone()]
+        } else {
+            vec![
+                result.tasks[0].title.clone(),
+                "Model title 1".into(),
+                result.tasks[1].title.clone(),
+            ]
+        };
+        assert_eq!(result.summary, format!("{}.", titles.join(". ")));
     }
 }
 

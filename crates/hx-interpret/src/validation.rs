@@ -264,10 +264,10 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
         || value.tasks.len() != original_task_count
     {
         // Summary prose has no references proving which removed assertion it used.
-        value.summary = episode_titles(&ordered_episodes(value.episodes.iter()));
+        value.summary = fallback_summary(value);
         fail(
             "summary",
-            "regenerated summary from retained episode titles in time order",
+            "regenerated summary from retained task and episode titles in time order",
         );
     }
     value.check_failures.extend(failures.clone());
@@ -433,6 +433,32 @@ fn ordered_episodes<'a>(episodes: impl Iterator<Item = &'a Episode>) -> Vec<&'a 
     let mut episodes: Vec<_> = episodes.collect();
     episodes.sort_by_key(|e| e.intervals.iter().map(|i| i.start).min());
     episodes
+}
+
+/// Retained task titles, plus titles of episodes no task covers, in time order and
+/// written as sentences: a short overview rather than every episode title.
+fn fallback_summary(value: &Interpretation) -> String {
+    let in_task: BTreeSet<&String> = value.tasks.iter().flat_map(|t| &t.episode_ids).collect();
+    let mut items: Vec<_> = value
+        .tasks
+        .iter()
+        .map(|t| (t.intervals.iter().map(|i| i.start).min(), t.title.as_str()))
+        .chain(
+            value
+                .episodes
+                .iter()
+                .filter(|e| !in_task.contains(&e.id))
+                .map(|e| (e.intervals.iter().map(|i| i.start).min(), e.title.as_str())),
+        )
+        .collect();
+    items.sort_by_key(|(start, _)| *start);
+    items
+        .iter()
+        .map(|(_, title)| title.trim().trim_end_matches('.'))
+        .filter(|title| !title.is_empty())
+        .map(|title| format!("{title}."))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn episode_titles(episodes: &[&Episode]) -> String {
