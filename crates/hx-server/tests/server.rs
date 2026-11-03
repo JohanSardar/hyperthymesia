@@ -2390,6 +2390,8 @@ assert instr.strip() and ('<digest>' in instr or 'Repair only' in instr)
 if mode=='timeout': time.sleep(3)
 if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
 if mode=='rate': print(json.dumps({'error':'429 rate limited','exit_code':1}));sys.exit(1)
+if mode=='rate-retrying':
+ sys.stderr.write('[notice] Rate limited · HTTP 429 · usage_limit_reached: The usage limit has been reached · retrying request in 30s\n'); sys.stderr.flush(); time.sleep(30)
 server=json.loads((home/'.fx/mcp.json').read_text())['mcpServers']['hyperthymesia']
 def rpc(method,params):
  req=urllib.request.Request(server['url'],data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['HX_MCP_TOKEN']})
@@ -2737,16 +2739,22 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
         .execute(&f.store.pool)
         .await
         .unwrap();
-    for mode in ["invalid", "failure", "timeout", "rate"] {
+    for mode in ["invalid", "failure", "timeout", "rate", "rate-retrying"] {
         let mut config = fake_fx(scratch.path(), mode);
         if mode == "timeout" {
             config.timeout = std::time::Duration::from_millis(100);
         }
+        let started = std::time::Instant::now();
         let result =
             hx_server::fx::interpret_window(&f.store, w, &format!("synthetic-fx-{mode}"), &config)
                 .await;
         assert!(result.is_err(), "{mode}");
-        if mode == "rate" {
+        // A retrying usage limit must be noticed at once, not after the fx timeout.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "{mode}"
+        );
+        if mode.starts_with("rate") {
             assert!(matches!(
                 result.unwrap_err().downcast_ref::<hx_jobs::Deferred>(),
                 Some(hx_jobs::Deferred::RateLimited)
