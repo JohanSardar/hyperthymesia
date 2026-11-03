@@ -31,8 +31,9 @@ Prose repair follows the structured dependencies:
   episode is dropped by the existing reference check. Unaffected episode/task
   prose and goals remain byte-for-byte unchanged.
 - The summary is preserved only when no claims changed and no episodes or tasks
-  were removed. Otherwise it is rebuilt from retained episode titles ordered by
-  earliest interval start (stable input order breaks ties). Because summaries
+  were removed. Otherwise it is rebuilt as sentences from retained task titles,
+  plus titles of episodes no task covers, ordered by earliest interval start
+  (stable input order breaks ties). Because summaries
   have no assertion references, even one downgrade/removal requires rebuilding;
   a window-only correction does not. Removing a task also triggers rebuilding
   because the summary might repeat its unsupported prose or goal.
