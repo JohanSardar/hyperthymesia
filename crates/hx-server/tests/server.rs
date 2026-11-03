@@ -401,6 +401,65 @@ async fn search_filters_restricted_sensitive_and_foreign_namespaces() {
     f.close().await;
 }
 #[test]
+fn dashboard_lists_episodes_in_the_owners_local_time() {
+    let w = hx_schema::Interval {
+        start: Utc.with_ymd_and_hms(2026, 1, 1, 6, 0, 0).unwrap(),
+        end: Utc.with_ymd_and_hms(2026, 1, 2, 6, 0, 0).unwrap(),
+    };
+    let timeline = hx_compile::Timeline {
+        window: w,
+        compiler_version: "test".into(),
+        lanes: vec![],
+        points: vec![],
+        coverage: vec![],
+        aggregates: vec![],
+    };
+    let episode = |id: &str, h: u32, title: &str| {
+        json!({"id":id,"title":title,"description":"Wrote <b>notes</b>","evidence":[7],
+            "intervals":[{"start":Utc.with_ymd_and_hms(2026,1,1,h,0,0).unwrap(),"end":Utc.with_ymd_and_hms(2026,1,1,h,30,0).unwrap()}]})
+    };
+    let revision = json!({"revision_id":1,"has_agent_run":false,"interpretation":{
+        "window":{"start":"2026-01-01T16:00:00Z","end":"2026-01-01T20:00:00Z"},
+        "summary":"Drafted notes.","tasks":[],
+        "episodes":[episode("b",18,"Second"),episode("a",16,"First"),episode("old",2,"Before the day")]}});
+    let zone = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
+    let mut timeline = timeline;
+    // A span in the day's last instant must render rather than panic the worker.
+    timeline.lanes.push(hx_compile::Lane {
+        id: hx_compile::LaneId {
+            key: "device:test".into(),
+            kind: "focus".into(),
+        },
+        intervals: [
+            (0, 60, "Merged"),
+            (60, 120, "Merged"),
+            (86_399, 86_400, "Late"),
+        ]
+        .into_iter()
+        .map(|(a, b, label)| hx_compile::LaneInterval {
+            interval: hx_schema::Interval {
+                start: w.start + chrono::Duration::seconds(a),
+                end: w.start + chrono::Duration::seconds(b),
+            },
+            label: label.into(),
+            attrs: json!({}),
+            evidence: vec![1],
+            uncertain_edges: false,
+        })
+        .collect(),
+    });
+    let html = hx_server::dashboard::render_day(&timeline, &[revision], &[], zone).0;
+    assert_eq!(html.matches("title=\"Merged\"").count(), 1);
+    assert_eq!(html.matches("title=\"Late\"").count(), 1);
+    assert!(html.contains("Thursday, January 1, 2026"), "{html}");
+    assert!(html.contains("UTC−06:00"));
+    assert!(html.contains("10:00–14:00"));
+    let first = html.find("10:00–10:30").unwrap();
+    assert!(first < html.find("12:00–12:30").unwrap());
+    assert!(html.contains(">First</a>") && !html.contains(">Before the day<"));
+    assert!(html.contains("Wrote &lt;b&gt;notes&lt;/b&gt;"));
+}
+#[test]
 fn dashboard_escapes_malicious_title() {
     let w = hx_store::window_at(event("x", 8).time.observed_at);
     let title = "<script>alert('captured')</script>";
@@ -424,7 +483,13 @@ fn dashboard_escapes_malicious_title() {
         coverage: vec![],
         aggregates: vec![],
     };
-    let html = hx_server::dashboard::render_day(&timeline, &[], &[]).0;
+    let html = hx_server::dashboard::render_day(
+        &timeline,
+        &[],
+        &[],
+        chrono::FixedOffset::east_opt(0).unwrap(),
+    )
+    .0;
     assert!(!html.contains("<script>"));
     assert!(html.contains("&lt;script&gt;"));
     assert!(!html.contains("https://"));
