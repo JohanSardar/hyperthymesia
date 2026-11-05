@@ -32,6 +32,7 @@ pub struct MenuBar {
     actions: Retained<MenuActions>,
     pairing: Retained<NSMenuItem>,
     permissions: Retained<NSMenuItem>,
+    pair: Retained<NSMenuItem>,
     paired: bool,
 }
 impl MenuBar {
@@ -125,6 +126,7 @@ impl MenuBar {
             actions,
             pairing,
             permissions,
+            pair,
             paired: false,
         };
         this.update(None);
@@ -133,6 +135,8 @@ impl MenuBar {
     pub fn set_paired(&mut self, paired: bool) {
         self.paired = paired;
         self.pairing.setHidden(paired);
+        // Replacing a pairing redirects the outbox, so it stays a deliberate CLI step.
+        self.pair.setHidden(paired);
     }
     /// Harnesses can display onboarding without ever requesting privacy access.
     pub fn disable_permissions(&mut self) {

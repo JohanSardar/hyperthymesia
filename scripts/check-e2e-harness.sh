@@ -9,7 +9,7 @@ if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release -p hx-agent
   echo 'ERROR: e2e-harness compiled in release mode' >&2
   exit 1
 fi
-if ! rg -q 'e2e-harness must never be enabled in release builds' "$log"; then
+if ! grep -q 'e2e-harness must never be enabled in release builds' "$log"; then
   cat "$log" >&2
   exit 1
 fi
