@@ -1061,7 +1061,11 @@ async fn context_changes_invalidate_dependent_generations() {
 #[tokio::test]
 async fn runner_normalizes_then_schedules_cadence_and_day_revision() {
     let f = Fixture::new().await;
-    ingest(&f.store, vec![event("runner", 8)]).await;
+    // Cadence admission applies inside the first 24 hours, not to old backlog.
+    let w = hx_store::window_at(Utc::now() - Duration::hours(4));
+    let mut e = event("runner", 8);
+    e.time = ObservationTime::point(w.start);
+    ingest(&f.store, vec![e]).await;
     let runner = hx_server::processing::Runner {
         store: f.store.clone(),
         provider: hx_server::processing::StubProvider,
@@ -1254,13 +1258,19 @@ async fn synthetic_burst(browser_points: bool) {
     assert_eq!(unfinished, 0);
     let canonical: i64 = sqlx::query_scalar("SELECT count(*) FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE r.input_generation=w.generation").fetch_one(&f.store.pool).await.unwrap();
     assert_eq!(
-        canonical, 6,
-        "the context-only seventh window does not buy an interpretation"
+        canonical, 0,
+        "historical burst data compiles without buying uncapped primary runs"
     );
     hx_server::processing::schedule(&f.store).await.unwrap();
     while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
         settle_for_test(&f.store).await;
     }
+    let canonical: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM windows WHERE canonical_revision IS NOT NULL")
+            .fetch_one(&f.store.pool)
+            .await
+            .unwrap();
+    assert_eq!(canonical, 1, "the burst shares one capped daily sweep");
     let tail = hx_store::window_at(event("tail", 0).time.observed_at + Duration::days(1));
     let state = f.store.window_state(tail).await.unwrap();
     assert!(state.canonical_revision.is_none());
@@ -1349,11 +1359,14 @@ async fn coalesced_work_keeps_leases_and_requeues_new_input() {
 #[tokio::test]
 async fn pending_overlap_defers_interpretation_without_spending_attempts() {
     let f = Fixture::new().await;
-    let w = hx_store::window_at(event("target", 8).time.observed_at);
-    ingest(&f.store, vec![event("target-visible", 8)]).await;
+    // Exercise readiness while a primary run is still age-eligible.
+    let w = hx_store::window_at(Utc::now() - Duration::hours(4));
+    let mut target = event("target-visible", 8);
+    target.time = ObservationTime::point(w.start);
+    ingest(&f.store, vec![target]).await;
     f.store.normalize_window(w).await.unwrap();
     let mut e = event("overlap", 7);
-    e.time = ObservationTime::point(e.time.observed_at + Duration::minutes(45));
+    e.time = ObservationTime::point(w.start - Duration::minutes(15));
     ingest(&f.store, vec![e]).await;
     sqlx::query("UPDATE windows SET input_changed_at=now()-interval '1 hour'")
         .execute(&f.store.pool)
@@ -1407,7 +1420,7 @@ async fn pending_overlap_defers_interpretation_without_spending_attempts() {
             .unwrap();
     }
     f.store
-        .normalize_window(hx_store::window_at(event("overlap", 7).time.observed_at))
+        .normalize_window(hx_store::window_at(w.start - Duration::minutes(15)))
         .await
         .unwrap();
     assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
@@ -3182,7 +3195,11 @@ async fn interpretation_storm_coalesces_and_late_data_waits_for_rerun_policy() {
             .fetch_one(&f.store.pool)
             .await
             .unwrap();
-    assert_eq!(slots, 2);
+    assert_eq!(
+        slots, 0,
+        "historical generations cannot buy primary or 24h slots"
+    );
+    f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
     let g = f.store.generation(w).await.unwrap();
     let generations: Vec<i64> = sqlx::query_scalar(
         "SELECT (payload->>'generation')::bigint FROM jobs WHERE kind='interpret'",
@@ -3190,26 +3207,22 @@ async fn interpretation_storm_coalesces_and_late_data_waits_for_rerun_policy() {
     .fetch_all(&f.store.pool)
     .await
     .unwrap();
-    assert_eq!(generations, vec![g, g]);
-    // Even an early claim (e.g. finish requeued a superseded lease) must settle.
-    sqlx::query(
-        "UPDATE jobs SET available_at=now() WHERE queue='interactive' AND kind='interpret'",
-    )
-    .execute(&f.store.pool)
-    .await
-    .unwrap();
+    assert_eq!(generations, vec![g], "the sweep coalesces to one paid slot");
+    // Even a capped sweep must wait for the uploaded input to settle.
+    sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret' AND state='ready'")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
     assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
     assert_eq!(runner.provider.0.load(Ordering::SeqCst), 0);
-    let attempts: i32 = sqlx::query_scalar(
-        "SELECT attempts FROM jobs WHERE kind='interpret' AND queue='interactive'",
-    )
-    .fetch_one(&f.store.pool)
-    .await
-    .unwrap();
+    let attempts: i32 = sqlx::query_scalar("SELECT attempts FROM jobs WHERE kind='interpret'")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
     assert_eq!(attempts, 0);
     settle_for_test(&f.store).await;
     assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap()); // unchanged revision24
+    assert!(!hx_jobs::run_one(&f.store.pool, &runner).await.unwrap()); // no uncapped 24h slot
     assert_eq!(runner.provider.0.load(Ordering::SeqCst), 1);
     // Manual and old queued requests use the same pre-provider identity check.
     assert!(
@@ -3237,16 +3250,21 @@ async fn interpretation_storm_coalesces_and_late_data_waits_for_rerun_policy() {
 #[tokio::test]
 async fn interpretation_slot_preserves_lease_and_recovers_new_generation() {
     let f = Fixture::new().await;
-    let w = hx_store::window_at(event("lease", 8).time.observed_at);
+    // Keep the primary age-eligible while testing in-flight generation fencing.
+    let w = hx_store::window_at(Utc::now() - Duration::hours(4));
     let runner = hx_server::processing::Runner {
         store: f.store.clone(),
         provider: CountingProvider(std::sync::atomic::AtomicUsize::new(0)),
     };
-    ingest(&f.store, vec![event("lease-1", 8)]).await;
+    let mut first = event("lease-1", 8);
+    first.time = ObservationTime::point(w.start);
+    ingest(&f.store, vec![first]).await;
     compile_for_test(&runner, w).await;
     settle_for_test(&f.store).await;
     let job = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
-    ingest(&f.store, vec![event("lease-2", 8)]).await;
+    let mut second = event("lease-2", 8);
+    second.time = ObservationTime::point(w.start);
+    ingest(&f.store, vec![second]).await;
     compile_for_test(&runner, w).await;
     assert!(hx_jobs::heartbeat(&f.store.pool, &job, 120).await.unwrap());
     assert!(hx_jobs::finish(&f.store.pool, &job, None).await.unwrap());
@@ -3260,6 +3278,10 @@ async fn interpretation_slot_preserves_lease_and_recovers_new_generation() {
     settle_for_test(&f.store).await;
     let recovered = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
     assert_eq!(job.id, recovered.id);
+    assert_eq!(
+        recovered.attempts, 2,
+        "generation refresh preserves spent attempts"
+    );
     assert!(!hx_jobs::finish(&f.store.pool, &job, None).await.unwrap());
     hx_jobs::Handler::handle(&runner, &recovered).await.unwrap();
     hx_jobs::finish(&f.store.pool, &recovered, None)

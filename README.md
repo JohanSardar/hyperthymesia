@@ -44,8 +44,13 @@ docker compose up -d          # Postgres + pgvector on localhost:55432
 Interpretation uses one durable primary slot and one 24-hour catch-up slot per window.
 The primary waits until the window ends and its input has settled for
 `HX_INTERPRET_SETTLE_S` seconds (default `600`). New ingest, OCR, and prior context
-restart settling. Catch-up runs only when input changed since the served revision;
-all providers skip an already recorded input generation, prompt, model, and disclosure policy.
+restart settling. Catch-up runs only when the visible timeline or OCR lineage changed
+since the served revision. Historical windows without a revision and exhausted
+catch-up passes wait for the global daily sweep: one window and one paid attempt
+per UTC day, with a seven-day cooldown for unchanged failed or deferred input.
+Generation changes preserve paid retry budgets; explicit `hx interpret` requests
+remain available. All providers skip an already recorded input generation, prompt,
+model, and disclosure policy.
 
 Requires Rust 1.99 (pinned in `rust-toolchain.toml`), Docker, and macOS for the capture agent.
 
