@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
                             tracing::error!("scheduler failed: {e:#}");
                         }
                     }
-                    match hx_jobs::run_one(&runner.store.pool, &runner).await {
+                    match hx_jobs::run_one(&runner.store, &runner).await {
                         Ok(true) => continue,
                         Err(e) => tracing::error!("processing failed: {e:#}"),
                         Ok(false) => {}
