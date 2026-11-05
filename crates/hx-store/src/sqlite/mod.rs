@@ -24,33 +24,44 @@ pub struct Store {
 impl Store {
     /// Create a new core, refusing to overwrite an existing one. The CLI's
     /// separate agent outbox initialization belongs to the cutover, not here.
+    ///
+    /// The core is built aside and published last, so a failed or interrupted
+    /// create leaves nothing that a retry or `open` would have to refuse.
     pub async fn create(state_dir: impl AsRef<Path>) -> Result<Self> {
         let state_dir = state_dir.as_ref();
         tokio::fs::create_dir_all(state_dir).await?;
         let path = state_dir.join("core.sqlite");
-        // Reserve the path atomically. SQLite connections themselves never use
-        // CREATE, including later connections opened lazily by the pool.
-        drop(
-            tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .await
-                .with_context(|| format!("create {}", path.display()))?,
+        ensure!(
+            !tokio::fs::try_exists(&path).await?,
+            "{} already exists",
+            path.display()
         );
-        let store = Self::connect(state_dir).await?;
+        let aside = tempfile::Builder::new()
+            .prefix(".core-creating")
+            .tempdir_in(state_dir)?;
+        let building = aside.path().join("core.sqlite");
+        tokio::fs::File::create_new(&building).await?;
+        // No WAL here: closing leaves the whole database in this one file.
+        let store = Self::connect(&building, SqliteJournalMode::Delete).await?;
         let mut tx = store.begin_write().await?;
         MIGRATOR.run(&mut *tx).await?;
         tx.commit().await?;
+        store.pool.close().await;
         tokio::fs::create_dir_all(state_dir.join("blobs")).await?;
         tokio::fs::create_dir_all(state_dir.join("locks")).await?;
-        Ok(store)
+        // Unlike rename, a hard link cannot replace a core created meanwhile.
+        tokio::fs::hard_link(&building, &path)
+            .await
+            .with_context(|| format!("create {}", path.display()))?;
+        std::fs::File::open(state_dir)?.sync_all()?;
+        Self::open(state_dir).await
     }
 
     /// Open only a core initialized with this schema. Applying future
     /// migrations remains an explicit operation, never a side effect of serve.
     pub async fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
-        let store = Self::connect(state_dir.as_ref()).await?;
+        let path = state_dir.as_ref().join("core.sqlite");
+        let store = Self::connect(&path, SqliteJournalMode::Wal).await?;
         let applied: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
             "SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version",
         )
@@ -72,11 +83,11 @@ impl Store {
         Ok(store)
     }
 
-    async fn connect(state_dir: &Path) -> Result<Self> {
+    async fn connect(path: &Path, journal: SqliteJournalMode) -> Result<Self> {
         let options = SqliteConnectOptions::new()
-            .filename(state_dir.join("core.sqlite"))
+            .filename(path)
             .create_if_missing(false)
-            .journal_mode(SqliteJournalMode::Wal)
+            .journal_mode(journal)
             .busy_timeout(Duration::from_secs(30))
             .foreign_keys(true)
             .pragma("recursive_triggers", "ON")
