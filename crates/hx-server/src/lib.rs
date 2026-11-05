@@ -77,6 +77,7 @@ pub async fn auth(store: &Store, headers: &HeaderMap, scope: &str) -> ApiResult<
 }
 pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
     Router::new()
+        .route("/healthz", get(|| async { "ok\n" }))
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
         .route("/v1/events", post(events))
         .route("/v1/blobs/{sha256}", put(upload_blob).get(download_blob))
