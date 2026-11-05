@@ -95,7 +95,6 @@ fn run_inner(
     let mut last_hash = String::new();
     let mut last_health = Instant::now() - Duration::from_secs(45);
     let mut last_screen = None;
-    let mut recording = false;
     let mut retry = Instant::now() - Duration::from_secs(60);
     while !stop.load(Ordering::Relaxed) {
         let mut focus = context.lock().expect("capture context").clone();
@@ -149,7 +148,7 @@ fn run_inner(
                 CollectorStatus::PermissionDenied
             } else if !allowed {
                 CollectorStatus::Paused
-            } else if recording && failure.is_none() {
+            } else if failure.is_none() {
                 CollectorStatus::Running
             } else {
                 CollectorStatus::Failed
@@ -159,13 +158,9 @@ fn run_inner(
             } else if !allowed {
                 "Screen recording is paused.".into()
             } else {
-                failure.clone().unwrap_or_else(|| {
-                    if recording {
-                        "Recording the foreground window.".into()
-                    } else {
-                        "Waiting for screen recording to start.".into()
-                    }
-                })
+                failure
+                    .clone()
+                    .unwrap_or_else(|| "Recording the foreground window.".into())
             };
             send_health(
                 &mut producer,
@@ -181,7 +176,6 @@ fn run_inner(
             .is_some_and(|s| focus.as_ref() != Some(&s.focus));
         if !allowed || changed {
             session = None;
-            recording = false;
             if let Some(c) = chunk.take() {
                 finish(c, &mut producer, &tx)?;
             }
@@ -260,7 +254,7 @@ fn run_inner(
                 if let Some(c) = chunk.as_mut() {
                     if c.writer.append(&frame).map_err(anyhow::Error::msg)? {
                         c.last_frame = frame_time(producer.time(), frame.nanos);
-                        if !recording || failure.is_some() {
+                        if failure.take().is_some() {
                             send_health(
                                 &mut producer,
                                 &tx,
@@ -269,15 +263,13 @@ fn run_inner(
                                 "Screen recording recovered.".into(),
                                 0,
                             )?;
-                            recording = true;
-                            failure = None;
                         }
                     } else {
                         send_health(
                             &mut producer,
                             &tx,
                             &live,
-                            if recording && failure.is_none() {
+                            if failure.is_none() {
                                 CollectorStatus::Running
                             } else {
                                 CollectorStatus::Failed
