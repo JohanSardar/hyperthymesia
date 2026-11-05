@@ -2123,6 +2123,72 @@ async fn laptop_policy_turns_restricted_stills_into_ocr_text_only() {
 }
 
 #[tokio::test]
+async fn digest_only_cites_current_non_deleted_store_revisions() {
+    use hx_server::{mcp::Broker, processing::SensitiveEgress};
+    let f = Fixture::new().await;
+    let mut rows = vec![];
+    for (key, latest_hour, delete) in [
+        ("edited", 1, false),
+        ("moved", 8, false),
+        ("deleted", 1, true),
+        ("deleted-later", 8, true),
+    ] {
+        let mut old = event(key, 1);
+        old.kind = Kind::new("source.email");
+        old.operation = Operation::Upsert;
+        old.revision = Revision::new("old");
+        old.sequence = Some(1);
+        old.payload = json!({"title":format!("STALE_{key}")});
+        let mut latest = old.clone();
+        latest.observation_id = ObservationId::generate();
+        latest.revision = Revision::new("new");
+        latest.sequence = Some(2);
+        latest.time =
+            ObservationTime::point(Utc.with_ymd_and_hms(2026, 1, 1, latest_hour, 0, 0).unwrap());
+        latest.payload = json!({"title":format!("CURRENT_{key}")});
+        if delete {
+            latest.operation = Operation::Delete;
+        }
+        // Arrival order and lexical revision order must not beat producer sequence.
+        rows.extend([latest, old]);
+    }
+    let mut independent = event("edited", 2);
+    independent.kind = Kind::new("source.email");
+    independent.connector_instance = ConnectorInstance::new("test:other");
+    independent.payload = json!({"title":"INDEPENDENT_CONNECTOR"});
+    rows.push(independent);
+    ingest(&f.store, rows).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    let policy = DisclosurePolicy::from_json(
+        r#"{"rules":[{"connector_prefix":"test:","kind":"*","class":"normal"}]}"#,
+    )
+    .unwrap();
+    let broker = Broker::new(f.store.clone(), policy, SensitiveEgress::Full, w);
+    let digest = broker.digest().await.unwrap();
+    let audit = broker.audit.lock().await;
+    let evidence: Vec<_> = audit.digest_evidence.values().collect();
+    assert!(!digest.contains("STALE_"), "{digest}");
+    assert!(!digest.contains("CURRENT_deleted"), "{digest}");
+    assert!(!digest.contains("CURRENT_moved"), "{digest}");
+    assert!(digest.contains("CURRENT_edited") && digest.contains("INDEPENDENT_CONNECTOR"));
+    assert_eq!(evidence.len(), 2);
+    assert!(
+        evidence
+            .iter()
+            .all(|e| !e.text.contains("STALE_") && !e.text.contains("CURRENT_deleted"))
+    );
+    assert_eq!(audit.digest_support.len(), 2);
+    assert!(
+        audit
+            .digest_support
+            .keys()
+            .all(|id| audit.digest_evidence.contains_key(id))
+    );
+    drop(audit);
+    f.close().await;
+}
+
+#[tokio::test]
 async fn mcp_tools_are_bounded_and_current_policy_controls_all_context() {
     use hx_server::{disclosure::DisclosurePolicy, mcp::Broker, processing::SensitiveEgress};
     let f = Fixture::new().await;

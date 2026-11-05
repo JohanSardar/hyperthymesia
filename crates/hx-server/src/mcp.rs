@@ -106,6 +106,8 @@ impl Broker {
             .max(config.input_gap_s)
             .max(config.health_max_s)
             .max(config.visual_change_s);
+        // Fetch all revisions of candidate identities as well: an edit or
+        // tombstone outside this window can supersede a record inside it.
         let rows = self
             .store
             .digest_records(
@@ -118,13 +120,40 @@ impl Broker {
         let mut screens = vec![];
         let mut evidence = BTreeMap::new();
         let mut namespaces = std::collections::BTreeSet::new();
-        for row in rows {
-            let e: Envelope = serde_json::from_value(row.envelope)?;
-            let o = hx_compile::Observation {
-                id: row.id,
-                received_at: row.received_at,
-                envelope: e,
-            };
+        let observations: Vec<hx_compile::Observation> = rows
+            .into_iter()
+            .map(|row| {
+                Ok(hx_compile::Observation {
+                    id: row.id,
+                    received_at: row.received_at,
+                    envelope: serde_json::from_value(row.envelope)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let current: std::collections::BTreeSet<_> = hx_compile::latest_observations(&observations)
+            .into_iter()
+            .filter(|o| o.envelope.operation != hx_schema::Operation::Delete)
+            .map(|o| o.id)
+            .collect();
+        for o in observations {
+            // Extra revisions participate in selection only. Preserve the
+            // original time-bounded capture scan, including its lookback.
+            let at = o
+                .envelope
+                .time
+                .source_start
+                .unwrap_or(o.envelope.time.observed_at);
+            let end = o.envelope.time.source_end.unwrap_or(at);
+            if at >= self.window.end
+                || end < self.window.start - Duration::seconds(i64::from(lookback))
+            {
+                continue;
+            }
+            // Preserve core capture rendering; only current non-core source
+            // records enter the digest or its citable evidence sidecar.
+            if !hx_schema::kinds::is_core(o.envelope.kind.as_str()) && !current.contains(&o.id) {
+                continue;
+            }
             let e = &o.envelope;
             if matches!(
                 e.kind.as_str(),

@@ -943,7 +943,7 @@ time.sleep(10)
 "#).unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
     let credential = scratch.path().join("synthetic-auth.json");
-    std::fs::write(&credential, "synthetic-test-only").unwrap();
+    std::fs::write(&credential, "{}").unwrap();
     let config = hx_server::fx::Config {
         binary,
         credential,
