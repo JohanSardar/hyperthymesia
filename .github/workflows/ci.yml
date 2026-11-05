@@ -57,9 +57,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: clippy
-        run: cargo clippy -p hx-macos-sys -p hx-agent -p hx-agent-app --all-targets -- -D warnings
+        run: cargo clippy -p hx-macos-sys -p hx-agent -p hx-agent-app -p hx-visual --all-targets -- -D warnings
       - name: test
-        run: cargo test -p hx-macos-sys -p hx-agent -p hx-agent-app
+        run: cargo test -p hx-macos-sys -p hx-agent -p hx-agent-app -p hx-visual
 
   companions:
     name: Companions (bun)
