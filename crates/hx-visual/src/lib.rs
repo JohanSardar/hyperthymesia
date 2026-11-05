@@ -1,4 +1,4 @@
-//! Server-side OCR. Perceptual hashes are sampling hints, never cache identities.
+//! Shared OCR and sampling. Perceptual hashes are sampling hints, never cache identities.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -89,6 +89,45 @@ pub fn perceptual_hash(luminance_8x8: &[u8; 64]) -> u64 {
         })
 }
 
+/// Decode with bounded dimensions/allocation and hash the same luminance thumbnail
+/// on the server and device. Never use this sampling hint as an evidence identity.
+pub fn thumbnail_hash(bytes: &[u8]) -> Result<u64> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let thumb = reader
+        .decode()?
+        .resize_exact(8, 8, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    Ok(perceptual_hash(thumb.as_raw().as_slice().try_into()?))
+}
+
+/// Sampling threshold for a prior completed still. Callers must first restrict the
+/// candidate to the same device, display and app, within the preceding 30 seconds.
+/// A match skips OCR; it must never borrow the prior still's text.
+pub fn similar_thumbnail_hashes(current: u64, previous: u64) -> bool {
+    (current ^ previous).count_ones() <= 3
+}
+
+/// Includes the helper source/config and OS build: Vision behavior can change with macOS.
+pub fn vision_version() -> Result<String> {
+    anyhow::ensure!(cfg!(target_os = "macos"), "Vision requires macOS");
+    let os = Command::new("/usr/bin/sw_vers")
+        .arg("-buildVersion")
+        .output()?;
+    anyhow::ensure!(os.status.success(), "cannot identify Vision OS build");
+    Ok(format!(
+        "vision:{}:{}",
+        hex::encode(Sha256::digest(include_bytes!("../swift/ocr.swift"))),
+        String::from_utf8(os.stdout)?.trim()
+    ))
+}
+
+/// Uses `HX_VISION_HELPER`, then a sibling `hx-vision-ocr`, then a locally compiled
+/// Swift helper. An invalid explicit override is an error, not a compiler fallback.
 pub struct VisionCliEngine {
     target_dir: PathBuf,
 }
@@ -112,6 +151,17 @@ impl VisionCliEngine {
         if !cfg!(target_os = "macos") {
             bail!("Apple Vision OCR requires macOS");
         }
+        // An explicit override wins over the release/app bundle's sibling helper.
+        if let Some(helper) = std::env::var_os("HX_VISION_HELPER") {
+            let helper = PathBuf::from(helper);
+            anyhow::ensure!(helper.is_file(), "HX_VISION_HELPER is not a file");
+            return Ok(helper);
+        }
+        let helper = std::env::current_exe()?.with_file_name("hx-vision-ocr");
+        if helper.is_file() {
+            return Ok(helper);
+        }
+        // Development fallback only; releases do not require a Swift toolchain.
         let _lock = COMPILE_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("Swift compiler lock poisoned"))?;
@@ -166,6 +216,40 @@ impl OcrEngine for VisionCliEngine {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn thumbnail_sampling_preserves_pixels_and_decode_limits() {
+        let pixels =
+            image::GrayImage::from_fn(64, 64, |x, _| image::Luma([if x < 32 { 10 } else { 240 }]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(pixels)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(
+            thumbnail_hash(png.get_ref()).unwrap(),
+            0xf0f0_f0f0_f0f0_f0f0
+        );
+        assert!(thumbnail_hash(b"not an image").is_err());
+
+        let mut oversized = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(16385, 1))
+            .write_to(&mut oversized, image::ImageFormat::Png)
+            .unwrap();
+        assert!(thumbnail_hash(oversized.get_ref()).is_err());
+    }
+
+    #[test]
+    fn similarity_includes_three_bits_but_excludes_four() {
+        let hash = 0xf0f0_f0f0_f0f0_f0f0;
+        assert!(similar_thumbnail_hashes(hash, hash));
+        assert!(similar_thumbnail_hashes(hash, hash ^ 0x8000_0000_0000_0003));
+        assert!(similar_thumbnail_hashes(hash ^ 7, hash));
+        assert!(!similar_thumbnail_hashes(
+            hash,
+            hash ^ 0x8000_0000_0000_0007
+        ));
+    }
+
     struct Counting(AtomicUsize);
     impl OcrEngine for Counting {
         fn ocr(&self, _: &[u8], _: &str) -> Result<OcrResult> {
