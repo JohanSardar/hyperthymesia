@@ -28,6 +28,9 @@ async fn interpretation_lock_releases_on_process_death_and_drop() {
             "concurrency_tests::interpretation_lock_child",
             "--ignored",
             "--nocapture",
+            // Serial libtest prefixes stdout with its progress label, which
+            // would hide the standalone LOCKED protocol line from the parent.
+            "--test-threads=2",
         ])
         .env("HX_LOCK_TEST_DIR", &f.store.data_dir)
         .stdout(Stdio::piped())
