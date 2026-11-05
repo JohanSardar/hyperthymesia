@@ -47,6 +47,56 @@ pub fn status() -> Result<serde_json::Value> {
         serde_json::json!({"health":latest_health,"permissions":p,"profile":Profile::select(power,&cfg),"secure_input":hx_macos_sys::secure_input(),"collectors":{"focus":"available","presence":"available","text":if p.accessibility {"available"}else {"permission_denied"},"ui":if p.accessibility && p.input {"available"}else {"permission_denied"},"clock":"available","input":if p.input {"available"}else {"permission_denied"},"media":if p.screen {"not_started"}else {"permission_denied"}}}),
     )
 }
+pub(crate) fn screen_warning(health: Option<&serde_json::Value>, paused: bool) -> Option<String> {
+    if paused {
+        return None;
+    }
+    let media = health?.get("media")?;
+    match media["status"].as_str()? {
+        "paused" | "stopped" => None,
+        "permission_denied" => Some("Screen Recording permission is off. Enable it in System Settings > Privacy & Security > Screen Recording.".into()),
+        "failed" => {
+            let detail = media["detail"].as_str().unwrap_or("The capture service stopped.");
+            let lower = detail.to_lowercase();
+            Some(if lower.contains("file") || lower.contains("folder") || lower.contains("writer") || lower.contains("permission denied") || lower.contains("disk") {
+                "Cannot save screen recordings. Check free disk space and recording folder permissions. Retrying automatically.".into()
+            } else {
+                format!("Screen recording stopped: {}. Retrying automatically.", detail.chars().take(180).collect::<String>())
+            })
+        }
+        "running" => {
+            let observed = media["observed_at"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+            if observed.is_none_or(|at| (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds() >= 55) {
+                Some("Screen recording is not responding. Waiting for it to recover.".into())
+            } else { None }
+        }
+        _ => None,
+    }
+}
+fn upload_warning(health: &serde_json::Value) -> Option<String> {
+    match health["upload"]["dropped"].as_u64()? {
+        0 => None,
+        n => Some(format!(
+            "The server refused {n} records. They are saved on this Mac."
+        )),
+    }
+}
+fn save_health(
+    dir: &std::path::Path,
+    latest: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    std::fs::write(dir.join("health.json.tmp"), serde_json::to_vec(latest)?)?;
+    std::fs::rename(dir.join("health.json.tmp"), dir.join("health.json"))?;
+    Ok(())
+}
+fn upload_health(outbox: &Outbox) -> Result<serde_json::Value> {
+    let dropped = outbox.dead_letter_count()?;
+    Ok(
+        serde_json::json!({"collector":"upload","status":if dropped == 0 {"running"} else {"failed"},
+        "dropped":dropped,"observed_at":chrono::Utc::now(),
+        "detail":if dropped == 0 {None} else {Some("The server refused some records. They are saved locally for inspection.")}}),
+    )
+}
 fn io_worker(
     config: Config,
     rx: tokio::sync::mpsc::Receiver<Submission>,
@@ -71,16 +121,18 @@ fn io_worker_at(
         let mut outbox=Outbox::open(&dir.join("outbox.sqlite"),config.event_budget_bytes,config.media_budget_bytes)?;
         outbox.reconcile(Producer::new(config.device_id.clone())?.time())?;
         let mut latest_health=serde_json::Map::new();
+        latest_health.insert("upload".into(),upload_health(&outbox)?);
+        save_health(&dir,&latest_health)?;
         let mut uploader=Uploader::new(&config)?;let mut rx=rx;let mut next=tokio::time::Instant::now()+uploader.delay();
         loop {tokio::select! {
             item=rx.recv()=>match item {Some(Submission {mut envelope,reply,focus,secure,blobs})=>{
                 if envelope.kind.as_str()=="collector.health" {envelope.payload["queue_age_ms"]=serde_json::json!(outbox.queue_age_ms()?);
-                    if let Some(name)=envelope.payload["collector"].as_str(){latest_health.insert(name.into(),envelope.payload.clone());std::fs::write(dir.join("health.json.tmp"),serde_json::to_vec(&latest_health)?)?;std::fs::rename(dir.join("health.json.tmp"),dir.join("health.json"))?;}
+                    if let Some(name)=envelope.payload["collector"].as_str(){let mut payload=envelope.payload.clone();payload["observed_at"]=serde_json::json!(envelope.time.observed_at);latest_health.insert(name.into(),payload);save_health(&dir,&latest_health)?;}
                 }
                 if let Err(e)=envelope.validate() {eprintln!("dropped invalid {} record: {e}",envelope.kind.as_str());if let Some(reply)=reply {let _=reply.send(false);}continue;}
                 let result=crate::policy::persist(&mut outbox,&policy,focus.as_ref(),secure,&envelope,&blobs);if let Some(reply)=reply {let _=reply.send(matches!(&result,Ok(true)));}
                 if let Err(e)=result {eprintln!("outbox: {e}");stop.store(true,Ordering::Relaxed);return Err(e);}},None=>break},
-            ()=tokio::time::sleep_until(next)=>{if !config.token.is_empty() && let Err(e)=uploader.once(&mut outbox).await {eprintln!("upload retained for retry: {e}");}next=tokio::time::Instant::now()+uploader.delay();}
+            ()=tokio::time::sleep_until(next)=>{if !config.token.is_empty() && let Err(e)=uploader.once(&mut outbox).await {eprintln!("upload retained for retry: {e}");}latest_health.insert("upload".into(),upload_health(&outbox)?);save_health(&dir,&latest_health)?;next=tokio::time::Instant::now()+uploader.delay();}
         }}
         Ok(())
     })
@@ -257,8 +309,9 @@ pub fn run(options: RunOptions) -> Result<()> {
     let paused = options
         .paused
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let quit_requested = Arc::new(AtomicBool::new(false));
     let mut menu = if options.menu_bar {
-        hx_macos_sys::MenuBar::new(paused.clone(), stop.clone())
+        hx_macos_sys::MenuBar::new(paused.clone(), stop.clone(), quit_requested.clone())
     } else {
         None
     };
@@ -280,6 +333,7 @@ pub fn run(options: RunOptions) -> Result<()> {
         Some(std::thread::spawn(move || io_worker(cfg, rx, stop)))
     };
     let capture_context = Arc::new(std::sync::Mutex::new(None::<Focus>));
+    let live_media_health = Arc::new(std::sync::Mutex::new(None));
     let media_stop = stop.clone();
     let media = if options.dry_run {
         None
@@ -288,8 +342,9 @@ pub fn run(options: RunOptions) -> Result<()> {
         let cfg = cfg.clone();
         let context = capture_context.clone();
         let paused = paused.clone();
+        let live = live_media_health.clone();
         Some(std::thread::spawn(move || {
-            crate::media::run(cfg, tx, context, paused, media_stop)
+            crate::media::run(cfg, tx, context, paused, media_stop, live)
         }))
     };
     let emit = |envelope: Envelope, reply: Option<mpsc::SyncSender<bool>>| {
@@ -356,6 +411,9 @@ pub fn run(options: RunOptions) -> Result<()> {
     let mut policy_gap = crate::gap::PolicyGap::default();
     let mut last_gap_update = Instant::now();
     let mut last_permissions = hx_macos_sys::permissions();
+    let mut menu_health_check = Instant::now() - Duration::from_secs(1);
+    let mut menu_health = None;
+    let mut menu_upload = None;
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed)
             && options
@@ -363,8 +421,25 @@ pub fn run(options: RunOptions) -> Result<()> {
                 .is_none_or(|s| start.elapsed() < Duration::from_secs(s))
         {
             main_loop.pump(Duration::from_millis(50));
+            if media
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                anyhow::bail!("screen capture worker stopped unexpectedly");
+            }
             if let Some(menu) = &mut menu {
-                menu.update();
+                if menu_health_check.elapsed() >= Duration::from_secs(1) {
+                    menu_health = live_media_health.lock().expect("screen health").clone();
+                    menu_upload = std::fs::read(support_dir().join("health.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        .as_ref()
+                        .and_then(upload_warning);
+                    menu_health_check = Instant::now();
+                }
+                let warning = screen_warning(menu_health.as_ref(), paused.load(Ordering::Relaxed))
+                    .or_else(|| menu_upload.clone());
+                menu.update(warning.as_deref());
             }
             let mut changed = ax_observer.as_ref().is_some_and(|o| o.take_changed());
             while let Some(signal) = main_loop.pop() {
@@ -803,11 +878,21 @@ pub fn run(options: RunOptions) -> Result<()> {
     if let Some(t) = media {
         let _ = t.join();
     }
-    if let Some(t) = worker {
+    let worker_result = if let Some(t) = worker {
         t.join()
-            .map_err(|_| anyhow::anyhow!("I/O worker panicked"))??;
+            .map_err(|_| anyhow::anyhow!("I/O worker panicked"))
+            .and_then(|r| r)
+    } else {
+        Ok(())
+    };
+    if quit_requested.load(Ordering::Relaxed) {
+        // launchd's SuccessfulExit=false must see a successful deliberate Quit,
+        // even if an encoder or upload failed during shutdown.
+        Ok(())
+    } else {
+        worker_result?;
+        result
     }
-    result
 }
 
 #[cfg(test)]

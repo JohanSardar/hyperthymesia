@@ -132,7 +132,10 @@ impl DisclosurePolicy {
                             .is_some_and(|value| !value.is_null())
                     })
             })
-            .map_or(envelope.sensitivity, |rule| rule.class)
+            .map_or_else(
+                || hx_schema::kinds::stored_class(envelope.kind.as_str(), envelope.sensitivity),
+                |rule| rule.class,
+            )
     }
 
     pub fn digest(&self) -> String {
@@ -155,6 +158,30 @@ mod tests {
         e.kind = hx_schema::Kind::new(kind);
         e.sensitivity = Sensitivity::Restricted;
         e
+    }
+
+    #[test]
+    fn unknown_kinds_stay_withheld_until_a_rule_grants_them() {
+        let mut unknown = envelope("mcp-source:synthetic", "synthetic.document");
+        unknown.sensitivity = Sensitivity::Normal;
+        for policy in [DisclosurePolicy::default(), DisclosurePolicy::laptop()] {
+            assert_eq!(policy.effective_class(&unknown), Sensitivity::Restricted);
+        }
+        let mut known = envelope("mcp-source:synthetic", "web.visit");
+        known.sensitivity = Sensitivity::Normal;
+        assert_eq!(
+            DisclosurePolicy::default().effective_class(&known),
+            Sensitivity::Normal
+        );
+        let grant = DisclosurePolicy {
+            rules: vec![DisclosureRule {
+                connector_prefix: "mcp-source:".into(),
+                kind: "synthetic.*".into(),
+                class: Sensitivity::Normal,
+                field_present: None,
+            }],
+        };
+        assert_eq!(grant.effective_class(&unknown), Sensitivity::Normal);
     }
 
     #[test]

@@ -71,3 +71,13 @@ replaced with a length-class placeholder; times and observation IDs are normaliz
 for deterministic output. `input.jsonl` fixtures are entirely synthetic parser
 inputs, while `envelopes.ndjson` samples are anonymized connector outputs. The
 privacy test rejects paths, emails, URLs, and prose in the whole fixture tree.
+
+A complete acknowledgement may refuse individual records. Sync commits those
+original envelopes and reasons to `<instance>.dead-letter.sqlite` (`dead_letters`
+table) before advancing the cursor, and writes the cumulative refusal count to
+`<instance>.health.json` as `upload.dropped`. Later batches continue. An interrupted
+checkpoint write can replay the batch; dead-letter inserts are idempotent by
+observation ID. HTTP auth/overload errors and malformed or incomplete acknowledgements
+keep the pending batch and cursor intact. Low-level `upload()` returns the validated
+`UploadAck`; callers outside `run_cli()` must retain its rejected records before
+advancing their own checkpoint.

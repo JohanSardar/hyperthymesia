@@ -57,7 +57,7 @@ A typed policy-gap payload would replace the current extension convention.
 ## Verification
 
 After `source ~/.cargo/env`, with
-`CARGO_TARGET_DIR=/Users/example/Hyperthymesia/.target-core`:
+`CARGO_TARGET_DIR=$HOME/Hyperthymesia/.target-core`:
 
 ```
 cargo test -p hx-compile

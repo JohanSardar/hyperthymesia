@@ -20,12 +20,19 @@ unsafe impl Sync for Frame {}
 struct OutputState {
     frames: ArrayQueue<Frame>,
     dropped: AtomicU64,
+    failure: Mutex<Option<String>>,
 }
 define_class!(
     #[unsafe(super=NSObject)]
     #[ivars=Arc<OutputState>]
     struct Output;
     unsafe impl NSObjectProtocol for Output {}
+    unsafe impl SCStreamDelegate for Output {
+        #[unsafe(method(stream:didStopWithError:))]
+        unsafe fn stopped(&self, _stream: &SCStream, error: &NSError) {
+            *self.ivars().failure.lock().expect("stream failure") = Some(error.to_string());
+        }
+    }
     unsafe impl SCStreamOutput for Output {
         #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
         unsafe fn output(&self,_stream:&SCStream,sample:&CMSampleBuffer,kind:SCStreamOutputType) {
@@ -139,13 +146,22 @@ impl ScreenStream {
                         config.setQueueDepth(3);
                         config.setShowsCursor(false);
                         config.setCapturesAudio(false);
+                        let state = Arc::new(OutputState {
+                            frames: ArrayQueue::new(3),
+                            dropped: AtomicU64::new(0),
+                            failure: Mutex::new(None),
+                        });
+                        let output: Retained<Output> = {
+                            let obj = Output::alloc().set_ivars(state.clone());
+                            msg_send![super(obj), init]
+                        };
                         let stream = SCStream::initWithFilter_configuration_delegate(
                             SCStream::alloc(),
                             &filter,
                             &config,
-                            None,
+                            Some(ProtocolObject::from_ref(&*output)),
                         );
-                        Ok((stream, width, height))
+                        Ok((stream, width, height, output, state))
                     }
                 })();
                 let _ = tx.try_send(result);
@@ -154,17 +170,9 @@ impl ScreenStream {
         unsafe {
             SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(true,true,&block);
         }
-        let (stream, width, height) = rx
+        let (stream, width, height, output, state) = rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|e| e.to_string())??;
-        let state = Arc::new(OutputState {
-            frames: ArrayQueue::new(3),
-            dropped: AtomicU64::new(0),
-        });
-        let output: Retained<Output> = unsafe {
-            let obj = Output::alloc().set_ivars(state.clone());
-            msg_send![super(obj), init]
-        };
         unsafe {
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(
@@ -185,6 +193,9 @@ impl ScreenStream {
     }
     pub fn pop(&self) -> Option<Frame> {
         self.state.frames.pop()
+    }
+    pub fn failure(&self) -> Option<String> {
+        self.state.failure.lock().expect("stream failure").clone()
     }
     pub fn dropped(&self) -> u64 {
         self.state.dropped.load(Ordering::Relaxed)
@@ -225,6 +236,7 @@ impl Frame {
     }
 }
 pub struct VideoWriter {
+    path: std::path::PathBuf,
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
     started: bool,
@@ -277,6 +289,7 @@ impl VideoWriter {
                 return Err(format!("writer start: {:?}", writer.error()));
             }
             Ok(Self {
+                path: path.into(),
                 writer,
                 input,
                 started: false,
@@ -286,6 +299,9 @@ impl VideoWriter {
     }
     pub fn append(&mut self, frame: &Frame) -> Result<bool, String> {
         unsafe {
+            if self.writer.status() != AVAssetWriterStatus::Writing {
+                return Err(format!("writer stopped: {:?}", self.writer.error()));
+            }
             if !self.started {
                 self.writer
                     .startSessionAtSourceTime(frame.sample.presentation_time_stamp());
@@ -315,6 +331,17 @@ impl VideoWriter {
                 return Err(format!("writer finish: {:?}", self.writer.error()));
             }
             Ok(())
+        }
+    }
+}
+
+impl Drop for VideoWriter {
+    fn drop(&mut self) {
+        unsafe {
+            if self.writer.status() != AVAssetWriterStatus::Completed {
+                self.writer.cancelWriting();
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 }

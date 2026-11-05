@@ -24,7 +24,7 @@ Content-change triggering alone does not bound bytes: scrolling and video can ch
 
 This is the same remedy proposed in round 1: import existing app-day estimates now; add a bounded raw InFocus-transition export to Apple Bridge; reconstruct estimated intervals on Hyperthymesia's server after qualification. Include native timing/device identity, decoder provenance, gaps, and lock evidence where available. Missing lock evidence remains missing. Transition support is not required to ship the honest aggregate view.
 
-Current code confirms the distinction: [UsageSource.swift:68](/Users/example/apple-bridge/native/Sources/UsageSource/UsageSource.swift:68) exports rollups, and [UsageRollup.swift:19](/Users/example/apple-bridge/native/Sources/UsageSource/UsageRollup.swift:19) caps sessions at four hours. Its output explicitly labels unproven parity, omitted unclosed sessions, and delayed remote batches. Owning the bridge makes extending it practical; it does not itself establish phone coverage or second-accurate timing.
+Current code confirms the distinction: [UsageSource.swift:68](apple-bridge/native/Sources/UsageSource/UsageSource.swift:68) exports rollups, and [UsageRollup.swift:19](apple-bridge/native/Sources/UsageSource/UsageRollup.swift:19) caps sessions at four hours. Its output explicitly labels unproven parity, omitted unclosed sessions, and delayed remote batches. Owning the bridge makes extending it practical; it does not itself establish phone coverage or second-accurate timing.
 
 ## 4. #26 Gate A scope — AGREE WITH AMENDMENT
 

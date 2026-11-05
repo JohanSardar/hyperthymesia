@@ -32,6 +32,7 @@ impl Outbox {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, identity TEXT UNIQUE NOT NULL, json BLOB NOT NULL, bytes INTEGER NOT NULL, created INTEGER NOT NULL DEFAULT (unixepoch())); CREATE TABLE IF NOT EXISTS blobs (sha TEXT PRIMARY KEY, media_type TEXT NOT NULL, data BLOB NOT NULL, bytes INTEGER NOT NULL, created INTEGER NOT NULL DEFAULT(unixepoch())); CREATE TABLE IF NOT EXISTS refs (event INTEGER NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(event,sha)); CREATE TABLE IF NOT EXISTS pending (singleton INTEGER PRIMARY KEY CHECK(singleton=1), json BLOB NOT NULL); CREATE TABLE IF NOT EXISTS losses (id INTEGER PRIMARY KEY, sha TEXT NOT NULL, bytes INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS sequences (connector TEXT PRIMARY KEY, value INTEGER NOT NULL);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS reserved_events (identity TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS open_intervals (connector TEXT NOT NULL, source_key TEXT NOT NULL, json BLOB NOT NULL, PRIMARY KEY(connector,source_key)); CREATE TABLE IF NOT EXISTS observed (connector TEXT PRIMARY KEY, json BLOB NOT NULL); CREATE TABLE IF NOT EXISTS checkpoint_version (version INTEGER PRIMARY KEY);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS dead_letters (identity TEXT PRIMARY KEY, batch_id TEXT NOT NULL, json BLOB NOT NULL, reason TEXT NOT NULL, rejected_at INTEGER NOT NULL DEFAULT(unixepoch())); CREATE TABLE IF NOT EXISTS dead_letter_refs (identity TEXT NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(identity,sha));")?;
         // Migrate the outstanding history once. New checkpoints survive acknowledgments.
         if db.query_row("SELECT COUNT(*) FROM checkpoint_version", [], |r| {
             r.get::<_, i64>(0)
@@ -138,7 +139,7 @@ impl Outbox {
             if used <= self.media_budget {
                 break;
             }
-            let mut query = tx.prepare("SELECT sha,bytes FROM blobs ORDER BY created,rowid")?;
+            let mut query = tx.prepare("SELECT sha,bytes FROM blobs WHERE sha NOT IN (SELECT sha FROM dead_letter_refs) ORDER BY created,rowid")?;
             let rows = query
                 .query_map([], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
@@ -467,17 +468,30 @@ impl Outbox {
         let Some(batch) = self.batch()? else {
             anyhow::bail!("no pending batch");
         };
-        ensure!(batch.batch_id == ack.batch_id, "ack batch mismatch");
-        ensure!(
-            ack.accepted as usize + ack.duplicates as usize + ack.rejected.len()
-                == batch.envelopes.len(),
-            "incomplete ack"
-        );
-        ensure!(
-            ack.rejected.is_empty(),
-            "server rejected observations; retained for investigation"
-        );
+        ack.validate_for(&batch).map_err(anyhow::Error::msg)?;
         let tx = self.db.transaction()?;
+        for rejected in &ack.rejected {
+            let e = batch
+                .envelopes
+                .iter()
+                .find(|e| e.observation_id == rejected.observation_id)
+                .expect("validated rejection");
+            tx.execute(
+                "INSERT OR IGNORE INTO dead_letters(identity,batch_id,json,reason) VALUES(?,?,?,?)",
+                params![
+                    e.observation_id.to_string(),
+                    batch.batch_id.to_string(),
+                    serde_json::to_vec(e)?,
+                    rejected.reason
+                ],
+            )?;
+            for blob in &e.blobs {
+                tx.execute(
+                    "INSERT OR IGNORE INTO dead_letter_refs(identity,sha) VALUES(?,?)",
+                    params![e.observation_id.to_string(), blob.sha256],
+                )?;
+            }
+        }
         for e in batch.envelopes {
             tx.execute(
                 "DELETE FROM refs WHERE event IN (SELECT id FROM events WHERE identity=?)",
@@ -489,7 +503,7 @@ impl Outbox {
             )?;
         }
         tx.execute(
-            "DELETE FROM blobs WHERE sha NOT IN (SELECT sha FROM refs)",
+            "DELETE FROM blobs WHERE sha NOT IN (SELECT sha FROM refs UNION SELECT sha FROM dead_letter_refs)",
             [],
         )?;
         tx.execute(
@@ -499,6 +513,13 @@ impl Outbox {
         tx.execute("DELETE FROM pending", [])?;
         tx.commit()?;
         Ok(())
+    }
+    pub fn dead_letter_count(&self) -> Result<u64> {
+        Ok(self
+            .db
+            .query_row("SELECT COUNT(*) FROM dead_letters", [], |r| {
+                r.get::<_, i64>(0)
+            })? as u64)
     }
     pub fn stats(&self) -> Result<(i64, i64, i64)> {
         Ok((
