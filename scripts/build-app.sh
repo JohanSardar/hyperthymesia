@@ -9,10 +9,12 @@ fi
 if (( $# )); then print -u2 -- "usage: $0 [--e2e [output-directory]]"; exit 2; fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/.target-native}"
 cargo build --release -p hx-agent -p hx-agent-app
+swiftc -O "$PWD/crates/hx-visual/swift/ocr.swift" -o "$CARGO_TARGET_DIR/release/hx-vision-ocr"
 app="$PWD/dist/Hyperthymesia.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$CARGO_TARGET_DIR/release/hx-agent-app" "$app/Contents/MacOS/Hyperthymesia"
 cp "$CARGO_TARGET_DIR/release/hx-agent" "$app/Contents/MacOS/hx-agent"
+cp "$CARGO_TARGET_DIR/release/hx-vision-ocr" "$app/Contents/MacOS/hx-vision-ocr"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -56,6 +58,7 @@ fi
 flags=(--force --sign "$identity")
 [[ "$identity" != - ]] && flags+=(--options runtime)
 codesign "${flags[@]}" "$app/Contents/MacOS/hx-agent"
+codesign "${flags[@]}" "$app/Contents/MacOS/hx-vision-ocr"
 codesign "${flags[@]}" "$app"
 codesign --verify --deep --strict "$app"
 print -r -- "$app"
