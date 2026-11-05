@@ -126,6 +126,23 @@ pub(crate) fn io_worker_at(
         let mut uploader=LiveUploader::new(&config)?;let mut rx=rx;let mut next=tokio::time::Instant::now()+uploader.delay();
         let mut reload = tokio::time::interval(Duration::from_secs(1));
         reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // OCR has a separate connection/task: slow helper or network work must
+        // never delay capture persistence, companion replies or credential reload.
+        let mut ocr_outbox=Outbox::open(&dir.join("outbox.sqlite"),config.event_budget_bytes,config.media_budget_bytes)?;
+        let mut ocr_uploader=LiveUploader::new(&config)?;
+        let ocr_config=config.clone();let ocr_dir=dir.clone();let ocr_stop=stop.clone();
+        let mut ocr_workers=tokio::task::JoinSet::new();
+        ocr_workers.spawn(async move {
+            let mut tick=tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if ocr_stop.load(Ordering::Relaxed) {break;}
+                if ocr_uploader.reload(&ocr_dir).is_err() {eprintln!("cannot reload device OCR credentials");continue;}
+                let saver=Profile::select(hx_macos_sys::power(),&ocr_config)==Profile::Saver;
+                if ocr_uploader.ocr_once(&mut ocr_outbox,saver).await.is_err() {eprintln!("device OCR retained for retry");}
+            }
+        });
         loop {tokio::select! {
             _=reload.tick()=>match uploader.reload(&dir) {
                 Ok(true) => next=tokio::time::Instant::now(),

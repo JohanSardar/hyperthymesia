@@ -25,6 +25,12 @@ pub struct Loss {
     pub sha256: String,
     pub bytes: u64,
 }
+/// Durable OCR metadata only. Recognized text never enters SQLite.
+#[derive(Clone)]
+pub(crate) struct OcrJob {
+    pub sha: String,
+    pub attempts: u32,
+}
 impl Outbox {
     pub fn open(path: &Path, event_budget: u64, media_budget: u64) -> Result<Self> {
         let db = Connection::open(path)?;
@@ -33,6 +39,9 @@ impl Outbox {
         db.execute_batch("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, identity TEXT UNIQUE NOT NULL, json BLOB NOT NULL, bytes INTEGER NOT NULL, created INTEGER NOT NULL DEFAULT (unixepoch())); CREATE TABLE IF NOT EXISTS blobs (sha TEXT PRIMARY KEY, media_type TEXT NOT NULL, data BLOB NOT NULL, bytes INTEGER NOT NULL, created INTEGER NOT NULL DEFAULT(unixepoch())); CREATE TABLE IF NOT EXISTS refs (event INTEGER NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(event,sha)); CREATE TABLE IF NOT EXISTS pending (singleton INTEGER PRIMARY KEY CHECK(singleton=1), json BLOB NOT NULL); CREATE TABLE IF NOT EXISTS losses (id INTEGER PRIMARY KEY, sha TEXT NOT NULL, bytes INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS sequences (connector TEXT PRIMARY KEY, value INTEGER NOT NULL);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS reserved_events (identity TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS open_intervals (connector TEXT NOT NULL, source_key TEXT NOT NULL, json BLOB NOT NULL, PRIMARY KEY(connector,source_key)); CREATE TABLE IF NOT EXISTS observed (connector TEXT PRIMARY KEY, json BLOB NOT NULL); CREATE TABLE IF NOT EXISTS checkpoint_version (version INTEGER PRIMARY KEY);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS dead_letters (identity TEXT PRIMARY KEY, batch_id TEXT NOT NULL, json BLOB NOT NULL, reason TEXT NOT NULL, rejected_at INTEGER NOT NULL DEFAULT(unixepoch())); CREATE TABLE IF NOT EXISTS dead_letter_refs (identity TEXT NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(identity,sha));")?;
+        // Additive migration: never rewrite existing events, pending batches or blobs.
+        db.execute_batch("CREATE TABLE IF NOT EXISTS ocr_queue (sha TEXT PRIMARY KEY, connector TEXT NOT NULL, device TEXT, display TEXT, app TEXT, captured INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS ocr_history (sha TEXT PRIMARY KEY, connector TEXT NOT NULL, device TEXT, display TEXT, app TEXT, captured INTEGER NOT NULL, engine_version TEXT NOT NULL, perceptual_hash TEXT NOT NULL);")?;
         // Migrate the outstanding history once. New checkpoints survive acknowledgments.
         if db.query_row("SELECT COUNT(*) FROM checkpoint_version", [], |r| {
             r.get::<_, i64>(0)
@@ -139,7 +148,7 @@ impl Outbox {
             if used <= self.media_budget {
                 break;
             }
-            let mut query = tx.prepare("SELECT sha,bytes FROM blobs WHERE sha NOT IN (SELECT sha FROM dead_letter_refs) ORDER BY created,rowid")?;
+            let mut query = tx.prepare("SELECT sha,bytes FROM blobs WHERE sha NOT IN (SELECT sha FROM dead_letter_refs UNION SELECT sha FROM ocr_queue) ORDER BY created,rowid")?;
             let rows = query
                 .query_map([], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
@@ -465,6 +474,9 @@ impl Outbox {
             .optional()?)
     }
     pub fn ack(&mut self, ack: &UploadAck) -> Result<()> {
+        self.ack_with_ocr(ack, false)
+    }
+    pub(crate) fn ack_with_ocr(&mut self, ack: &UploadAck, device_ocr: bool) -> Result<()> {
         let Some(batch) = self.batch()? else {
             anyhow::bail!("no pending batch");
         };
@@ -493,6 +505,18 @@ impl Outbox {
             }
         }
         for e in batch.envelopes {
+            if device_ocr
+                && e.kind.as_str() == "media.still"
+                && !ack
+                    .rejected
+                    .iter()
+                    .any(|r| r.observation_id == e.observation_id)
+            {
+                for blob in &e.blobs {
+                    tx.execute("INSERT OR IGNORE INTO ocr_queue(sha,connector,device,display,app,captured) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM blobs WHERE sha=?) AND NOT EXISTS(SELECT 1 FROM ocr_history WHERE sha=?)",
+                        params![blob.sha256,e.connector_instance.as_str(),e.device.as_ref().map(|d| d.as_str()),e.payload["display"].as_str(),e.payload["app_bundle_id"].as_str(),e.time.source_start.unwrap_or(e.time.observed_at).timestamp_millis(),blob.sha256,blob.sha256])?;
+                }
+            }
             tx.execute(
                 "DELETE FROM refs WHERE event IN (SELECT id FROM events WHERE identity=?)",
                 [e.observation_id.to_string()],
@@ -503,7 +527,7 @@ impl Outbox {
             )?;
         }
         tx.execute(
-            "DELETE FROM blobs WHERE sha NOT IN (SELECT sha FROM refs UNION SELECT sha FROM dead_letter_refs)",
+            "DELETE FROM blobs WHERE sha NOT IN (SELECT sha FROM refs UNION SELECT sha FROM dead_letter_refs UNION SELECT sha FROM ocr_queue)",
             [],
         )?;
         tx.execute(
@@ -511,6 +535,33 @@ impl Outbox {
             [],
         )?;
         tx.execute("DELETE FROM pending", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn next_ocr(&self, now_ms: i64) -> Result<Option<OcrJob>> {
+        Ok(self.db.query_row("SELECT sha,attempts FROM ocr_queue WHERE available<=? ORDER BY captured,sha LIMIT 1", [now_ms], |r| Ok(OcrJob { sha: r.get(0)?, attempts: r.get(1)? })).optional()?)
+    }
+    pub(crate) fn previous_ocr(&self, sha: &str, version: &str) -> Result<Option<(String, u64)>> {
+        let prior: Option<(String, String)> = self.db.query_row("SELECT h.sha,h.perceptual_hash FROM ocr_history h JOIN ocr_queue q ON q.sha=? WHERE h.engine_version=? AND h.connector=q.connector AND h.device IS q.device AND h.display IS q.display AND h.app IS q.app AND h.captured BETWEEN q.captured-30000 AND q.captured ORDER BY h.captured DESC,h.rowid DESC LIMIT 1", params![sha,version], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        prior
+            .map(|(sha, hash)| Ok((sha, u64::from_str_radix(&hash, 16)?)))
+            .transpose()
+    }
+    pub(crate) fn fail_ocr(&mut self, sha: &str, now_ms: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE ocr_queue SET attempts=attempts+1,available=? WHERE sha=?",
+            params![now_ms.saturating_add(30000), sha],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn finish_ocr(&mut self, sha: &str, request: &protocol::OcrRequest) -> Result<()> {
+        let tx = self.db.transaction()?;
+        if request.status == protocol::OcrStatus::Complete {
+            tx.execute("INSERT OR REPLACE INTO ocr_history SELECT sha,connector,device,display,app,captured,?,? FROM ocr_queue WHERE sha=?", params![request.engine_version,request.perceptual_hash,sha])?;
+            tx.execute("DELETE FROM ocr_history WHERE captured < (SELECT MAX(captured)-30000 FROM ocr_history)", [])?;
+        }
+        tx.execute("DELETE FROM ocr_queue WHERE sha=?", [sha])?;
+        tx.execute("DELETE FROM blobs WHERE sha NOT IN (SELECT sha FROM refs UNION SELECT sha FROM dead_letter_refs UNION SELECT sha FROM ocr_queue)", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -649,4 +700,124 @@ fn checkpoint(tx: &Transaction<'_>, envelope: &Envelope) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    const LEGACY_SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, identity TEXT UNIQUE NOT NULL, json BLOB NOT NULL, bytes INTEGER NOT NULL, created INTEGER NOT NULL DEFAULT (unixepoch())); CREATE TABLE IF NOT EXISTS blobs (sha TEXT PRIMARY KEY, media_type TEXT NOT NULL, data BLOB NOT NULL, bytes INTEGER NOT NULL, created INTEGER NOT NULL DEFAULT(unixepoch())); CREATE TABLE IF NOT EXISTS refs (event INTEGER NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(event,sha)); CREATE TABLE IF NOT EXISTS pending (singleton INTEGER PRIMARY KEY CHECK(singleton=1), json BLOB NOT NULL); CREATE TABLE IF NOT EXISTS losses (id INTEGER PRIMARY KEY, sha TEXT NOT NULL, bytes INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS sequences (connector TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS reserved_events (identity TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS open_intervals (connector TEXT NOT NULL, source_key TEXT NOT NULL, json BLOB NOT NULL, PRIMARY KEY(connector,source_key)); CREATE TABLE IF NOT EXISTS observed (connector TEXT PRIMARY KEY, json BLOB NOT NULL); CREATE TABLE IF NOT EXISTS checkpoint_version (version INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS dead_letters (identity TEXT PRIMARY KEY, batch_id TEXT NOT NULL, json BLOB NOT NULL, reason TEXT NOT NULL, rejected_at INTEGER NOT NULL DEFAULT(unixepoch())); CREATE TABLE IF NOT EXISTS dead_letter_refs (identity TEXT NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(identity,sha));"#;
+
+    #[test]
+    fn pre_device_ocr_outbox_migration_keeps_every_existing_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(LEGACY_SCHEMA).unwrap();
+        let e = crate::envelope::Producer::new("synthetic-legacy".into())
+            .unwrap()
+            .calibration();
+        let json = serde_json::to_vec(&e).unwrap();
+        let identity = e.observation_id.to_string();
+        let batch = UploadBatch {
+            batch_id: ulid::Ulid::generate(),
+            envelopes: vec![e.clone()],
+        };
+        db.execute(
+            "INSERT INTO events VALUES(7,?,?,?,123)",
+            params![identity, json, json.len() as i64],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO pending VALUES(1,?)",
+            [serde_json::to_vec(&batch).unwrap()],
+        )
+        .unwrap();
+        // Synthetic JPEG bytes are generated entirely in memory.
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(8, 8))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let bytes = jpeg.into_inner();
+        let sha = sha256_hex(&bytes);
+        db.execute(
+            "INSERT INTO blobs VALUES(?,'image/jpeg',?,?,123)",
+            params![sha, bytes, bytes.len() as i64],
+        )
+        .unwrap();
+        db.execute("INSERT INTO refs VALUES(7,?)", [&sha]).unwrap();
+        db.execute("INSERT INTO sequences VALUES('synthetic-legacy',42)", [])
+            .unwrap();
+        db.execute("INSERT INTO reserved_events VALUES(?)", [&identity])
+            .unwrap();
+        db.execute("INSERT INTO losses VALUES(1,?,100)", [&sha])
+            .unwrap();
+        db.execute(
+            "INSERT INTO open_intervals VALUES('synthetic-legacy','synthetic',?)",
+            [&json],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO observed VALUES('synthetic-legacy',?)",
+            [serde_json::to_vec(&e.time).unwrap()],
+        )
+        .unwrap();
+        db.execute("INSERT INTO checkpoint_version VALUES(1)", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO dead_letters VALUES(?,?,?,'synthetic rejection',123)",
+            params![identity, batch.batch_id.to_string(), json],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO dead_letter_refs VALUES(?,?)",
+            params![identity, sha],
+        )
+        .unwrap();
+        let tables = [
+            "events",
+            "blobs",
+            "refs",
+            "pending",
+            "losses",
+            "sequences",
+            "reserved_events",
+            "open_intervals",
+            "observed",
+            "checkpoint_version",
+            "dead_letters",
+            "dead_letter_refs",
+        ];
+        let snapshot = |db: &Connection| -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+            tables
+                .iter()
+                .map(|table| {
+                    let mut statement = db
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap();
+                    let count = statement.column_count();
+                    statement
+                        .query_map([], |row| (0..count).map(|i| row.get(i)).collect())
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let before = snapshot(&db);
+        drop(db);
+        let mut outbox = Outbox::open(&path, 100_000, 100_000).unwrap();
+        assert_eq!(
+            snapshot(&outbox.db),
+            before,
+            "migration must not rewrite any legacy row"
+        );
+        assert_eq!(outbox.batch().unwrap().unwrap(), batch);
+        assert!(
+            outbox.next_ocr(i64::MAX).unwrap().is_none(),
+            "no backfill of existing stills"
+        );
+        assert_eq!(outbox.blob(&sha).unwrap().unwrap().1, bytes);
+    }
 }

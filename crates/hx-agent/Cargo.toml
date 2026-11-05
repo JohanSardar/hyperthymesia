@@ -10,6 +10,7 @@ workspace = true
 e2e-harness = ["dep:image"]
 [dependencies]
 hx-schema.workspace = true
+hx-visual.workspace = true
 hx-macos-sys.workspace = true
 anyhow.workspace = true
 serde.workspace = true
@@ -26,6 +27,7 @@ tempfile.workspace = true
 fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 tempfile.workspace = true
 axum.workspace = true
 hx-compile.workspace = true

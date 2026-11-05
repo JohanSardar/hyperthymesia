@@ -88,3 +88,37 @@ pub struct PairRequest {
 pub struct PairResponse {
     pub token: String,
 }
+
+/// Which side runs OCR for newly acknowledged stills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrMode {
+    Server,
+    Device,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceResponse {
+    pub ocr: OcrMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrStatus {
+    Complete,
+    Sampled,
+    Failed,
+}
+
+/// Device OCR has no disclosure class: only the server may decide disclosure.
+/// Deliberately no Debug implementation: result may contain captured text.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OcrRequest {
+    pub status: OcrStatus,
+    pub engine_version: String,
+    pub perceptual_hash: Option<String>,
+    pub sampled_from: Option<String>,
+    pub result: Option<serde_json::Value>,
+}
