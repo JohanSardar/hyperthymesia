@@ -123,7 +123,13 @@ pub(crate) async fn admit_visible_window(store: &Store, w: Interval) -> Result<b
         w,
     );
     for o in store.observations(w, true).await? {
-        if ids.contains(&o.id) && !broker.project(o.id, &o.envelope).await?.is_empty() {
+        if ids.contains(&o.id)
+            && !matches!(
+                o.envelope.kind.as_str(),
+                "collector.health" | "clock.calibration" | "presence.span"
+            )
+            && !broker.project(o.id, &o.envelope).await?.is_empty()
+        {
             return Ok(true);
         }
     }
@@ -153,7 +159,7 @@ async fn interpret_window_key<P: Provider>(
     store: &Store,
     w: Interval,
     provider: &P,
-    primary: bool,
+    require_settled: bool,
     output_key: &str,
 ) -> Result<bool> {
     if !admit_visible_window(store, w).await? {
@@ -165,7 +171,7 @@ async fn interpret_window_key<P: Provider>(
             w,
             output_key,
             &crate::fx::Config::from_env(),
-            primary,
+            require_settled,
         )
         .await;
     }
@@ -179,7 +185,7 @@ async fn interpret_window_key<P: Provider>(
             generation,
             namespaces,
         } = prepare_input(store, w, &provider.name()).await?;
-        if primary {
+        if require_settled {
             ensure_settled(store, w, generation).await?;
         }
         if revision_exists(store, w, generation, &manifest_identity(&manifest)).await? {
@@ -273,7 +279,7 @@ pub async fn prepare_input_with_policy(
     sensitive: SensitiveEgress,
     disclosure: &DisclosurePolicy,
 ) -> Result<PreparedInput> {
-    let (compiled, generation) = compile_window(store, w).await?;
+    let (_, generation) = compile_window(store, w).await?;
     let expanded = Interval {
         start: w.start - Duration::minutes(30),
         end: w.end,
@@ -378,7 +384,11 @@ pub async fn prepare_input_with_policy(
     safe_timeline.window = w;
     let mut packet = hx_interpret::build_packet(&safe_timeline, &evidence, &entities, &open_tasks);
     packet.window = w;
-    let manifest = json!({"window":w,"timeline_hash":hx_store::hash(&serde_json::to_vec(&compiled)?),"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"disclosure_policy":{"version":POLICY_VERSION,"digest":disclosure.digest(),"policy":disclosure},"packet":packet,"input_namespaces":namespaces,"prior_revision_ids":prior["revisions"].as_array().into_iter().flatten().take(1).filter(|_| !packet.open_tasks.is_empty()).filter_map(|r| r["revision_id"].as_i64()).collect::<Vec<_>>()});
+    let timeline_hash = store
+        .compiled_timeline_hash(w, generation)
+        .await?
+        .ok_or(Deferred::InputChanged)?;
+    let manifest = json!({"window":w,"timeline_hash":timeline_hash,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"disclosure_policy":{"version":POLICY_VERSION,"digest":disclosure.digest(),"policy":disclosure},"packet":packet,"input_namespaces":namespaces,"prior_revision_ids":prior["revisions"].as_array().into_iter().flatten().take(1).filter(|_| !packet.open_tasks.is_empty()).filter_map(|r| r["revision_id"].as_i64()).collect::<Vec<_>>()});
     packet.input_digest = hx_store::hash(&serde_json::to_vec(&manifest)?);
     Ok(PreparedInput {
         packet,
@@ -443,7 +453,7 @@ impl<P: Provider> Handler for Runner<P> {
                 let w: Interval = serde_json::from_value(job.payload["window"].clone())?;
                 let revision24 = job.payload["revision24"].as_bool().unwrap_or(false);
                 let ready_at: chrono::DateTime<Utc> = sqlx::query_scalar(
-                    "SELECT CASE WHEN $2 THEN end_at+interval '24 hours' ELSE greatest(end_at,input_changed_at+make_interval(secs=>$3::double precision)) END FROM windows WHERE start_at=$1",
+                    "SELECT greatest(end_at+CASE WHEN $2 THEN interval '24 hours' ELSE interval '0' END,input_changed_at+make_interval(secs=>$3::double precision)) FROM windows WHERE start_at=$1",
                 ).bind(w.start).bind(revision24).bind(interpret_settle_s() as f64)
                     .fetch_one(&self.store.pool).await?;
                 if ready_at > Utc::now() {
@@ -453,6 +463,7 @@ impl<P: Provider> Handler for Runner<P> {
                     return Ok(());
                 }
                 let state = self.store.interpretation_state(w).await?;
+                ensure_settled(&self.store, w, state.generation).await?;
                 let sweep_day = job
                     .payload
                     .get("sweep_day")
@@ -467,19 +478,19 @@ impl<P: Provider> Handler for Runner<P> {
                         self.store.finish_revision24(w, state.generation).await?;
                         return Ok(());
                     }
-                } else if state.canonical_revision.is_some() {
-                    let Some(day) = sweep_day else {
-                        return Ok(());
-                    };
+                } else if let Some(day) = sweep_day {
+                    // Rescues without a canonical revision spend the same daily start.
                     if !self.store.start_daily_sweep(w, day).await? {
                         return Ok(());
                     }
+                } else if state.canonical_revision.is_some() {
+                    return Ok(());
                 }
                 let result = interpret_window_key(
                     &self.store,
                     w,
                     &self.provider,
-                    !revision24,
+                    true,
                     &format!("job:{}:{}", job.id, ulid::Ulid::generate()),
                 )
                 .await;

@@ -10,6 +10,10 @@ pub struct Fixture {
 }
 impl Fixture {
     pub async fn new() -> Self {
+        Self::through_migration(i64::MAX).await
+    }
+    /// Exercise an upgrade with synthetic data written by the old schema.
+    pub async fn through_migration(version: i64) -> Self {
         let url = std::env::var("HX_TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://hx:hx@localhost:55432/hx".into());
         let base = url.rsplit_once('/').expect("test database URL").0;
@@ -26,7 +30,14 @@ impl Fixture {
         let store = Store::connect(&format!("{base}/{db}"), dir.path())
             .await
             .unwrap();
-        store.migrate().await.unwrap();
+        let mut migrations = sqlx::migrate!("./migrations");
+        migrations.migrations = migrations
+            .iter()
+            .filter(|m| m.version <= version)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        migrations.run(&store.pool).await.unwrap();
         Self {
             store,
             admin,
@@ -57,6 +68,7 @@ pub struct JobState {
     pub kind: String,
     pub state: String,
     pub attempts: i32,
+    pub revivals: i32,
 }
 impl Store {
     pub async fn sweep_reservations(
@@ -77,17 +89,26 @@ impl Store {
         .await?)
     }
     pub async fn job_states(&self) -> Result<Vec<JobState>> {
-        Ok(
-            sqlx::query_as(
-                "SELECT id,output_key,payload,kind,state,attempts FROM jobs ORDER BY id",
-            )
-            .fetch_all(&self.pool)
-            .await?,
+        Ok(sqlx::query_as(
+            "SELECT id,output_key,payload,kind,state,attempts,revivals FROM jobs ORDER BY id",
         )
+        .fetch_all(&self.pool)
+        .await?)
     }
     pub async fn request_work(&self, kind: &str, w: Interval, generation: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         request_window_job(&mut tx, kind, w, generation).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    pub async fn request_interpretation(
+        &self,
+        w: Interval,
+        generation: i64,
+        revision24: bool,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        request_interpret_job(&mut tx, w, generation, revision24, Utc::now()).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -143,6 +164,24 @@ impl Store {
         .bind(connector)
         .fetch_one(&self.pool)
         .await?)
+    }
+    /// Move a synthetic reservation and its request past the UTC-day boundary.
+    pub async fn expire_sweep_day(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE daily_sweeps SET day=day-1")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE jobs SET payload=jsonb_set(payload,'{sweep_day}',to_jsonb((payload->>'sweep_day')::date-1)) WHERE payload ? 'sweep_day'")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    /// Deterministically defer a worker at the provider guard, after sweep admission.
+    pub async fn hold_interpretation_gate(&self, w: Interval) -> Result<ClaimGate<'_>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || ':interpret:' || $1,0))")
+            .bind(w.start.to_rfc3339()).execute(&mut *tx).await?;
+        Ok(ClaimGate(tx))
     }
     pub async fn hold_claim_gate(&self) -> Result<ClaimGate<'_>> {
         let mut tx = self.pool.begin().await?;

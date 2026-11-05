@@ -304,11 +304,28 @@ impl Store {
         .await?)
     }
     pub async fn save_timeline(&self, timeline: &Timeline, generation: i64) -> Result<bool> {
+        // OCR results are immutable per source/blob/engine lineage. Include the
+        // lead-in used by both providers; an OCR completion can change that input
+        // without changing any event or compiled lane.
+        let lineage: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'source_event_id',source_event_id,'sha256',sha256,'engine_version',engine_version) FROM ocr_derived WHERE source_start >= $1 AND source_start < $2 ORDER BY id")
+            .bind(timeline.window.start - Duration::minutes(30)).bind(timeline.window.end)
+            .fetch_all(&self.pool).await?;
+        let identity = hash(&serde_json::to_vec(&(timeline, lineage))?);
         Ok(sqlx::query("UPDATE windows SET timeline=$3,compiler_version=$4,compiled_generation=$2,dirty=false,timeline_hash=$5 WHERE start_at=$1 AND generation=$2")
-            .bind(timeline.window.start).bind(generation).bind(serde_json::to_value(timeline)?).bind(&timeline.compiler_version).bind(hash(&serde_json::to_vec(timeline)?)).execute(&self.pool).await?.rows_affected()==1)
+            .bind(timeline.window.start).bind(generation).bind(serde_json::to_value(timeline)?).bind(&timeline.compiler_version).bind(identity).execute(&self.pool).await?.rows_affected()==1)
+    }
+    /// Read the exact identity saved for this compiled generation. A concurrent
+    /// input change must not attach a newer hash to an older interpretation.
+    pub async fn compiled_timeline_hash(
+        &self,
+        w: Interval,
+        generation: i64,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT timeline_hash FROM windows WHERE start_at=$1 AND generation=$2 AND compiled_generation=$2")
+            .bind(w.start).bind(generation).fetch_optional(&self.pool).await?.flatten())
     }
     pub async fn interpretation_state(&self, w: Interval) -> Result<InterpretationState> {
-        Ok(sqlx::query_as("SELECT w.generation,w.canonical_revision,w.input_changed_at,w.revision24_finished, (r.id IS NULL OR (r.input_generation<>w.generation AND w.timeline_hash IS DISTINCT FROM r.interpretation#>>'{input_manifest,timeline_hash}')) AS timeline_changed FROM windows w LEFT JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1")
+        Ok(sqlx::query_as("SELECT w.generation,w.canonical_revision,w.input_changed_at,w.revision24_finished, (r.id IS NULL OR (r.input_generation<>w.generation AND w.timeline_hash IS NOT NULL AND r.interpretation#>>'{input_manifest,timeline_hash}' IS NOT NULL AND w.timeline_hash IS DISTINCT FROM r.interpretation#>>'{input_manifest,timeline_hash}')) AS timeline_changed FROM windows w LEFT JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1")
             .bind(w.start).fetch_one(&self.pool).await?)
     }
     pub async fn finish_revision24(&self, w: Interval, generation: i64) -> Result<()> {
@@ -322,11 +339,44 @@ impl Store {
         Ok(())
     }
     /// Reserve only one stale window per UTC day, including across scheduler restarts.
-    /// A failed current-version job keeps its retry cap; the sweep cannot bypass it.
+    /// Reservation history prevents failed/deferred input from winning again.
+    /// Exhausted first interpretations get one rescue after their normal budget.
     pub async fn schedule_daily_sweep(&self, now: DateTime<Utc>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let candidate = sqlx::query("SELECT w.start_at,w.end_at,w.generation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.revision24_finished AND w.empty_generation IS DISTINCT FROM w.generation AND w.end_at+interval '24 hours'<=$1 AND NOT w.dirty AND w.compiled_generation=w.generation AND r.input_generation<w.generation AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind='interpret' AND (j.state IN ('ready','running') OR (j.state='failed' AND (j.payload->>'generation')::bigint>=w.generation)) AND (j.payload->'window'->>'start')::timestamptz=w.start_at) ORDER BY w.end_at LIMIT 1 FOR UPDATE OF w SKIP LOCKED")
-            .bind(now).fetch_optional(&mut *tx).await?;
+        let candidate = sqlx::query(
+            "SELECT w.start_at,w.end_at,w.generation
+             FROM windows w LEFT JOIN revisions r ON r.id=w.canonical_revision
+             WHERE w.empty_generation IS DISTINCT FROM w.generation
+               AND w.end_at+interval '24 hours'<=$1
+               AND NOT w.dirty AND w.compiled_generation=w.generation
+               AND (
+                 (w.revision24_finished AND r.input_generation<w.generation)
+                 OR (w.canonical_revision IS NULL AND EXISTS (
+                   SELECT 1 FROM jobs exhausted
+                   WHERE exhausted.kind='interpret' AND exhausted.state='failed'
+                     AND exhausted.revivals>=3
+                     AND (exhausted.payload->>'generation')::bigint=w.generation
+                     AND (exhausted.payload->'window'->>'start')::timestamptz=w.start_at
+                 ))
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM daily_sweeps spent
+                 WHERE spent.start_at=w.start_at AND spent.generation=w.generation
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM jobs j WHERE j.kind='interpret'
+                   AND (j.payload->'window'->>'start')::timestamptz=w.start_at
+                   AND (j.state IN ('ready','running') OR (
+                     j.state='failed'
+                     AND (j.payload->>'generation')::bigint>=w.generation
+                     AND NOT (w.canonical_revision IS NULL AND j.revivals>=3)
+                   ))
+               )
+             ORDER BY w.end_at DESC LIMIT 1 FOR UPDATE OF w SKIP LOCKED",
+        )
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
         if let Some(row) = candidate {
             let w = Interval {
                 start: row.get("start_at"),
@@ -336,7 +386,7 @@ impl Store {
             let reserved: Option<chrono::NaiveDate> = sqlx::query_scalar("INSERT INTO daily_sweeps(day,start_at,generation) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING day")
                 .bind(now.date_naive()).bind(w.start).bind(generation).fetch_optional(&mut *tx).await?;
             if reserved.is_some() {
-                sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue) VALUES($1,'interpret',$2,'backfill') ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,revivals=CASE WHEN jobs.payload->'generation'=EXCLUDED.payload->'generation' THEN jobs.revivals ELSE 0 END,request_version=jobs.request_version+1,state='ready',attempts=0,available_at=now(),last_error=NULL WHERE jobs.state='done' OR (jobs.state='failed' AND (jobs.payload->>'generation')::bigint<(EXCLUDED.payload->>'generation')::bigint)")
+                sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue) VALUES($1,'interpret',$2,'backfill') ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,revivals=CASE WHEN jobs.payload->'generation'=EXCLUDED.payload->'generation' THEN jobs.revivals ELSE 0 END,request_version=jobs.request_version+1,state='ready',attempts=0,available_at=now(),last_error=NULL WHERE jobs.state IN ('done','failed')")
                     .bind(format!("interpret:{}", w.start)).bind(json!({"window":w,"generation":generation,"sweep_day":now.date_naive()})).execute(&mut *tx).await?;
             }
         }
@@ -418,16 +468,23 @@ impl Store {
             let previous:Option<Value>=sqlx::query_scalar("SELECT coalesce(interpretation->'tasks','null'::jsonb) FROM revisions WHERE id=(SELECT canonical_revision FROM windows WHERE start_at=$1)")
                 .bind(w.start).fetch_optional(&mut *tx).await?;
             let stored: Value = revision.get("interpretation");
-            if previous.as_ref().unwrap_or(&Value::Null)
-                != stored.get("tasks").unwrap_or(&Value::Null)
+            let open_tasks = |tasks: &Value| -> Vec<Value> {
+                tasks
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|task| task["open"].as_bool() == Some(true))
+                    .cloned()
+                    .collect()
+            };
+            if open_tasks(previous.as_ref().unwrap_or(&Value::Null))
+                != open_tasks(stored.get("tasks").unwrap_or(&Value::Null))
             {
-                sqlx::query(
-                    "UPDATE windows later SET generation=later.generation+1,dirty=true WHERE later.start_at >= $2 AND (EXISTS (SELECT 1 FROM revisions run WHERE run.id=later.canonical_revision AND (EXISTS (SELECT 1 FROM revisions prior WHERE prior.start_at=$1 AND (run.interpretation->'input_manifest'->'prior_revision_ids' @> jsonb_build_array(prior.id) OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(run.agent_run->'calls','[]'::jsonb)) call WHERE call->>'tool'='prior_context' AND call->'result'->'revisions' @> jsonb_build_array(jsonb_build_object('revision_id',prior.id))))))) OR (later.start_at=$2 AND NOT EXISTS (SELECT 1 FROM revisions run WHERE run.id=later.canonical_revision AND (run.agent_run IS NOT NULL OR run.interpretation->'input_manifest' ? 'prior_revision_ids'))))",
-                )
-                .bind(w.start)
-                .bind(w.end)
-                .execute(&mut *tx)
-                .await?;
+                // A consumer with no prior open tasks records no dependency ID.
+                // The same 16h lookback as prior_context must still become stale
+                // when new tasks appear. Mark only; payment stays cadence-gated.
+                sqlx::query("UPDATE windows SET generation=generation+1,dirty=true WHERE start_at >= $1 AND start_at < $1+interval '16 hours'")
+                    .bind(w.end).execute(&mut *tx).await?;
             }
             sqlx::query("UPDATE windows SET canonical_revision=$2 WHERE start_at=$1")
                 .bind(w.start)

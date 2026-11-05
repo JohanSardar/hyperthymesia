@@ -32,7 +32,11 @@ async fn assert_revival_cap(kind: &str) {
     let f = Fixture::new().await;
     let w = window();
     let g = f.store.generation(w).await.unwrap();
-    f.store.request_work(kind, w, g).await.unwrap();
+    if kind == "interpret" {
+        f.store.request_interpretation(w, g, false).await.unwrap();
+    } else {
+        f.store.request_work(kind, w, g).await.unwrap();
+    }
     let key = format!("{kind}:{}", w.start);
     for revival in 0..=3 {
         exhaust_slot(&f.store, &key).await;
@@ -56,7 +60,26 @@ async fn assert_revival_cap(kind: &str) {
     }
     // A changed data version resets the revival budget, even in the same slot.
     f.store.change_input(w).await.unwrap();
-    f.store.request_work(kind, w, g + 1).await.unwrap();
+    if kind == "interpret" {
+        f.store
+            .request_interpretation(w, g + 1, false)
+            .await
+            .unwrap();
+    } else {
+        f.store.request_work(kind, w, g + 1).await.unwrap();
+    }
+    let reset = f
+        .store
+        .job_states()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|j| j.output_key == key)
+        .unwrap();
+    assert_eq!(
+        reset.revivals, 0,
+        "new interpretation requests reset revivals"
+    );
     for _ in 0..8 {
         f.store.make_jobs_due("ready", None).await.unwrap();
         let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
@@ -596,7 +619,7 @@ async fn empty_windows_finish_without_provider_and_reopen_on_data() {
 }
 
 #[tokio::test]
-async fn task_changes_invalidate_only_dependent_windows() {
+async fn task_changes_invalidate_windows_within_the_prior_context_lookback() {
     let f = Fixture::new().await;
     let w = window();
     let next = hx_store::window_at(w.end);
@@ -607,7 +630,12 @@ async fn task_changes_invalidate_only_dependent_windows() {
     let g = f.store.generation(w).await.unwrap();
     let (prior, _) = f
         .store
-        .publish_revision_key(w, g, json!({"tasks":[{"title":"old"}]}), "prior")
+        .publish_revision_key(
+            w,
+            g,
+            json!({"tasks":[{"title":"old","open":true}]}),
+            "prior",
+        )
         .await
         .unwrap();
     for (win, key, manifest, agent) in [
@@ -653,13 +681,18 @@ async fn task_changes_invalidate_only_dependent_windows() {
         generations.push(f.store.generation(win).await.unwrap());
     }
     f.store
-        .publish_revision_key(w, g, json!({"tasks":[{"title":"changed"}]}), "changed")
+        .publish_revision_key(
+            w,
+            g,
+            json!({"tasks":[{"title":"changed","open":true}]}),
+            "changed",
+        )
         .await
         .unwrap();
     for (i, win) in before.into_iter().enumerate() {
         assert_eq!(
             f.store.generation(win).await.unwrap(),
-            generations[i] + i64::from(i < 3),
+            generations[i] + i64::from(i < 4),
             "{win:?}"
         );
     }
@@ -942,4 +975,494 @@ time.sleep(10)
     assert_eq!(f.store.record_count("revisions").await.unwrap(), 0);
     assert!(!scratch.path().join("finished-doomed-run").exists());
     f.close().await;
+}
+
+// PR #44 review regressions. All data is synthetic and providers are local fakes.
+#[tokio::test]
+async fn review_legacy_windows_do_not_buy_a_24h_rerun() {
+    let f = Fixture::through_migration(9).await;
+    let old = window();
+    let recent = hx_store::window_at(Utc::now() - chrono::Duration::hours(4));
+    for w in [old, recent] {
+        let g = f.store.generation(w).await.unwrap();
+        f.store
+            .publish_revision(w, g, json!({"tasks":[]}))
+            .await
+            .unwrap();
+    }
+    f.store.migrate().await.unwrap();
+    assert!(
+        f.store
+            .interpretation_state(old)
+            .await
+            .unwrap()
+            .revision24_finished,
+        "migration must retire the 24h pass for old windows"
+    );
+    assert!(
+        !f.store
+            .interpretation_state(recent)
+            .await
+            .unwrap()
+            .revision24_finished
+    );
+    for w in [old, recent] {
+        f.store.change_input(w).await.unwrap();
+        hx_server::processing::compile_window(&f.store, w)
+            .await
+            .unwrap();
+        assert!(
+            !f.store
+                .interpretation_state(w)
+                .await
+                .unwrap()
+                .timeline_changed,
+            "a missing legacy hash is unknown, not changed"
+        );
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn review_revision24_waits_for_upload_backlog_to_settle() {
+    let f = Fixture::new().await;
+    let w = window();
+    ingest(&f.store, vec![event("before-backlog", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: Counts::default(),
+    };
+    hx_server::processing::interpret_window(&f.store, w, &runner.provider)
+        .await
+        .unwrap();
+    // Three upload batches, with no wall-clock sleeps or process-global env changes.
+    for batch in 0..3 {
+        ingest(&f.store, vec![event(&format!("backlog-{batch}"), 8)]).await;
+        for _ in 0..10 {
+            if !hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
+                break;
+            }
+        }
+        assert_eq!(
+            runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unsettled 24h passes must not start a provider"
+        );
+        assert!(
+            !f.store
+                .interpretation_state(w)
+                .await
+                .unwrap()
+                .revision24_finished
+        );
+        let jobs = f.store.job_states().await.unwrap();
+        let pass = jobs
+            .iter()
+            .find(|j| j.output_key.starts_with("revision24:"))
+            .unwrap();
+        assert_eq!(pass.state, "ready");
+        assert_eq!(
+            pass.attempts, 0,
+            "readiness deferrals do not spend attempts"
+        );
+    }
+    f.store.settle_inputs().await.unwrap();
+    f.store
+        .make_jobs_due("ready", Some("interpret"))
+        .await
+        .unwrap();
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert!(
+        f.store
+            .interpretation_state(w)
+            .await
+            .unwrap()
+            .revision24_finished
+    );
+    f.close().await;
+}
+
+struct ReviewOcr;
+impl hx_visual::OcrEngine for ReviewOcr {
+    fn ocr(&self, _: &[u8], _: &str) -> anyhow::Result<hx_visual::OcrResult> {
+        Ok(hx_visual::OcrResult {
+            engine_name: "synthetic".into(),
+            engine_version: "1".into(),
+            coverage: "partial".into(),
+            lines: vec![hx_visual::OcrLine {
+                text: "Synthetic late OCR".into(),
+                confidence: 1.0,
+                bbox: hx_visual::BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+            }],
+        })
+    }
+}
+#[tokio::test]
+async fn review_late_ocr_changes_the_24h_timeline_identity() {
+    let f = Fixture::new().await;
+    let w = window();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageLuma8(image::GrayImage::new(8, 8))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let bytes = png.into_inner();
+    let sha = hx_store::hash(&bytes);
+    let mut still = event("late-ocr-still", 8);
+    still.kind = Kind::new("media.still");
+    still.payload = json!({"display":"synthetic","trigger":"focus_change","width":8,"height":8,"app_bundle_id":"synthetic.app"});
+    still.blobs.push(hx_schema::BlobRef {
+        sha256: sha.clone(),
+        media_type: "image/png".into(),
+        bytes: bytes.len() as u64,
+    });
+    ingest(&f.store, vec![event("before-ocr", 8), still]).await;
+    f.store.upload_blob(&sha, &bytes).await.unwrap();
+    f.store.normalize_window(w).await.unwrap();
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: Counts::default(),
+    };
+    hx_server::processing::interpret_window(&f.store, w, &runner.provider)
+        .await
+        .unwrap();
+    hx_server::ocr::discover(&f.store, "synthetic-ocr-v1")
+        .await
+        .unwrap();
+    assert!(
+        hx_server::ocr::run_one(&f.store, std::sync::Arc::new(ReviewOcr), "synthetic-ocr-v1")
+            .await
+            .unwrap()
+    );
+    hx_server::processing::compile_window(&f.store, w)
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .interpretation_state(w)
+            .await
+            .unwrap()
+            .timeline_changed,
+        "new OCR lineage must change the identity even when events are unchanged"
+    );
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert!(
+        f.store
+            .interpretation_state(w)
+            .await
+            .unwrap()
+            .revision24_finished
+    );
+    f.close().await;
+}
+
+async fn stale_sweep_window(store: &Store, hour: u32) -> Interval {
+    let w = hx_store::window_at(event("at", hour).time.observed_at);
+    ingest(store, vec![event(&format!("sweep-{hour}"), hour)]).await;
+    store.normalize_window(w).await.unwrap();
+    hx_server::processing::interpret_window(store, w, &hx_server::processing::StubProvider)
+        .await
+        .unwrap();
+    let g = store.generation(w).await.unwrap();
+    store.finish_revision24(w, g).await.unwrap();
+    store.change_input(w).await.unwrap();
+    hx_server::processing::compile_window(store, w)
+        .await
+        .unwrap();
+    // Retire upload-created jobs so the next claim isolates the sweep.
+    while let Some(j) = hx_jobs::claim(&store.pool, 120).await.unwrap() {
+        hx_jobs::finish(&store.pool, &j, None).await.unwrap();
+    }
+    store.settle_inputs().await.unwrap();
+    w
+}
+struct CountsFail(std::sync::atomic::AtomicUsize);
+impl hx_interpret::Provider for CountsFail {
+    fn name(&self) -> String {
+        "synthetic-counting-failure".into()
+    }
+    async fn complete(&self, _: &str, _: &str) -> Result<String, hx_interpret::InterpretError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(hx_interpret::InterpretError::Provider(
+            "synthetic failure".into(),
+        ))
+    }
+}
+#[tokio::test]
+async fn review_failed_sweep_does_not_hold_future_days() {
+    let f = Fixture::new().await;
+    let a = stale_sweep_window(&f.store, 8).await;
+    let b = stale_sweep_window(&f.store, 12).await;
+    let now = Utc::now();
+    f.store.schedule_daily_sweep(now).await.unwrap();
+    let chosen = f.store.sweep_reservations().await.unwrap()[0].1;
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: CountsFail(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.is_err());
+    f.store.make_jobs_due("ready", None).await.unwrap();
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "retrying queue bookkeeping must not retry a paid sweep attempt"
+    );
+    f.store.make_jobs_due("failed", None).await.unwrap();
+    hx_jobs::revive_window_jobs(&f.store.pool).await.unwrap();
+    f.store
+        .schedule_daily_sweep(now + chrono::Duration::days(1))
+        .await
+        .unwrap();
+    let reservations = f.store.sweep_reservations().await.unwrap();
+    assert_eq!(reservations.len(), 2);
+    assert_eq!(
+        reservations[1].1,
+        if chosen == a.start { b.start } else { a.start },
+        "failed input must not win another day's sweep"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn review_heartbeat_only_windows_buy_nothing() {
+    let f = Fixture::new().await;
+    let w = window();
+    let mut heartbeat = event("heartbeat", 8);
+    heartbeat.kind = Kind::new("collector.health");
+    heartbeat.payload = json!({"collector":"synthetic","status":"running","dropped":0});
+    let mut clock = event("clock", 8);
+    clock.kind = Kind::new("clock.calibration");
+    clock.payload = json!({"offset_ms":0,"error_ms":0,"method":"synthetic"});
+    let mut presence = event("presence", 8);
+    presence.kind = Kind::new("presence.span");
+    presence.time.source_end = Some(w.end);
+    presence.payload = json!({"state":"active"});
+    ingest(&f.store, vec![heartbeat, clock, presence]).await;
+    f.store.normalize_window(w).await.unwrap();
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: Counts::default(),
+    };
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "housekeeping alone cannot buy an interpretation"
+    );
+    assert!(
+        f.store
+            .job_states()
+            .await
+            .unwrap()
+            .iter()
+            .all(|j| j.kind != "interpret")
+    );
+    ingest(&f.store, vec![event("actual-activity", 8)]).await;
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn review_sweep_rescues_newest_exhausted_window_without_a_revision() {
+    let f = Fixture::new().await;
+    let now = Utc::now();
+    for hour in [8, 12] {
+        let w = hx_store::window_at(event("at", hour).time.observed_at);
+        ingest(&f.store, vec![event(&format!("exhausted-{hour}"), hour)]).await;
+        f.store.normalize_window(w).await.unwrap();
+        hx_server::processing::compile_window(&f.store, w)
+            .await
+            .unwrap();
+        let g = f.store.generation(w).await.unwrap();
+        f.store.request_interpretation(w, g, false).await.unwrap();
+        for revival in 0..=3 {
+            exhaust_slot(&f.store, &format!("interpret:{}", w.start)).await;
+            if revival < 3 {
+                f.store.make_jobs_due("failed", None).await.unwrap();
+                hx_jobs::revive_window_jobs(&f.store.pool).await.unwrap();
+            }
+        }
+    }
+    f.store.settle_inputs().await.unwrap();
+    f.store.schedule_daily_sweep(now).await.unwrap();
+    let reservations = f.store.sweep_reservations().await.unwrap();
+    assert_eq!(
+        reservations.len(),
+        1,
+        "exhausted windows without a revision need the sweep"
+    );
+    assert_eq!(
+        reservations[0].1,
+        event("at", 12).time.observed_at,
+        "newest candidate first"
+    );
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: Counts::default(),
+    };
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(
+        f.store.sweep_reservations().await.unwrap()[0].2,
+        "rescue also consumes the daily start"
+    );
+    f.store.schedule_daily_sweep(now).await.unwrap();
+    assert_eq!(f.store.sweep_reservations().await.unwrap().len(), 1);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn review_new_open_tasks_stale_later_windows_with_empty_dependencies() {
+    let f = Fixture::new().await;
+    let w = window();
+    let g = f.store.generation(w).await.unwrap();
+    f.store
+        .publish_revision(w, g, json!({"tasks":[]}))
+        .await
+        .unwrap();
+    let later = hx_store::window_at(w.end + chrono::Duration::hours(8));
+    let outside = hx_store::window_at(w.end + chrono::Duration::hours(16));
+    for win in [later, outside] {
+        let v = f.store.generation(win).await.unwrap();
+        f.store
+            .publish_revision(
+                win,
+                v,
+                json!({"tasks":[],"input_manifest":{"prior_revision_ids":[]}}),
+            )
+            .await
+            .unwrap();
+    }
+    let before = f.store.generation(later).await.unwrap();
+    let outside_g = f.store.generation(outside).await.unwrap();
+    f.store
+        .publish_revision(
+            w,
+            g,
+            json!({"tasks":[{"title":"Synthetic new task","open":true}]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store.generation(later).await.unwrap(),
+        before + 1,
+        "empty dependency lists cannot hide newly opened earlier tasks"
+    );
+    assert_eq!(
+        f.store.generation(outside).await.unwrap(),
+        outside_g,
+        "exclusive 16h lookback"
+    );
+    assert!(f.store.window_state(later).await.unwrap().dirty);
+    assert!(
+        f.store.job_states().await.unwrap().is_empty(),
+        "invalidation only marks; it must not buy runs"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn review_deferred_sweep_releases_its_unspent_start_but_not_future_days() {
+    for retry_today in [true, false] {
+        let f = Fixture::new().await;
+        let older = stale_sweep_window(&f.store, 8).await;
+        let newest = stale_sweep_window(&f.store, 12).await;
+        let now = Utc::now();
+        f.store.schedule_daily_sweep(now).await.unwrap();
+        let day = now.date_naive();
+        assert_eq!(
+            f.store.sweep_reservations().await.unwrap(),
+            vec![(day, newest.start, false)]
+        );
+        let gate = f.store.hold_interpretation_gate(newest).await.unwrap();
+        let runner = hx_server::processing::Runner {
+            store: f.store.clone(),
+            provider: Counts::default(),
+        };
+        assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+        assert_eq!(
+            runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            f.store.sweep_reservations().await.unwrap(),
+            vec![(day, newest.start, false)],
+            "provider-busy deferrals must release the unspent start for today's retry"
+        );
+        let deferred = f
+            .store
+            .job_states()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.payload.get("sweep_day").is_some())
+            .unwrap();
+        assert_eq!(deferred.state, "ready");
+        assert_eq!(deferred.attempts, 0);
+        gate.release().await.unwrap();
+        if !retry_today {
+            // Advance the durable reservation and request together, so the real
+            // worker takes its expired-day path without sleeps or a fake handler.
+            f.store.expire_sweep_day().await.unwrap();
+        }
+        f.store.make_jobs_due("ready", None).await.unwrap();
+        assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+        assert_eq!(
+            runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(retry_today)
+        );
+        assert_eq!(
+            f.store.sweep_reservations().await.unwrap()[0].2,
+            retry_today
+        );
+        if !retry_today {
+            f.store.schedule_daily_sweep(now).await.unwrap();
+            assert_eq!(
+                f.store.sweep_reservations().await.unwrap()[1].1,
+                older.start,
+                "even an unspent reservation cannot win again on unchanged input"
+            );
+        }
+        // New input permits this window to become a candidate again.
+        f.store.change_input(newest).await.unwrap();
+        hx_server::processing::compile_window(&f.store, newest)
+            .await
+            .unwrap();
+        f.store
+            .schedule_daily_sweep(now + chrono::Duration::days(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            f.store
+                .sweep_reservations()
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .1,
+            newest.start
+        );
+        f.close().await;
+    }
 }
