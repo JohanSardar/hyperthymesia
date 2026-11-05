@@ -50,6 +50,12 @@ jobs:
       - name: test
         run: cargo test -p hx-macos-sys -p hx-agent -p hx-agent-app
 
+      - name: synthetic pairing harness
+        run: |
+          cargo clippy -p hx-agent -p hx-agent-app --all-targets --features e2e-harness -- -D warnings
+          cargo test -p hx-agent -p hx-agent-app --features e2e-harness
+          scripts/check-e2e-harness.sh
+
   companions:
     name: Companions (bun)
     runs-on: ubuntu-latest
