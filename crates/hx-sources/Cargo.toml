@@ -12,6 +12,15 @@ workspace = true
 base64 = "0.22"
 libc = "0.2"
 regex = "1"
+hx-schema.workspace = true
+chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+axum.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
