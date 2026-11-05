@@ -606,13 +606,25 @@ fn no_record_stuck_in_connector_after_a_refusal_or_http_failure() {
             apple_token: None,
         };
         let sync = || {
-            hx_connector_sdk::run_cli(cli(), "synthetic", "synthetic", &[], |_, cursor| {
-                let mut result = hx_connector_sdk::Scan::new(serde_json::json!(
-                    cursor.as_u64().unwrap_or(0) + 1
-                ));
-                result.envelopes = vec![producer().calibration(), producer().calibration()];
-                Ok(result)
-            })
+            // A process spawned by a parallel test can briefly hold a copy of the lock's
+            // file descriptor, so a run right after the last one may find it still taken.
+            for _ in 0..100 {
+                let result =
+                    hx_connector_sdk::run_cli(cli(), "synthetic", "synthetic", &[], |_, cursor| {
+                        let mut result = hx_connector_sdk::Scan::new(serde_json::json!(
+                            cursor.as_u64().unwrap_or(0) + 1
+                        ));
+                        result.envelopes = vec![producer().calibration(), producer().calibration()];
+                        Ok(result)
+                    });
+                match result {
+                    Err(error) if error.to_string().contains("already syncing") => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => return other,
+                }
+            }
+            panic!("connector lock stayed held for two seconds");
         };
         let result = sync();
         if status == 200 {
