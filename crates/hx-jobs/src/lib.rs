@@ -87,7 +87,7 @@ async fn quarantine_exhausted(
 /// At most three failed-job revivals per input generation, after five minutes.
 /// Existing output keys keep recovery idempotent and the error history bounded.
 pub async fn revive_window_jobs(pool: &PgPool) -> Result<()> {
-    sqlx::query("UPDATE jobs SET state='ready',attempts=0,revivals=revivals+1,request_version=request_version+1,lease_until=NULL,lease_owner=NULL WHERE id IN (SELECT id FROM jobs WHERE state='failed' AND revivals<3 AND kind IN ('compile','interpret') AND available_at<=now() ORDER BY available_at,id LIMIT 1000 FOR UPDATE SKIP LOCKED)")
+    sqlx::query("UPDATE jobs SET state='ready',attempts=0,revivals=revivals+1,request_version=request_version+1,lease_until=NULL,lease_owner=NULL WHERE id IN (SELECT id FROM jobs WHERE state='failed' AND revivals<3 AND NOT (payload ? 'sweep_day') AND kind IN ('compile','interpret') AND available_at<=now() ORDER BY available_at,id LIMIT 1000 FOR UPDATE SKIP LOCKED)")
         .execute(pool).await?;
     Ok(())
 }
