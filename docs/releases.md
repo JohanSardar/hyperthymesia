@@ -29,8 +29,9 @@ the real installer downloads it separately and checks its pinned hash.
 
 Each build runs the shipped installer with `--dry-run`, a scratch HOME, and
 `HX_RELEASE_BASE=file://<asset-directory>`. This requires access to the pinned
-fx release; download failures fail CI with diagnostics. Two fresh Linux jobs,
-without toolchain setup, caches, database or fx, extract the server and assert
+fx release; download failures fail CI with diagnostics. Two fresh Linux jobs
+in pristine `ubuntu:22.04` containers, with no added packages, Rust, database
+or fx, extract the server and assert
 its `--version` output with an empty environment. The combined artifact is
 assembled only after those checks pass. Its checksums use bare filenames and
 exactly two spaces between hash and filename.
@@ -51,6 +52,7 @@ A partially configured set fails visibly. On dispatch and tag runs only,
 the macOS runner imports the certificate into a temporary keychain, signs
 with hardened runtime and timestamps, submits the app and standalone server
 executables for notarization, and staples the app ticket before packaging.
+The final app zip is extracted again to verify its signature and stapled ticket.
 The temporary keychain and p12 are removed even if the build fails. PR runs
 use ad-hoc signing. Keychain writes belong exclusively to the hosted runner.
 The standalone tar cannot carry a stapled ticket; Gatekeeper retrieves its
