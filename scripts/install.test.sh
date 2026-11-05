@@ -227,4 +227,16 @@ case "$2" in file://*) cp "${2#file://}" "$4";; *) echo 'network forbidden' >&2;
         assert not service.exists()
         assert not (h / '.local/bin/hx-server').is_symlink()
     print('ok: installs, service syntax, repeat install and state-preserving uninstall')
+
+    # A disk-full or interrupted first install must stay ours to retry; the owner
+    # refusal has no override, so a marker-less prefix would be a dead end.
+    h = home()
+    stub('cp', 'case "$*" in */tools/fx-0.0.16/*) exit 1;; esac\nexec /bin/cp "$@"\n')
+    failed = run(h)
+    (stubs / 'cp').unlink()
+    assert failed.returncode != 0, 'stubbed cp failure was not reached'
+    retry = run(h)
+    assert retry.returncode == 0, (retry.returncode, retry.stderr)
+    assert (h / '.local/share/hyperthymesia/tools/fx-0.0.16/fx').is_file()
+    print('ok: an interrupted first install can be retried')
 PY
