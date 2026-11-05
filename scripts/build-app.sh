@@ -1,7 +1,12 @@
 #!/bin/zsh
 set -euo pipefail
-[[ ! -f "$HOME/.cargo/env" ]] || source "$HOME/.cargo/env"
+if [[ -f "$HOME/.cargo/env" ]]; then source "$HOME/.cargo/env"; fi
 cd "${0:A:h:h}"
+if [[ "${1:-}" == --e2e ]]; then
+  shift
+  exec "$PWD/scripts/build-e2e-app.sh" "$@"
+fi
+if (( $# )); then print -u2 -- "usage: $0 [--e2e [output-directory]]"; exit 2; fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/.target-native}"
 version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "hx-agent-app"))')
 cargo build --release -p hx-agent -p hx-agent-app

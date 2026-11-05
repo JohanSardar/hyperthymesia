@@ -73,3 +73,18 @@ pub enum ConnectorMessage {
         cursor: Cursor,
     },
 }
+
+/// Redeem a short-lived, one-use pairing code. Codes and returned tokens are secrets.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PairRequest {
+    pub code: String,
+    pub device_id: String,
+}
+
+/// Returned once by POST /v1/pair; failures uniformly return HTTP 410.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PairResponse {
+    pub token: String,
+}

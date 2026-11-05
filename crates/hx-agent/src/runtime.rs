@@ -3,7 +3,7 @@ use crate::{
     envelope::Producer,
     outbox::Outbox,
     policy::Policy,
-    upload::Uploader,
+    upload::LiveUploader,
 };
 use anyhow::{Context, Result};
 use hx_macos_sys::{Focus, NativeEvent};
@@ -108,7 +108,7 @@ fn io_worker(
     }
     result
 }
-fn io_worker_at(
+pub(crate) fn io_worker_at(
     config: Config,
     rx: tokio::sync::mpsc::Receiver<Submission>,
     stop: Arc<AtomicBool>,
@@ -123,8 +123,15 @@ fn io_worker_at(
         let mut latest_health=serde_json::Map::new();
         latest_health.insert("upload".into(),upload_health(&outbox)?);
         save_health(&dir,&latest_health)?;
-        let mut uploader=Uploader::new(&config)?;let mut rx=rx;let mut next=tokio::time::Instant::now()+uploader.delay();
+        let mut uploader=LiveUploader::new(&config)?;let mut rx=rx;let mut next=tokio::time::Instant::now()+uploader.delay();
+        let mut reload = tokio::time::interval(Duration::from_secs(1));
+        reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {tokio::select! {
+            _=reload.tick()=>match uploader.reload(&dir) {
+                Ok(true) => next=tokio::time::Instant::now(),
+                Ok(false) => {},
+                Err(e) => eprintln!("cannot reload pairing config: {e}"),
+            },
             item=rx.recv()=>match item {Some(Submission {mut envelope,reply,focus,secure,blobs})=>{
                 if envelope.kind.as_str()=="collector.health" {envelope.payload["queue_age_ms"]=serde_json::json!(outbox.queue_age_ms()?);
                     if let Some(name)=envelope.payload["collector"].as_str(){let mut payload=envelope.payload.clone();payload["observed_at"]=serde_json::json!(envelope.time.observed_at);latest_health.insert(name.into(),payload);save_health(&dir,&latest_health)?;}
@@ -132,7 +139,7 @@ fn io_worker_at(
                 if let Err(e)=envelope.validate() {eprintln!("dropped invalid {} record: {e}",envelope.kind.as_str());if let Some(reply)=reply {let _=reply.send(false);}continue;}
                 let result=crate::policy::persist(&mut outbox,&policy,focus.as_ref(),secure,&envelope,&blobs);if let Some(reply)=reply {let _=reply.send(matches!(&result,Ok(true)));}
                 if let Err(e)=result {eprintln!("outbox: {e}");stop.store(true,Ordering::Relaxed);return Err(e);}},None=>break},
-            ()=tokio::time::sleep_until(next)=>{if !config.token.is_empty() && let Err(e)=uploader.once(&mut outbox).await {eprintln!("upload retained for retry: {e}");}latest_health.insert("upload".into(),upload_health(&outbox)?);save_health(&dir,&latest_health)?;next=tokio::time::Instant::now()+uploader.delay();}
+            ()=tokio::time::sleep_until(next)=>{if let Err(e)=uploader.once(&mut outbox).await {eprintln!("upload retained for retry: {e}");}latest_health.insert("upload".into(),upload_health(&outbox)?);save_health(&dir,&latest_health)?;next=tokio::time::Instant::now()+uploader.delay();}
         }}
         Ok(())
     })
@@ -299,6 +306,10 @@ fn close_span_at(span: &Envelope, p: &mut Producer, end: ObservationTime) -> Env
     closed
 }
 pub fn run(options: RunOptions) -> Result<()> {
+    anyhow::ensure!(
+        !cfg!(feature = "e2e-harness"),
+        "e2e-harness cannot run capture; use hx-agent-app"
+    );
     let cfg = Config::load()?;
     let policy = Policy::new(&cfg)?;
     let mut producer = Producer::new(cfg.device_id.clone())?;
@@ -315,6 +326,10 @@ pub fn run(options: RunOptions) -> Result<()> {
     } else {
         None
     };
+    if let Some(menu) = &mut menu {
+        menu.set_paired(!cfg.token.is_empty());
+        menu.update(None);
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let (companion_tx, companion_rx) = mpsc::sync_channel(128);
     let socket = if options.dry_run {
@@ -412,6 +427,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     let mut last_gap_update = Instant::now();
     let mut last_permissions = hx_macos_sys::permissions();
     let mut menu_health_check = Instant::now() - Duration::from_secs(1);
+    let mut onboarding = crate::first_run::Onboarding::new(support_dir());
     let mut menu_health = None;
     let mut menu_upload = None;
     let result = (|| -> Result<()> {
@@ -439,7 +455,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                 }
                 let warning = screen_warning(menu_health.as_ref(), paused.load(Ordering::Relaxed))
                     .or_else(|| menu_upload.clone());
-                menu.update(warning.as_deref());
+                onboarding.update(menu, warning.as_deref());
             }
             let mut changed = ax_observer.as_ref().is_some_and(|o| o.take_changed());
             while let Some(signal) = main_loop.pop() {
@@ -1149,5 +1165,85 @@ mod delivery_regressions {
                 .as_ref()
                 .is_some_and(|c| c.scope == "capture_loss")
         }));
+    }
+}
+
+#[cfg(test)]
+mod pairing_reload_tests {
+    use super::*;
+    use axum::{Json, Router, body::Bytes, http::HeaderMap, routing::post};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn io_worker_uploads_existing_outbox_after_pairing_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (uploaded, received) = tokio::sync::oneshot::channel();
+        let uploaded = Arc::new(std::sync::Mutex::new(Some(uploaded)));
+        let app = Router::new().route(
+            "/v1/events",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let uploaded = uploaded.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer synthetic-token");
+                    let bytes = zstd::decode_all(body.as_ref()).unwrap();
+                    let batch: UploadBatch = serde_json::from_slice(&bytes).unwrap();
+                    if let Some(tx) = uploaded.lock().unwrap().take() {
+                        let _ = tx.send(batch.clone());
+                    }
+                    Json(UploadAck {
+                        batch_id: batch.batch_id,
+                        accepted: batch.envelopes.len() as u32,
+                        duplicates: 0,
+                        rejected: vec![],
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let cfg = Config {
+            device_id: "synthetic".into(),
+            ..Default::default()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let path = dir.path().to_owned();
+        let worker = std::thread::spawn(move || {
+            io_worker_at(cfg, rx, Arc::new(AtomicBool::new(false)), path)
+        });
+        let envelope = Producer::new("synthetic".into()).unwrap().calibration();
+        let id = envelope.observation_id;
+        let (reply, persisted) = mpsc::sync_channel(1);
+        tx.send(Submission {
+            envelope,
+            reply: Some(reply),
+            focus: None,
+            secure: false,
+            blobs: vec![],
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::task::spawn_blocking(move || persisted.recv().unwrap())
+                .await
+                .unwrap()
+        );
+        std::fs::write(
+            dir.path().join("agent.json"),
+            serde_json::to_vec(&serde_json::json!({"token":"synthetic-token", "server_url":url}))
+                .unwrap(),
+        )
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), received).await;
+        drop(tx);
+        tokio::task::spawn_blocking(move || worker.join().unwrap().unwrap())
+            .await
+            .unwrap();
+        server.abort();
+        let batch = result
+            .expect("pairing must reload the uploader without restarting")
+            .unwrap();
+        assert!(batch.envelopes.iter().any(|e| e.observation_id == id));
     }
 }

@@ -12,6 +12,11 @@ enum Command {
         #[arg(long)]
         duration_s: Option<u64>,
     },
+    Pair {
+        link: String,
+        #[arg(long)]
+        replace: bool,
+    },
     Status,
     Onboard,
     NmHost,
@@ -30,11 +35,24 @@ fn main() -> anyhow::Result<()> {
             duration_s,
             ..Default::default()
         }),
+        Command::Pair { link, replace } => {
+            tokio::runtime::Runtime::new()?.block_on(hx_agent::pair::redeem(
+                &link,
+                replace,
+                &hx_agent::config::support_dir(),
+            ))?;
+            println!("Paired. Uploads will resume automatically.");
+            Ok(())
+        }
         Command::Status => {
             println!("{}", serde_json::to_string_pretty(&hx_agent::status()?)?);
             Ok(())
         }
         Command::Onboard => {
+            anyhow::ensure!(
+                !cfg!(feature = "e2e-harness"),
+                "e2e-harness cannot request permissions"
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&hx_macos_sys::onboard())?
