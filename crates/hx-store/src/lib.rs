@@ -138,10 +138,10 @@ impl Store {
                 continue;
             }
             let start = e.time.source_start.unwrap_or(e.time.observed_at);
-            let sensitivity = match e.sensitivity {
-                Sensitivity::Normal if hx_schema::kinds::is_core(e.kind.as_str()) => "normal",
+            let sensitivity = match hx_schema::kinds::stored_class(e.kind.as_str(), e.sensitivity) {
+                Sensitivity::Normal => "normal",
                 Sensitivity::Sensitive => "sensitive",
-                _ => "restricted",
+                Sensitivity::Restricted => "restricted",
             };
             let inserted = sqlx::query("INSERT INTO events(observation_id,connector_instance,source_key,revision,kind,source_start,source_end,observed_at,device,sensitivity,envelope) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(connector_instance,source_key,revision) DO NOTHING RETURNING id,(SELECT coalesce(jsonb_agg(jsonb_build_array(prior.source_start,prior.source_end)),'[]'::jsonb) FROM events prior WHERE prior.connector_instance=$2 AND prior.source_key=$3) AS previous_ranges")
                 .bind(e.observation_id.to_string()).bind(e.connector_instance.as_str()).bind(e.source_key.as_str()).bind(e.revision.as_str()).bind(e.kind.as_str())
