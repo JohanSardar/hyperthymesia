@@ -32,11 +32,15 @@ enum Command {
     },
     Compile {
         #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
         from: DateTime<Utc>,
         #[arg(long)]
         to: DateTime<Utc>,
     },
     Interpret {
+        #[arg(long)]
+        data_dir: PathBuf,
         #[arg(long)]
         from: DateTime<Utc>,
         #[arg(long)]
@@ -65,7 +69,10 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let dir = match &cli.command {
-        Command::Serve { data_dir, .. } | Command::Gc { data_dir } => data_dir.clone(),
+        Command::Serve { data_dir, .. }
+        | Command::Compile { data_dir, .. }
+        | Command::Interpret { data_dir, .. }
+        | Command::Gc { data_dir } => data_dir.clone(),
         _ => PathBuf::from("."),
     };
     let store = Store::connect(&cli.database_url, dir).await?;
@@ -80,12 +87,12 @@ async fn main() -> Result<()> {
                 },
         } => println!("{}", store.create_token(&name, prefix, scopes).await?),
         Command::Gc { .. } => println!("Expired {} blobs", store.gc().await?),
-        Command::Compile { from, to } => {
+        Command::Compile { from, to, .. } => {
             for w in windows(from, to)? {
                 processing::compile_window(&store, w).await?;
             }
         }
-        Command::Interpret { from, to } => {
+        Command::Interpret { from, to, .. } => {
             for w in windows(from, to)? {
                 processing::interpret_window(
                     &store,

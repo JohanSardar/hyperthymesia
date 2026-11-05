@@ -1,4 +1,4 @@
-//! Durable OCR persistence. The claim handle retains its transaction across engine work.
+//! Durable OCR persistence. The claim holds an OS file lock across engine work.
 use super::*;
 impl Store {
     pub async fn discover_ocr(&self, version: &str) -> Result<()> {
@@ -33,19 +33,19 @@ impl Store {
     }
 
     pub async fn claim_ocr(&self, version: &str) -> Result<Option<OcrClaim>> {
-        let mut tx = self.pool.begin().await?;
-        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || ':hx-ocr',0))")
-        .fetch_one(&mut *tx)
-        .await?;
-        if !locked {
+        let Some(lock) = self.try_file_lock("hx-ocr").await? else {
             return Ok(None);
-        }
-        let row = sqlx::query_as::<_, OcrCandidate>("SELECT o.sha256,o.source_event_id,e.envelope,e.source_start FROM ocr_jobs o JOIN events e ON e.id=o.source_event_id JOIN blobs b USING(sha256) WHERE o.engine_version=$1 AND o.status='pending' AND o.available_at<=now() AND b.published AND NOT b.evidence_expired ORDER BY e.source_start,e.id FOR UPDATE OF o SKIP LOCKED LIMIT 1")
-        .bind(version).fetch_optional(&mut *tx).await?;
+        };
+        let row = sqlx::query_as::<_, OcrCandidate>("SELECT o.sha256,o.source_event_id,e.envelope,e.source_start FROM ocr_jobs o JOIN events e ON e.id=o.source_event_id JOIN blobs b USING(sha256) WHERE o.engine_version=$1 AND o.status='pending' AND o.available_at<=now() AND b.published AND NOT b.evidence_expired ORDER BY e.source_start,e.id LIMIT 1")
+        .bind(version).fetch_optional(&self.pool).await?;
         let Some(row) = row else {
             return Ok(None);
         };
-        Ok(Some(OcrClaim { tx, candidate: row }))
+        Ok(Some(OcrClaim {
+            store: self.clone(),
+            _lock: lock,
+            candidate: row,
+        }))
     }
 }
 #[derive(Debug, sqlx::FromRow)]
@@ -56,11 +56,12 @@ pub struct OcrCandidate {
     pub source_start: DateTime<Utc>,
 }
 pub struct OcrClaim {
-    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    store: Store,
+    _lock: crate::locks::FileLock,
     pub candidate: OcrCandidate,
 }
 impl OcrClaim {
-    pub async fn previous(&mut self, version: &str) -> Result<Option<(String, String)>> {
+    pub async fn previous(&self, version: &str) -> Result<Option<(String, String)>> {
         let source = &self.candidate.envelope;
         let at = self.candidate.source_start;
         // Compare only against a recognized frame on the same device/connector/surface,
@@ -68,11 +69,11 @@ impl OcrClaim {
         let prior = sqlx::query_as("SELECT o.sha256,o.perceptual_hash FROM ocr_jobs o JOIN events e ON e.id=o.source_event_id WHERE o.engine_version=$1 AND o.status='complete' AND e.connector_instance=$2 AND e.device IS NOT DISTINCT FROM $3 AND e.envelope->'payload'->'display' IS NOT DISTINCT FROM $4 AND e.envelope->'payload'->'app_bundle_id' IS NOT DISTINCT FROM $5 AND e.source_start<=$6 AND e.source_start>=$6-interval '30 seconds' ORDER BY e.source_start DESC,e.id DESC LIMIT 1")
         .bind(version).bind(source["connector_instance"].as_str().unwrap_or_default())
         .bind(source["device"].as_str()).bind(&source["payload"]["display"])
-        .bind(&source["payload"]["app_bundle_id"]).bind(at).fetch_optional(&mut *self.tx).await?;
+        .bind(&source["payload"]["app_bundle_id"]).bind(at).fetch_optional(&self.store.pool).await?;
         Ok(prior)
     }
     pub async fn complete(
-        &mut self,
+        self,
         version: &str,
         hash: u64,
         sampled: Option<String>,
@@ -81,17 +82,13 @@ impl OcrClaim {
         let sha = &self.candidate.sha256;
         sqlx::query("UPDATE ocr_jobs SET status=$3,perceptual_hash=$4,sampled_from=$5,result=$6,attempts=attempts+1 WHERE sha256=$1 AND engine_version=$2")
                 .bind(sha).bind(version).bind(if sampled.is_some() {"sampled"} else {"complete"})
-                .bind(format!("{hash:016x}")).bind(sampled).bind(result).execute(&mut *self.tx).await?;
+                .bind(format!("{hash:016x}")).bind(sampled).bind(result).execute(&self.store.pool).await?;
         Ok(())
     }
-    pub async fn fail(&mut self, version: &str) -> Result<()> {
+    pub async fn fail(self, version: &str) -> Result<()> {
         let sha = &self.candidate.sha256;
         sqlx::query("UPDATE ocr_jobs SET attempts=attempts+1,status=CASE WHEN attempts>=4 THEN 'failed' ELSE 'pending' END,available_at=now()+interval '30 seconds' WHERE sha256=$1 AND engine_version=$2")
-                .bind(sha).bind(version).execute(&mut *self.tx).await?;
-        Ok(())
-    }
-    pub async fn commit(self) -> Result<()> {
-        self.tx.commit().await?;
+                .bind(sha).bind(version).execute(&self.store.pool).await?;
         Ok(())
     }
 }

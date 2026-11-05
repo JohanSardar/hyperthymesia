@@ -1,4 +1,4 @@
-//! Durable server-only OCR worker. One advisory lock bounds expensive work across
+//! Durable server-only OCR worker. One OS file lock bounds expensive work across
 //! server processes; blocking image decoding and Vision never run on a Tokio thread.
 //! Successful exact results are reusable; sampled frames carry no borrowed text.
 use anyhow::{Context, Result};
@@ -28,14 +28,14 @@ pub async fn discover(store: &Store, version: &str) -> Result<()> {
     store.discover_ocr(version).await
 }
 
-/// Run one durable job. Transaction/row locks recover after process death. The
+/// Run one durable job. The OS releases the file lock after process death. The
 /// global try-lock also prevents a lease retry from overlapping a live OCR process.
 pub async fn run_one<E: OcrEngine + 'static>(
     store: &Store,
     engine: Arc<E>,
     version: &str,
 ) -> Result<bool> {
-    let Some(mut claim) = store.claim_ocr(version).await? else {
+    let Some(claim) = store.claim_ocr(version).await? else {
         return Ok(false);
     };
     let sha = claim.candidate.sha256.clone();
@@ -48,8 +48,10 @@ pub async fn run_one<E: OcrEngine + 'static>(
         .and_then(|b| b["media_type"].as_str())
         .unwrap_or("image/jpeg")
         .to_owned();
-    let result = tokio::task::spawn_blocking(
-        move || -> Result<(u64, Option<String>, Option<OcrResult>)> {
+    // A blocking OCR task cannot be aborted. Move the claim into it so the OS
+    // lock still excludes other workers if the async caller is cancelled.
+    let (claim, result) = tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<(u64, Option<String>, Option<OcrResult>)> {
             let bytes = std::fs::read(path)?;
             let mut reader =
                 image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
@@ -69,8 +71,9 @@ pub async fn run_one<E: OcrEngine + 'static>(
                 return Ok((hash, Some(sha), None));
             }
             Ok((hash, None, Some(engine.ocr(&bytes, &media)?)))
-        },
-    )
+        })();
+        (claim, result)
+    })
     .await
     .context("OCR worker join")?;
     match result {
@@ -89,7 +92,6 @@ pub async fn run_one<E: OcrEngine + 'static>(
             claim.fail(version).await?;
         }
     }
-    claim.commit().await?;
     store.publish_ocr_lineage(version).await?;
     Ok(true)
 }
