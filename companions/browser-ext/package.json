@@ -2,6 +2,7 @@
   "name": "hyperthymesia-browser",
   "version": "0.1.0",
   "private": true,
+  "license": "AGPL-3.0-only",
   "scripts": {
     "build": "bun build src/background.ts src/content.ts src/options.ts --outdir dist --target browser && cp manifest.json options.html dist/",
     "test": "bun test",
