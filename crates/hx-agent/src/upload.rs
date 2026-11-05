@@ -222,6 +222,20 @@ impl Uploader {
             .json(request)
             .send()
             .await?;
+        // Retrying can't change these answers, and would block every still behind it.
+        if [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ]
+        .contains(&response.status())
+        {
+            eprintln!("device OCR result refused: {}", response.status());
+            outbox.discard_ocr(sha)?;
+            self.pending_ocr = None;
+            return Ok(());
+        }
         ensure!(
             response.status() == reqwest::StatusCode::OK,
             "OCR upload: {}",
@@ -396,6 +410,7 @@ mod device_ocr_tests {
         unavailable: AtomicBool,
         redirect: AtomicBool,
         reject: AtomicBool,
+        refuse: AtomicBool,
     }
     struct Engine {
         calls: AtomicUsize,
@@ -504,7 +519,9 @@ mod device_ocr_tests {
                         async move {
                             assert_eq!(headers["authorization"], "Bearer synthetic");
                             ocr.puts.lock().unwrap().push((sha, request));
-                            if ocr.unavailable.load(Ordering::Relaxed) {
+                            if ocr.refuse.load(Ordering::Relaxed) {
+                                (StatusCode::CONFLICT, "")
+                            } else if ocr.unavailable.load(Ordering::Relaxed) {
                                 (StatusCode::SERVICE_UNAVAILABLE, TEXT)
                             } else if ocr.redirect.load(Ordering::Relaxed) {
                                 (StatusCode::FOUND, "")
@@ -699,7 +716,7 @@ mod device_ocr_tests {
     }
 
     #[tokio::test]
-    async fn device_evicted_and_rejected_stills_have_no_ocr_job_and_queued_blobs_are_pinned() {
+    async fn device_evicted_and_rejected_stills_have_no_ocr_job_and_backlog_never_blocks_capture() {
         let (config, server, state) = fake_server("device").await;
         let dir = tempfile::tempdir().unwrap();
         let (a, ba) = still(10);
@@ -730,12 +747,42 @@ mod device_ocr_tests {
         state.reject.store(false, Ordering::Relaxed);
         outbox.enqueue(&a, std::slice::from_ref(&ba)).unwrap();
         uploader.once(&mut outbox).await.unwrap();
-        assert!(!outbox.capture(&b, std::slice::from_ref(&bb)).unwrap());
-        assert!(outbox.blob(&ba.0.sha256).unwrap().is_some());
-        tick(&mut uploader, &mut outbox, &engine, 0, false)
-            .await
-            .unwrap();
+        // The queued still is already on the server; only its text is given up.
+        assert!(outbox.capture(&b, std::slice::from_ref(&bb)).unwrap());
+        assert!(outbox.blob(&ba.0.sha256).unwrap().is_none());
+        assert!(outbox.blob(&bb.0.sha256).unwrap().is_some());
         assert!(outbox.next_ocr(i64::MAX).unwrap().is_none());
+        assert!(outbox.losses().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn device_refused_result_does_not_block_the_stills_behind_it() {
+        let (config, server, state) = fake_server("device").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open(&dir.path().join("outbox.sqlite"), 100_000, 1 << 20).unwrap();
+        let (a, ba) = still(10);
+        let (b, bb) = still(200);
+        outbox.enqueue(&a, std::slice::from_ref(&ba)).unwrap();
+        outbox.enqueue(&b, std::slice::from_ref(&bb)).unwrap();
+        let mut uploader = Uploader::new(&config).unwrap();
+        uploader.once(&mut outbox).await.unwrap();
+        uploader.once(&mut outbox).await.unwrap();
+        state.refuse.store(true, Ordering::Relaxed);
+        let engine = Engine::new(false);
+        for _ in 0..2 {
+            let _ = tick(&mut uploader, &mut outbox, &engine, 0, false).await;
+        }
+        let sent: std::collections::BTreeSet<_> = state
+            .puts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sha, _)| sha.clone())
+            .collect();
+        assert_eq!(sent.len(), 2, "a refused result must not be retried first");
+        assert!(outbox.next_ocr(i64::MAX).unwrap().is_none());
+        assert!(outbox.blob(&ba.0.sha256).unwrap().is_none());
         server.abort();
     }
 

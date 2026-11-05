@@ -148,6 +148,19 @@ impl Outbox {
             if used <= self.media_budget {
                 break;
             }
+            // Give up queued OCR first: those stills are already on the server, so
+            // only their text is lost, never a capture.
+            let backlog = tx
+                .prepare("SELECT sha FROM ocr_queue WHERE sha NOT IN (SELECT sha FROM refs UNION SELECT sha FROM dead_letter_refs) ORDER BY captured,sha")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .find(|sha| !envelope.blobs.iter().any(|b| &b.sha256 == sha));
+            if let Some(sha) = backlog {
+                tx.execute("DELETE FROM ocr_queue WHERE sha=?", [&sha])?;
+                tx.execute("DELETE FROM blobs WHERE sha=?", [&sha])?;
+                continue;
+            }
             let mut query = tx.prepare("SELECT sha,bytes FROM blobs WHERE sha NOT IN (SELECT sha FROM dead_letter_refs UNION SELECT sha FROM ocr_queue) ORDER BY created,rowid")?;
             let rows = query
                 .query_map([], |r| {
@@ -552,6 +565,14 @@ impl Outbox {
             "UPDATE ocr_queue SET attempts=attempts+1,available=? WHERE sha=?",
             params![now_ms.saturating_add(30000), sha],
         )?;
+        Ok(())
+    }
+    /// The server refused this still's result for good, so its text is given up.
+    pub(crate) fn discard_ocr(&mut self, sha: &str) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM ocr_queue WHERE sha=?", [sha])?;
+        tx.execute("DELETE FROM blobs WHERE sha=? AND sha NOT IN (SELECT sha FROM refs UNION SELECT sha FROM dead_letter_refs)", [sha])?;
+        tx.commit()?;
         Ok(())
     }
     pub(crate) fn finish_ocr(&mut self, sha: &str, request: &protocol::OcrRequest) -> Result<()> {
