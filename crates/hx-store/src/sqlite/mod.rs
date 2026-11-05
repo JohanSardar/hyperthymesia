@@ -1,0 +1,164 @@
+//! SQLite foundation, unused by the Postgres store until the separate port.
+//!
+//! Only `create` initializes a state directory. `open` refuses missing or
+//! unmigrated cores; it never silently creates a new history.
+use anyhow::{Context, Result, ensure};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{Sqlite, SqliteConnection, SqlitePool, sqlite::SqliteArguments};
+use std::{
+    ops::{Deref, DerefMut},
+    path::Path,
+    time::Duration,
+};
+
+mod ts;
+pub use ts::Ts;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations-sqlite");
+
+#[derive(Clone)]
+pub struct Store {
+    pub pool: SqlitePool,
+}
+
+impl Store {
+    /// Create a new core, refusing to overwrite an existing one. The CLI's
+    /// separate agent outbox initialization belongs to the cutover, not here.
+    pub async fn create(state_dir: impl AsRef<Path>) -> Result<Self> {
+        let state_dir = state_dir.as_ref();
+        tokio::fs::create_dir_all(state_dir).await?;
+        let path = state_dir.join("core.sqlite");
+        // Reserve the path atomically. SQLite connections themselves never use
+        // CREATE, including later connections opened lazily by the pool.
+        drop(
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+                .with_context(|| format!("create {}", path.display()))?,
+        );
+        let store = Self::connect(state_dir).await?;
+        let mut tx = store.begin_write().await?;
+        MIGRATOR.run(&mut *tx).await?;
+        tx.commit().await?;
+        tokio::fs::create_dir_all(state_dir.join("blobs")).await?;
+        tokio::fs::create_dir_all(state_dir.join("locks")).await?;
+        Ok(store)
+    }
+
+    /// Open only a core initialized with this schema. Applying future
+    /// migrations remains an explicit operation, never a side effect of serve.
+    pub async fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
+        let store = Self::connect(state_dir.as_ref()).await?;
+        let applied: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
+            "SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .context("core.sqlite has not been initialized")?;
+        ensure!(
+            applied.len() == MIGRATOR.iter().len(),
+            "core.sqlite schema version mismatch"
+        );
+        for ((version, success, checksum), expected) in applied.iter().zip(MIGRATOR.iter()) {
+            ensure!(
+                *success
+                    && *version == expected.version
+                    && checksum.as_slice() == expected.checksum.as_ref(),
+                "core.sqlite migration {version} is incomplete or has a different checksum"
+            );
+        }
+        Ok(store)
+    }
+
+    async fn connect(state_dir: &Path) -> Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(state_dir.join("core.sqlite"))
+            .create_if_missing(false)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30))
+            .foreign_keys(true)
+            .pragma("recursive_triggers", "ON")
+            .synchronous(SqliteSynchronous::Full);
+        #[cfg(target_os = "macos")]
+        let options = options.pragma("fullfsync", "ON");
+        Ok(Self {
+            pool: SqlitePoolOptions::new()
+                .max_connections(8)
+                .connect_with(options)
+                .await?,
+        })
+    }
+
+    /// Take the writer lock before reading any state. A deferred read followed
+    /// by a write could fail with SQLITE_BUSY_SNAPSHOT despite busy_timeout.
+    pub async fn begin_write(&self) -> Result<WriteTransaction> {
+        Ok(WriteTransaction(
+            self.pool.begin_with("BEGIN IMMEDIATE").await?,
+        ))
+    }
+}
+
+pub struct WriteTransaction(sqlx::Transaction<'static, Sqlite>);
+
+impl WriteTransaction {
+    /// Execute an INSERT using `(SELECT next_id FROM evidence_seq)` for its ID,
+    /// `ON CONFLICT ... DO NOTHING RETURNING id`, then advance only on success.
+    /// Both the row and the allocator roll back together. As with any write
+    /// error, the caller must roll back/drop the transaction on an error here.
+    pub async fn insert_evidence<'q>(
+        &mut self,
+        insert: sqlx::query::QueryScalar<'q, Sqlite, i64, SqliteArguments>,
+    ) -> Result<Option<i64>> {
+        let id = insert.fetch_optional(&mut **self).await?;
+        if let Some(id) = id {
+            let updated = sqlx::query("UPDATE evidence_seq SET next_id=next_id+1 WHERE next_id=$1")
+                .bind(id)
+                .execute(&mut **self)
+                .await?;
+            ensure!(
+                updated.rows_affected() == 1,
+                "evidence INSERT must use evidence_seq.next_id"
+            );
+        }
+        Ok(id)
+    }
+
+    pub async fn commit(self) -> Result<()> {
+        self.0.commit().await?;
+        Ok(())
+    }
+
+    pub async fn rollback(self) -> Result<()> {
+        self.0.rollback().await?;
+        Ok(())
+    }
+}
+
+impl Deref for WriteTransaction {
+    type Target = SqliteConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for WriteTransaction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Treat each whitespace-separated term as a literal phrase, joined by AND.
+/// Quoting also prevents FTS operators from changing the query's meaning.
+pub fn search_query(text: &str) -> String {
+    let terms: Vec<_> = text
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        "\"\"".to_owned()
+    } else {
+        terms.join(" AND ")
+    }
+}
