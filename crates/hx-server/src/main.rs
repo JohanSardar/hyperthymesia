@@ -134,10 +134,10 @@ async fn main() -> Result<()> {
                     "WARNING: HX_PROVIDER selects the stub; no real interpretation will run. Set HX_PROVIDER=fx and run hx-server doctor."
                 );
             }
-            // See docs/gc-safety.md: old hashes can lose freshly uploaded bytes,
-            // and filesystem deletion cannot roll back with the transaction.
+            // See docs/gc-safety.md: new records don't protect old hashes, and the
+            // first run's deletion of old chunks is the owner's decision.
             eprintln!(
-                "WARNING: automatic blob GC is disabled pending retention and crash-safety fixes; disk usage will grow. See docs/gc-safety.md."
+                "WARNING: automatic blob GC is off; disk usage will grow. See docs/gc-safety.md."
             );
             let runner = Runner {
                 store: store.clone(),
