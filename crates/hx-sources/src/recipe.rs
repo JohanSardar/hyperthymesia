@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::request::Request;
 
 pub const MAX_ITEM_BYTES: usize = 64 * 1024;
+pub const MAX_TITLE_BYTES: usize = 1024;
 pub const MAX_PAGES_PER_PULL: usize = 20;
 pub const MAX_ITEMS_PER_PULL: usize = 1_000;
 
@@ -69,14 +70,14 @@ pub struct Pages {
     pub max: usize,
 }
 
-/// Owner settings, not recipe-controlled. Keep `first_pull` true across every
-/// page of the initial pull, even when its execution is delayed after connect.
+/// Owner settings, not recipe-controlled. The connection-time history floor
+/// applies to every page of every pull, including delayed executions.
 #[derive(Debug, Clone, Copy)]
 pub struct MapContext<'a> {
     pub recipe_id: &'a str,
+    pub source_id: &'a str,
     pub connected_at: DateTime<Utc>,
     pub history_days: u8,
-    pub first_pull: bool,
     pub pulled_at: DateTime<Utc>,
 }
 
@@ -87,6 +88,8 @@ pub struct PullCounts {
     pub mapped: usize,
     pub bad_time: usize,
     pub too_old: usize,
+    pub too_future: usize,
+    pub long_span: usize,
     pub too_large: usize,
 }
 
@@ -133,6 +136,9 @@ impl Recipe {
             .chain(self.cursor.as_ref().map(|c| c.pointer.as_str()))
             .chain(self.pages.as_ref().map(|p| p.next.as_str()))
             .chain(self.ignore.iter().map(String::as_str));
+        if self.ignore.iter().any(String::is_empty) {
+            return Err(RecipeError::Setting("ignore must not select the root"));
+        }
         if !pointers.into_iter().all(valid_pointer) {
             return Err(RecipeError::Setting("invalid JSON pointer"));
         }
@@ -150,27 +156,26 @@ pub struct PullMapper<'a> {
     recipe: &'a Recipe,
     context: MapContext<'a>,
     counts: PullCounts,
-    cutoff: Option<DateTime<Utc>>,
+    cutoff: DateTime<Utc>,
 }
 
 impl<'a> PullMapper<'a> {
     pub fn new(recipe: &'a Recipe, context: MapContext<'a>) -> Result<Self, RecipeError> {
         recipe.validate()?;
-        if context.recipe_id.is_empty() || context.history_days > 30 {
+        if context.recipe_id.is_empty()
+            || context.source_id.is_empty()
+            || context.recipe_id.contains('\0')
+            || context.source_id.contains('\0')
+            || context.history_days > 30
+        {
             return Err(RecipeError::Setting(
-                "recipe ID required; history_days must be 0..=30",
+                "recipe and source IDs required without NUL; history_days must be 0..=30",
             ));
         }
-        let cutoff = if context.first_pull {
-            Some(
-                context
-                    .connected_at
-                    .checked_sub_signed(Duration::days(context.history_days.into()))
-                    .ok_or(RecipeError::Setting("history cutoff is out of range"))?,
-            )
-        } else {
-            None
-        };
+        let cutoff = context
+            .connected_at
+            .checked_sub_signed(Duration::days(context.history_days.into()))
+            .ok_or(RecipeError::Setting("history cutoff is out of range"))?;
         Ok(Self {
             recipe,
             context,
@@ -190,6 +195,9 @@ impl<'a> PullMapper<'a> {
         if self.counts.pages >= page_limit || self.counts.items_seen >= MAX_ITEMS_PER_PULL {
             return Err(RecipeError::PullLimit);
         }
+        // PostgreSQL JSONB refuses NUL in both values and object keys. Normalize
+        // before looking up fields so identity, hashes, cursors and payload agree.
+        let response = without_nul(response);
         let items = response
             .pointer(&self.recipe.items)
             .and_then(Value::as_array)
@@ -216,16 +224,27 @@ impl<'a> PullMapper<'a> {
                 self.counts.too_large += 1;
                 continue;
             }
-            let Some(time) = self.item_time(item) else {
+            let Some(mut time) = self.item_time(item) else {
                 self.counts.bad_time += 1;
                 continue;
             };
-            if self
-                .cutoff
-                .is_some_and(|cutoff| time.source_start.is_some_and(|s| s < cutoff))
-            {
+            let start = time
+                .source_start
+                .expect("item_time always sets source_start");
+            if start < self.cutoff {
                 self.counts.too_old += 1;
                 continue;
+            }
+            if start.signed_duration_since(self.context.pulled_at) > Duration::days(1) {
+                self.counts.too_future += 1;
+                continue;
+            }
+            if time
+                .source_end
+                .is_some_and(|end| end - start > Duration::hours(24))
+            {
+                time.source_end = None;
+                self.counts.long_span += 1;
             }
             let content = without_ignored(item, "", &self.recipe.ignore);
             let revision =
@@ -248,13 +267,14 @@ impl<'a> PullMapper<'a> {
                 .title
                 .as_ref()
                 .and_then(|p| item.pointer(p))
-                .and_then(Value::as_str);
+                .and_then(Value::as_str)
+                .map(|title| &title[..title.floor_char_boundary(MAX_TITLE_BYTES)]);
             page.envelopes.push(Envelope {
                 envelope_version: ENVELOPE_VERSION,
                 observation_id: ObservationId::generate(),
                 connector_instance: ConnectorInstance::new(format!(
                     "source:{}",
-                    self.recipe.source
+                    self.context.source_id
                 )),
                 source_key,
                 revision,
@@ -320,6 +340,20 @@ impl<'a> PullMapper<'a> {
                 1
             };
         Some(time)
+    }
+}
+
+/// Strip NUL recursively, including keys, before producing database-bound strings.
+fn without_nul(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(s.replace('\0', "")),
+        Value::Array(values) => Value::Array(values.iter().map(without_nul).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.replace('\0', ""), without_nul(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
     }
 }
 
@@ -416,9 +450,9 @@ mod tests {
         let connected_at = "2026-11-05T12:00:00Z".parse().unwrap();
         MapContext {
             recipe_id: "recipe-1",
+            source_id: "01source",
             connected_at,
             history_days: 1,
-            first_pull: true,
             pulled_at: connected_at + Duration::hours(4),
         }
     }
@@ -542,30 +576,142 @@ mod tests {
     }
 
     #[test]
-    fn first_pull_cuts_old_items_at_connect_time_not_execution_time() {
+    fn history_floor_bounds_total_windows_across_repeated_pulls() {
+        // Independent four-hour bucket oracle, matching the ingest window contract.
         let recipe = recipe();
-        let context = MapContext {
-            pulled_at: context().connected_at + Duration::days(5),
-            ..context()
-        };
-        let mut old = item();
-        old["sent_at"] = json!("2026-11-04T11:59:59.999Z");
-        let mut boundary = item();
-        boundary["sent_at"] = json!("2026-11-04T12:00:00Z");
-        let response = json!({"messages":[old, boundary, item()]});
-        let mut mapper = PullMapper::new(&recipe, context).unwrap();
-        assert_eq!(mapper.map_page(&response).unwrap().envelopes.len(), 2);
-        assert_eq!(mapper.counts().too_old, 1);
-        let mut later = PullMapper::new(
-            &recipe,
-            MapContext {
-                first_pull: false,
-                ..context
-            },
-        )
-        .unwrap();
-        assert_eq!(later.map_page(&response).unwrap().envelopes.len(), 3);
-        assert_eq!(later.counts().too_old, 0);
+        let mut windows = std::collections::BTreeSet::new();
+        let mut skipped = 0;
+        for pull in 0..3 {
+            let ctx = MapContext {
+                pulled_at: context().connected_at + Duration::days(5 + pull),
+                ..context()
+            };
+            let messages: Vec<_> = (0..365 * 6).map(|bucket| {
+                json!({"id":bucket, "sent_at":(ctx.connected_at - Duration::hours(bucket * 4)).to_rfc3339()})
+            }).collect();
+            let mut paged = recipe.clone();
+            paged.pages = Some(Pages {
+                next: "/next".into(),
+                max: 20,
+            });
+            let mut mapper = PullMapper::new(&paged, ctx).unwrap();
+            // Different slices on later pulls simulate continuing through a year of mail.
+            for page in messages.chunks(300).skip(pull as usize * 2).take(2) {
+                for envelope in mapper
+                    .map_page(&json!({"messages":page}))
+                    .unwrap()
+                    .envelopes
+                {
+                    windows.insert(
+                        envelope
+                            .time
+                            .source_start
+                            .unwrap()
+                            .timestamp()
+                            .div_euclid(4 * 3600),
+                    );
+                }
+            }
+            skipped += mapper.counts().too_old;
+        }
+        assert_eq!(windows.len(), 7, "later pulls must not admit older windows");
+        assert_eq!(skipped, 1800 - 7);
+    }
+
+    #[test]
+    fn future_items_and_long_spans_cannot_expand_work_without_bound() {
+        let mut recipe = recipe();
+        recipe.map.end = Some("/end".into());
+        let ctx = context();
+        let response = json!({"messages":[
+            {"sent_at":(ctx.pulled_at + Duration::days(1) + Duration::milliseconds(1)).to_rfc3339(),
+             "end":(ctx.pulled_at + Duration::days(2)).to_rfc3339()},
+            {"sent_at":ctx.pulled_at.to_rfc3339(), "end":(ctx.pulled_at + Duration::days(730)).to_rfc3339()},
+            {"sent_at":ctx.pulled_at.to_rfc3339(), "end":(ctx.pulled_at + Duration::hours(24)).to_rfc3339()},
+            {"sent_at":(ctx.pulled_at + Duration::days(1)).to_rfc3339(), "end":(ctx.pulled_at + Duration::days(1)).to_rfc3339()}
+        ]});
+        let mut mapper = PullMapper::new(&recipe, ctx).unwrap();
+        let page = mapper.map_page(&response).unwrap();
+        assert_eq!(page.envelopes.len(), 3, "skip starts beyond tomorrow");
+        assert_eq!(mapper.counts().too_future, 1);
+        assert_eq!(mapper.counts().long_span, 1);
+        assert_eq!(
+            page.envelopes[0].time.source_end, None,
+            "long spans become points"
+        );
+        assert_eq!(
+            page.envelopes[1].time.source_end,
+            Some(ctx.pulled_at + Duration::hours(24))
+        );
+        recipe.time_format = TimeFormat::UnixS;
+        recipe.map.end = None;
+        let mut mapper = PullMapper::new(&recipe, ctx).unwrap();
+        assert!(
+            mapper
+                .map_page(&json!({"messages":[{"sent_at":ctx.pulled_at.timestamp_millis()}]}))
+                .unwrap()
+                .envelopes
+                .is_empty()
+        );
+        assert_eq!(mapper.counts().too_future, 1);
+    }
+
+    #[test]
+    fn nul_is_removed_recursively_before_identity_hashing_and_payload_copy() {
+        let recipe = recipe();
+        let mut dirty = item();
+        dirty["id"] = json!("mes\u{0000}sage-1");
+        dirty["subject"] = json!("Orch\u{0000}ids");
+        dirty["nested\u{0000}"] = json!([{ "ke\u{0000}y": "val\u{0000}ue" }]);
+        let mut clean = item();
+        clean["nested"] = json!([{ "key":"value" }]);
+        let envelope = mapped(&recipe, dirty);
+        assert_eq!(
+            envelope.dedup_key(),
+            mapped(&recipe, clean.clone()).dedup_key()
+        );
+        assert_eq!(envelope.payload, json!({"title":"Orchids", "item":clean}));
+        assert!(
+            !serde_json::to_string(&envelope)
+                .unwrap()
+                .contains("\\u0000")
+        );
+        envelope.validate().unwrap();
+    }
+
+    #[test]
+    fn owner_context_controls_source_identity() {
+        let mut recipe = recipe();
+        recipe.source = "agent-supplied-other-source".into();
+        for source_id in ["01source", "owner-selected-source"] {
+            let page = PullMapper::new(
+                &recipe,
+                MapContext {
+                    source_id,
+                    ..context()
+                },
+            )
+            .unwrap()
+            .map_page(&json!({"messages":[item()]}))
+            .unwrap();
+            assert_eq!(
+                page.envelopes[0].connector_instance.as_str(),
+                format!("source:{source_id}")
+            );
+        }
+    }
+
+    #[test]
+    fn root_ignore_is_refused_and_copied_title_is_bounded_utf8() {
+        let mut recipe = recipe();
+        recipe.ignore = vec![String::new()];
+        assert!(recipe.validate().is_err());
+        recipe.ignore.clear();
+        let mut input = item();
+        input["subject"] = json!("🌻".repeat(257));
+        let envelope = mapped(&recipe, input.clone());
+        assert_eq!(envelope.payload["title"].as_str().unwrap().len(), 1024);
+        assert_eq!(envelope.payload["item"], input);
     }
 
     #[test]
