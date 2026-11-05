@@ -28,6 +28,9 @@ impl Onboarding {
             // A malformed edit must not claim that a configured device is unpaired.
             if let Ok(cfg) = Config::load_at(&self.dir) {
                 self.paired = !cfg.token.is_empty();
+                if self.paired && self.pending.is_none() {
+                    self.message = None;
+                }
             }
             self.checked = Instant::now();
         }
