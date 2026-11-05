@@ -122,7 +122,7 @@ pub async fn run_one<H: Handler>(pool: &PgPool, handler: &H) -> Result<bool> {
     Ok(true)
 }
 
-/// Dependency readiness is not a processing failure and does not spend an attempt.
+/// Pre-provider readiness refunds attempts; rate limits after launch spend them.
 #[derive(Debug)]
 pub enum Deferred {
     NormalizationPending,
@@ -144,8 +144,8 @@ impl std::fmt::Display for Deferred {
 }
 impl std::error::Error for Deferred {}
 pub async fn defer(pool: &PgPool, job: &Job, reason: &Deferred) -> Result<bool> {
-    Ok(sqlx::query("UPDATE jobs SET state='ready',attempts=CASE WHEN request_version>leased_version AND kind<>'interpret' THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=coalesce($4,now()+CASE WHEN $3='subscription rate limited' THEN interval '30 minutes' WHEN $3='subscription credential busy' THEN interval '5 seconds' ELSE interval '1 second' END),lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
-        .bind(job.id).bind(&job.owner).bind(reason.to_string()).bind(match reason { Deferred::Until(at) => Some(*at), _ => None }).execute(pool).await?.rows_affected()==1)
+    Ok(sqlx::query("UPDATE jobs SET state=CASE WHEN $5 AND attempts>=max_attempts THEN 'failed' ELSE 'ready' END,attempts=CASE WHEN $5 THEN attempts WHEN request_version>leased_version AND kind<>'interpret' THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=coalesce($4,now()+CASE WHEN $3='subscription rate limited' THEN interval '30 minutes' WHEN $3='subscription credential busy' THEN interval '5 seconds' ELSE interval '1 second' END),lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
+        .bind(job.id).bind(&job.owner).bind(reason.to_string()).bind(match reason { Deferred::Until(at) => Some(*at), _ => None }).bind(matches!(reason, Deferred::RateLimited)).execute(pool).await?.rows_affected()==1)
 }
 // Never persist arbitrary Display strings: SQL/provider/serde errors can contain source text.
 #[derive(Debug)]

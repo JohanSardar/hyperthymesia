@@ -93,7 +93,7 @@ async fn assert_revival_cap(kind: &str) {
             hx_jobs::finish(&f.store.pool, &j, None).await.unwrap();
             continue;
         }
-        hx_jobs::defer(&f.store.pool, &j, &hx_jobs::Deferred::RateLimited)
+        hx_jobs::defer(&f.store.pool, &j, &hx_jobs::Deferred::ProviderBusy)
             .await
             .unwrap();
         let state = f
@@ -872,8 +872,13 @@ async fn late_data_recompiles_without_unbounded_paid_reruns() {
 #[tokio::test]
 async fn revision24_compares_timeline_hash_instead_of_generation() {
     let f = Fixture::new().await;
-    let w = window();
-    ingest(&f.store, vec![event("first", 8)]).await;
+    let w = hx_store::window_at(Utc::now() - chrono::Duration::hours(40));
+    let at = |key: &str, start| {
+        let mut e = event(key, 8);
+        e.time = ObservationTime::point(start);
+        e
+    };
+    ingest(&f.store, vec![at("first", w.start)]).await;
     f.store.normalize_window(w).await.unwrap();
     let p = Counts::default();
     assert!(
@@ -895,14 +900,14 @@ async fn revision24_compares_timeline_hash_instead_of_generation() {
         "unchanged timeline must not buy the 24h pass"
     );
     let other = hx_store::window_at(w.end);
-    ingest(&f.store, vec![event("other-first", 12)]).await;
+    ingest(&f.store, vec![at("other-first", other.start)]).await;
     f.store.normalize_window(other).await.unwrap();
     assert!(
         hx_server::processing::interpret_window(&f.store, other, &runner.provider)
             .await
             .unwrap()
     );
-    ingest(&f.store, vec![event("other-late-before-pass", 12)]).await;
+    ingest(&f.store, vec![at("other-late-before-pass", other.start)]).await;
     drain(&f.store, &runner).await;
     assert_eq!(
         runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
@@ -913,8 +918,8 @@ async fn revision24_compares_timeline_hash_instead_of_generation() {
     drain(&f.store, &runner).await;
     assert_eq!(
         runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
-        4,
-        "the capped daily sweep can refresh changed prior context even when the timeline is unchanged"
+        3,
+        "context-only refreshes cannot buy a sweep when the timeline is unchanged"
     );
     f.close().await;
 }
@@ -1045,8 +1050,13 @@ async fn review_legacy_windows_do_not_buy_a_24h_rerun() {
 #[tokio::test]
 async fn review_revision24_waits_for_upload_backlog_to_settle() {
     let f = Fixture::new().await;
-    let w = window();
-    ingest(&f.store, vec![event("before-backlog", 8)]).await;
+    let w = hx_store::window_at(Utc::now() - chrono::Duration::hours(32));
+    let at = |key: &str| {
+        let mut e = event(key, 8);
+        e.time = ObservationTime::point(w.start);
+        e
+    };
+    ingest(&f.store, vec![at("before-backlog")]).await;
     f.store.normalize_window(w).await.unwrap();
     let runner = hx_server::processing::Runner {
         store: f.store.clone(),
@@ -1057,7 +1067,7 @@ async fn review_revision24_waits_for_upload_backlog_to_settle() {
         .unwrap();
     // Three upload batches, with no wall-clock sleeps or process-global env changes.
     for batch in 0..3 {
-        ingest(&f.store, vec![event(&format!("backlog-{batch}"), 8)]).await;
+        ingest(&f.store, vec![at(&format!("backlog-{batch}"))]).await;
         for _ in 0..10 {
             if !hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
                 break;
@@ -1129,14 +1139,19 @@ impl hx_visual::OcrEngine for ReviewOcr {
 #[tokio::test]
 async fn review_late_ocr_changes_the_24h_timeline_identity() {
     let f = Fixture::new().await;
-    let w = window();
+    let w = hx_store::window_at(Utc::now() - chrono::Duration::hours(32));
+    let at = |key: &str| {
+        let mut e = event(key, 8);
+        e.time = ObservationTime::point(w.start);
+        e
+    };
     let mut png = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageLuma8(image::GrayImage::new(8, 8))
         .write_to(&mut png, image::ImageFormat::Png)
         .unwrap();
     let bytes = png.into_inner();
     let sha = hx_store::hash(&bytes);
-    let mut still = event("late-ocr-still", 8);
+    let mut still = at("late-ocr-still");
     still.kind = Kind::new("media.still");
     still.payload = json!({"display":"synthetic","trigger":"focus_change","width":8,"height":8,"app_bundle_id":"synthetic.app"});
     still.blobs.push(hx_schema::BlobRef {
@@ -1144,7 +1159,7 @@ async fn review_late_ocr_changes_the_24h_timeline_identity() {
         media_type: "image/png".into(),
         bytes: bytes.len() as u64,
     });
-    ingest(&f.store, vec![event("before-ocr", 8), still]).await;
+    ingest(&f.store, vec![at("before-ocr"), still]).await;
     f.store.upload_blob(&sha, &bytes).await.unwrap();
     f.store.normalize_window(w).await.unwrap();
     let runner = hx_server::processing::Runner {
@@ -1197,7 +1212,8 @@ async fn stale_sweep_window(store: &Store, hour: u32) -> Interval {
         .unwrap();
     let g = store.generation(w).await.unwrap();
     store.finish_revision24(w, g).await.unwrap();
-    store.change_input(w).await.unwrap();
+    ingest(store, vec![event(&format!("sweep-changed-{hour}"), hour)]).await;
+    store.normalize_window(w).await.unwrap();
     hx_server::processing::compile_window(store, w)
         .await
         .unwrap();
@@ -1471,7 +1487,8 @@ async fn review_deferred_sweep_releases_its_unspent_start_but_not_future_days() 
             );
         }
         // New input permits this window to become a candidate again.
-        f.store.change_input(newest).await.unwrap();
+        ingest(&f.store, vec![event("new-visible-after-sweep", 12)]).await;
+        f.store.normalize_window(newest).await.unwrap();
         hx_server::processing::compile_window(&f.store, newest)
             .await
             .unwrap();
@@ -1891,5 +1908,162 @@ async fn cap_closed_task_changes_mark_no_windows() {
         assert!(!f.store.window_state(later).await.unwrap().dirty);
     }
     assert!(f.store.job_states().await.unwrap().is_empty());
+    f.close().await;
+}
+
+#[tokio::test]
+async fn close_old_explicit_revision_cannot_open_a_24h_slot() {
+    let f = Fixture::new().await;
+    let w = window();
+    ingest(&f.store, vec![event("old-explicit", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: Counts::default(),
+    };
+    assert!(
+        hx_server::processing::interpret_window(&f.store, w, &runner.provider)
+            .await
+            .unwrap()
+    );
+    ingest(&f.store, vec![event("old-changed", 8)]).await;
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an explicit historical run must not create an automatic 24h purchase"
+    );
+    let jobs = f.store.job_states().await.unwrap();
+    assert!(
+        !jobs
+            .iter()
+            .any(|j| j.payload["revision24"] == true && j.state == "ready")
+    );
+    // A retired (rather than exhausted) 24h slot must not strand changed history.
+    let g = f.store.generation(w).await.unwrap();
+    f.store.request_interpretation(w, g, true).await.unwrap();
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an existing historical 24h job cannot buy a run either"
+    );
+    assert!(
+        !f.store
+            .interpretation_state(w)
+            .await
+            .unwrap()
+            .revision24_finished
+    );
+    f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
+    assert_eq!(f.store.sweep_reservations().await.unwrap().len(), 1);
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn close_sweep_requires_a_changed_recorded_timeline_hash() {
+    for legacy in [false, true] {
+        let f = Fixture::new().await;
+        let w = window();
+        ingest(&f.store, vec![event("visible-hash", 8)]).await;
+        f.store.normalize_window(w).await.unwrap();
+        let g = f.store.generation(w).await.unwrap();
+        if legacy {
+            f.store
+                .publish_revision(w, g, json!({"tasks":[],"summary":"legacy without a hash"}))
+                .await
+                .unwrap();
+        } else {
+            hx_server::processing::interpret_window(
+                &f.store,
+                w,
+                &hx_server::processing::StubProvider,
+            )
+            .await
+            .unwrap();
+        }
+        f.store.finish_revision24(w, g).await.unwrap();
+        f.store.change_input(w).await.unwrap(); // Prior context alone.
+        let mut heartbeat = event("housekeeping-hash", 8);
+        heartbeat.kind = Kind::new("collector.health");
+        heartbeat.payload = json!({"collector":"synthetic","status":"running","dropped":0});
+        ingest(&f.store, vec![heartbeat]).await;
+        f.store.normalize_window(w).await.unwrap();
+        hx_server::processing::compile_window(&f.store, w)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET state='done'")
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
+        assert!(
+            f.store.sweep_reservations().await.unwrap().is_empty(),
+            "context and housekeeping cannot buy a sweep, legacy={legacy}"
+        );
+        ingest(&f.store, vec![event("real-change-hash", 8)]).await;
+        f.store.normalize_window(w).await.unwrap();
+        hx_server::processing::compile_window(&f.store, w)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET state='done'")
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
+        assert_eq!(
+            f.store.sweep_reservations().await.unwrap().len(),
+            usize::from(!legacy),
+            "a revision with no recorded hash requires an explicit request"
+        );
+        assert!(
+            hx_server::processing::interpret_window(
+                &f.store,
+                w,
+                &hx_server::processing::StubProvider
+            )
+            .await
+            .unwrap(),
+            "explicit requests remain available for changed or hashless history"
+        );
+        f.close().await;
+    }
+}
+
+#[tokio::test]
+async fn close_empty_sweep_candidate_releases_today_for_visible_history() {
+    let f = Fixture::new().await;
+    let visible = stale_sweep_window(&f.store, 8).await;
+    let empty = hx_store::window_at(event("empty", 12).time.observed_at);
+    f.store.generation(empty).await.unwrap();
+    hx_server::processing::compile_window(&f.store, empty)
+        .await
+        .unwrap();
+    // This window has compiled but admission has not classified it yet.
+    f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
+    assert_eq!(
+        f.store.sweep_reservations().await.unwrap()[0].1,
+        empty.start
+    );
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: Counts::default(),
+    };
+    drain(&f.store, &runner).await;
+    let reservations = f.store.sweep_reservations().await.unwrap();
+    assert_eq!(
+        reservations,
+        vec![(Utc::now().date_naive(), visible.start, true)],
+        "the same worker tick must replace empty admission with real work"
+    );
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     f.close().await;
 }
