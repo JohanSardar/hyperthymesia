@@ -35,5 +35,6 @@ tempfile.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
+hx-store = { workspace = true, features = ["test-support"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
