@@ -33,8 +33,8 @@ pub async fn claim(pool: &PgPool, lease_seconds: i64) -> Result<Option<Job>> {
     sqlx::query("SELECT pg_advisory_xact_lock(6847291630281)")
         .execute(&mut *tx)
         .await?;
-    // A crashed worker must not exhaust the attempt budget of newer input.
-    sqlx::query("UPDATE jobs SET attempts=0 WHERE state='running' AND lease_until<statement_timestamp() AND request_version>leased_version").execute(&mut *tx).await?;
+    // Free jobs get a fresh budget for newer input; paid budgets survive generation changes.
+    sqlx::query("UPDATE jobs SET attempts=0 WHERE kind<>'interpret' AND state='running' AND lease_until<statement_timestamp() AND request_version>leased_version").execute(&mut *tx).await?;
     sqlx::query("UPDATE jobs SET state='failed',available_at=statement_timestamp()+interval '5 minutes',lease_until=NULL,lease_owner=NULL,last_error=coalesce(last_error,'worker lease expired; attempts exhausted') WHERE attempts>=max_attempts AND (state='ready' OR (state='running' AND lease_until<statement_timestamp()))")
         .execute(&mut *tx).await?;
     // Also repair normalization slots exhausted before this recovery logic existed.
@@ -61,7 +61,7 @@ pub async fn heartbeat(pool: &PgPool, job: &Job, seconds: i64) -> Result<bool> {
 }
 pub async fn finish(pool: &PgPool, job: &Job, error: Option<&str>) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    let state: Option<String> = sqlx::query_scalar("UPDATE jobs SET state=CASE WHEN $3::text IS NULL THEN CASE WHEN request_version>leased_version THEN 'ready' ELSE 'done' END WHEN request_version>leased_version THEN 'ready' WHEN attempts>=max_attempts THEN 'failed' ELSE 'ready' END,attempts=CASE WHEN request_version>leased_version THEN 0 ELSE attempts END,last_error=$3,available_at=CASE WHEN request_version>leased_version THEN now() WHEN $3::text IS NOT NULL AND attempts>=max_attempts THEN now()+interval '5 minutes' ELSE now()+interval '5 seconds' END,lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now() RETURNING state")
+    let state: Option<String> = sqlx::query_scalar("UPDATE jobs SET state=CASE WHEN $3::text IS NULL THEN CASE WHEN request_version>leased_version THEN 'ready' ELSE 'done' END WHEN request_version>leased_version THEN 'ready' WHEN attempts>=max_attempts THEN 'failed' ELSE 'ready' END,attempts=CASE WHEN request_version>leased_version AND kind<>'interpret' THEN 0 ELSE attempts END,last_error=$3,available_at=CASE WHEN request_version>leased_version THEN now() WHEN $3::text IS NOT NULL AND attempts>=max_attempts THEN now()+interval '5 minutes' ELSE now()+interval '5 seconds' END,lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now() RETURNING state")
         .bind(job.id).bind(&job.owner).bind(error).fetch_optional(&mut *tx).await?;
     if state.as_deref() == Some("failed") && job.kind == "normalize" {
         quarantine_exhausted(&mut tx, std::slice::from_ref(&job.payload)).await?;
@@ -84,7 +84,8 @@ async fn quarantine_exhausted(
     Ok(())
 }
 
-/// At most three failed-job revivals per input generation, after five minutes.
+/// At most three failed-job revivals after five minutes. Only free compile
+/// jobs reset this budget when their input generation changes.
 /// Existing output keys keep recovery idempotent and the error history bounded.
 pub async fn revive_window_jobs(pool: &PgPool) -> Result<()> {
     sqlx::query("UPDATE jobs SET state='ready',attempts=0,revivals=revivals+1,request_version=request_version+1,lease_until=NULL,lease_owner=NULL WHERE id IN (SELECT id FROM jobs WHERE state='failed' AND revivals<3 AND NOT (payload ? 'sweep_day') AND kind IN ('compile','interpret') AND available_at<=now() ORDER BY available_at,id LIMIT 1000 FOR UPDATE SKIP LOCKED)")
@@ -143,7 +144,7 @@ impl std::fmt::Display for Deferred {
 }
 impl std::error::Error for Deferred {}
 pub async fn defer(pool: &PgPool, job: &Job, reason: &Deferred) -> Result<bool> {
-    Ok(sqlx::query("UPDATE jobs SET state='ready',attempts=CASE WHEN request_version>leased_version THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=coalesce($4,now()+CASE WHEN $3='subscription rate limited' THEN interval '30 minutes' WHEN $3='subscription credential busy' THEN interval '5 seconds' ELSE interval '1 second' END),lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
+    Ok(sqlx::query("UPDATE jobs SET state='ready',attempts=CASE WHEN request_version>leased_version AND kind<>'interpret' THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=coalesce($4,now()+CASE WHEN $3='subscription rate limited' THEN interval '30 minutes' WHEN $3='subscription credential busy' THEN interval '5 seconds' ELSE interval '1 second' END),lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
         .bind(job.id).bind(&job.owner).bind(reason.to_string()).bind(match reason { Deferred::Until(at) => Some(*at), _ => None }).execute(pool).await?.rows_affected()==1)
 }
 // Never persist arbitrary Display strings: SQL/provider/serde errors can contain source text.

@@ -310,7 +310,21 @@ impl Store {
         let lineage: Vec<Value> = sqlx::query_scalar("SELECT jsonb_build_object('id',id,'source_event_id',source_event_id,'sha256',sha256,'engine_version',engine_version) FROM ocr_derived WHERE source_start >= $1 AND source_start < $2 ORDER BY id")
             .bind(timeline.window.start - Duration::minutes(30)).bind(timeline.window.end)
             .fetch_all(&self.pool).await?;
-        let identity = hash(&serde_json::to_vec(&(timeline, lineage))?);
+        // Keep the full timeline for display, but exclude admission-ineligible
+        // housekeeping from paid identity, including its lanes/coverage effects.
+        let observations: Vec<_> = self
+            .observations(timeline.window, true)
+            .await?
+            .into_iter()
+            .filter(|o| {
+                !matches!(
+                    o.envelope.kind.as_str(),
+                    "collector.health" | "clock.calibration" | "presence.span"
+                )
+            })
+            .collect();
+        let paid_timeline = hx_compile::compile(&observations, timeline.window);
+        let identity = hash(&serde_json::to_vec(&(paid_timeline, lineage))?);
         Ok(sqlx::query("UPDATE windows SET timeline=$3,compiler_version=$4,compiled_generation=$2,dirty=false,timeline_hash=$5 WHERE start_at=$1 AND generation=$2")
             .bind(timeline.window.start).bind(generation).bind(serde_json::to_value(timeline)?).bind(&timeline.compiler_version).bind(identity).execute(&self.pool).await?.rows_affected()==1)
     }
@@ -339,8 +353,8 @@ impl Store {
         Ok(())
     }
     /// Reserve only one stale window per UTC day, including across scheduler restarts.
-    /// Reservation history prevents failed/deferred input from winning again.
-    /// Exhausted first interpretations get one rescue after their normal budget.
+    /// Unchanged failed/deferred input cools down for seven UTC days.
+    /// Historical first runs and exhausted 24h passes share this same cap.
     pub async fn schedule_daily_sweep(&self, now: DateTime<Utc>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let candidate = sqlx::query(
@@ -350,26 +364,30 @@ impl Store {
                AND w.end_at+interval '24 hours'<=$1
                AND NOT w.dirty AND w.compiled_generation=w.generation
                AND (
-                 (w.revision24_finished AND r.input_generation<w.generation)
-                 OR (w.canonical_revision IS NULL AND EXISTS (
-                   SELECT 1 FROM jobs exhausted
-                   WHERE exhausted.kind='interpret' AND exhausted.state='failed'
-                     AND exhausted.revivals>=3
-                     AND (exhausted.payload->>'generation')::bigint=w.generation
-                     AND (exhausted.payload->'window'->>'start')::timestamptz=w.start_at
+                 w.canonical_revision IS NULL
+                 OR (r.input_generation<w.generation AND (
+                   w.revision24_finished OR EXISTS (
+                     SELECT 1 FROM jobs exhausted
+                     WHERE exhausted.kind='interpret' AND exhausted.state='failed'
+                       AND exhausted.revivals>=3
+                       AND exhausted.payload->>'revision24'='true'
+                       AND (exhausted.payload->'window'->>'start')::timestamptz=w.start_at
+                   )
                  ))
                )
                AND NOT EXISTS (
                  SELECT 1 FROM daily_sweeps spent
                  WHERE spent.start_at=w.start_at AND spent.generation=w.generation
+                   AND spent.day > ($1 AT TIME ZONE 'UTC')::date-7
                )
                AND NOT EXISTS (
                  SELECT 1 FROM jobs j WHERE j.kind='interpret'
                    AND (j.payload->'window'->>'start')::timestamptz=w.start_at
                    AND (j.state IN ('ready','running') OR (
-                     j.state='failed'
-                     AND (j.payload->>'generation')::bigint>=w.generation
-                     AND NOT (w.canonical_revision IS NULL AND j.revivals>=3)
+                     j.state='failed' AND j.revivals<3
+                     AND j.payload->>'revision24'='true'
+                     AND NOT w.revision24_finished
+                     AND NOT (j.payload ? 'sweep_day')
                    ))
                )
              ORDER BY w.end_at DESC LIMIT 1 FOR UPDATE OF w SKIP LOCKED",
@@ -386,7 +404,14 @@ impl Store {
             let reserved: Option<chrono::NaiveDate> = sqlx::query_scalar("INSERT INTO daily_sweeps(day,start_at,generation) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING day")
                 .bind(now.date_naive()).bind(w.start).bind(generation).fetch_optional(&mut *tx).await?;
             if reserved.is_some() {
-                sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue) VALUES($1,'interpret',$2,'backfill') ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,revivals=CASE WHEN jobs.payload->'generation'=EXCLUDED.payload->'generation' THEN jobs.revivals ELSE 0 END,request_version=jobs.request_version+1,state='ready',attempts=0,available_at=now(),last_error=NULL WHERE jobs.state IN ('done','failed')")
+                // Reservation takes over the one automatic catch-up opportunity.
+                // Retire it under the window lock, before any provider work or
+                // concurrent generation change can expose a fresh 24h slot.
+                sqlx::query("UPDATE windows SET revision24_finished=true WHERE start_at=$1")
+                    .bind(w.start)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue) VALUES($1,'interpret',$2,'backfill') ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,revivals=jobs.revivals,request_version=jobs.request_version+1,state='ready',attempts=0,available_at=now(),last_error=NULL WHERE jobs.state IN ('done','failed')")
                     .bind(format!("interpret:{}", w.start)).bind(json!({"window":w,"generation":generation,"sweep_day":now.date_naive()})).execute(&mut *tx).await?;
             }
         }
@@ -623,7 +648,8 @@ pub async fn request_window_job(
     Ok(())
 }
 
-/// Coalesce interpretation requests while preserving an active worker's fencing token.
+/// Refresh automatic input without refilling paid attempts or revival rounds.
+/// Done/failed slots stay terminal; an input generation is not a paid request.
 pub async fn request_interpret_job(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     window: Interval,
@@ -636,7 +662,7 @@ pub async fn request_interpret_job(
     } else {
         "interpret"
     };
-    sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue,available_at) VALUES($1,'interpret',$2,$3,$4) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,revivals=0,request_version=jobs.request_version+1,state=CASE WHEN jobs.state='running' THEN 'running' ELSE 'ready' END,attempts=CASE WHEN jobs.state='running' THEN jobs.attempts ELSE 0 END,available_at=EXCLUDED.available_at,last_error=NULL WHERE coalesce((jobs.payload->>'generation')::bigint,0)<(EXCLUDED.payload->>'generation')::bigint")
+    sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue,available_at) VALUES($1,'interpret',$2,$3,$4) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,request_version=jobs.request_version+1,available_at=CASE WHEN jobs.state='ready' THEN EXCLUDED.available_at ELSE jobs.available_at END WHERE coalesce((jobs.payload->>'generation')::bigint,0)<(EXCLUDED.payload->>'generation')::bigint")
         .bind(format!("{slot}:{}", window.start))
         .bind(json!({"window":window,"generation":generation,"revision24":revision24}))
         .bind(if revision24 { "backfill" } else { "interactive" })

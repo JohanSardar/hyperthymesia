@@ -156,7 +156,14 @@ Stop existing workers before running the migration and restart on the new binary
 Migration 0004 retires the legacy normalize/compile backlog, fences its leases,
 and seeds window slots for remaining work. Existing failed interpret jobs are
 preserved; an operator can reset their attempts and requeue them after inspecting
-the local failure. The scheduler also requests interpretation for new generations.
+the local failure. Migration 0010 retires old automatic interpretation jobs and
+24-hour passes. After T+24h, windows without a canonical revision use the capped
+daily sweep; exhausted 24-hour passes are also eligible. The sweep reserves one
+window per UTC day and permits one paid attempt. Failed or deferred unchanged
+input becomes eligible again after seven UTC days, or sooner after input changes.
+Generation bumps preserve paid attempt and revival budgets; explicit `hx interpret`
+requests remain available. Housekeeping does not change the paid timeline identity;
+OCR lineage does.
 
 ## Verification
 

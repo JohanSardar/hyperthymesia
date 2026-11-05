@@ -420,7 +420,7 @@ impl<P: Provider> Handler for Runner<P> {
                 let (_, generation) = compile_window(&self.store, w).await?;
                 let state = self.store.interpretation_state(w).await?;
                 let mut tx = self.store.pool.begin().await?;
-                if state.canonical_revision.is_none() {
+                if state.canonical_revision.is_none() && Utc::now() < w.end + Duration::hours(24) {
                     hx_store::request_interpret_job(
                         &mut tx,
                         w,
@@ -437,7 +437,10 @@ impl<P: Provider> Handler for Runner<P> {
                     sqlx::query("UPDATE jobs SET state='done' WHERE output_key=$1 AND state='ready' AND NOT (payload ? 'sweep_day')")
                         .bind(format!("interpret:{}", w.start)).execute(&mut *tx).await?;
                 }
-                if !state.revision24_finished {
+                if !state.revision24_finished
+                    && (state.canonical_revision.is_some()
+                        || Utc::now() < w.end + Duration::hours(24))
+                {
                     hx_store::request_interpret_job(
                         &mut tx,
                         w,
@@ -471,7 +474,7 @@ impl<P: Provider> Handler for Runner<P> {
                     .map(serde_json::from_value::<chrono::NaiveDate>)
                     .transpose()?;
                 if revision24 {
-                    if state.revision24_finished {
+                    if state.revision24_finished || state.canonical_revision.is_none() {
                         return Ok(());
                     }
                     if !state.timeline_changed {
@@ -483,7 +486,11 @@ impl<P: Provider> Handler for Runner<P> {
                     if !self.store.start_daily_sweep(w, day).await? {
                         return Ok(());
                     }
-                } else if state.canonical_revision.is_some() {
+                } else if state.canonical_revision.is_some()
+                    || Utc::now() >= w.end + Duration::hours(24)
+                {
+                    // Old first-run jobs, including pre-upgrade retries, cannot
+                    // spend outside the capped sweep. Explicit calls bypass this handler.
                     return Ok(());
                 }
                 let result = interpret_window_key(
