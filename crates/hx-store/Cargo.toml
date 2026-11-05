@@ -21,3 +21,6 @@ sha2.workspace = true
 hex.workspace = true
 tempfile.workspace = true
 ulid.workspace = true
+
+[features]
+test-support = []
