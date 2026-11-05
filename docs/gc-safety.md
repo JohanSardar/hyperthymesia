@@ -1,31 +1,24 @@
-# Automatic GC is disabled
+# Automatic GC is off
 
-N1 (#35) deliberately does not schedule `Store::gc()` in `serve`. The issue
-plan reports that GC has never run in production; the only production call in
-`31810ed` is the explicit `hx-server gc` command. No owner data was inspected.
+`serve` does not schedule `Store::gc()`. The only caller is the explicit
+`hx-server gc` command, and it has never run on real data.
 
-The implementation in `crates/hx-store/src/lib.rs` selects published, unpinned
-`chunk` blobs whose **blob row** is over 30 days old. It preserves `keep` blobs
-(including stills) and pins, and locks each selected blob row. Upload and ingest
-also lock that row, so they serialize with GC. These protections are insufficient
-to turn on unattended deletion:
+GC deletes published, unpinned `chunk` blobs whose row is over 30 days old. It
+keeps `keep` blobs (including stills) and pinned blobs, and holds the row lock
+that upload also takes while it unlinks each file.
 
-- A new live chunk record referencing an old hash increments `refcount` without
-  refreshing `created_at`. Re-uploading expired bytes also keeps that timestamp.
-  GC can therefore immediately expire bytes just acknowledged to a concurrent
-  uploader or needed by a new live record. It never considers reference age.
-- The selection does not check live references or OCR jobs. Stills currently
-  promote the shared hash to `keep`, which protects normal OCR discovery, but
-  active jobs do not acquire pins (the only `pin` callers are tests). There is
-  no general active-reader/job protection.
-- It unlinks real files **before** committing the database transaction. Failure
-  on a later file, database update, or commit rolls back database changes without
-  restoring already deleted bytes. Those rows can still say `published=true`;
-  a retry upload then returns early without repairing the missing file.
+Uploads are safe against it: a re-upload restores a missing file and restarts
+the 30 days, so a 200 means the bytes are there and will stay.
 
-Before enabling daily GC, the store owner must define reference-aware retention
-and upload acknowledgement semantics, protect active jobs, and make deletion
-recoverable across filesystem/database failures. Synthetic tests must cover an
-old hash receiving a fresh reference or upload, active OCR, retention/pins, and
-partial deletion/commit failure. N1 does not change `hx-store` or `hx-jobs`, and
-the existing manual GC command remains available with these limitations.
+Two things must be settled before it runs unattended:
+
+- **References.** A new live record pointing at an old hash raises `refcount` but
+  doesn't restart the 30 days, and GC never looks at references or age of use. It
+  could delete bytes a new record needs. Active jobs also take no pins, although
+  stills are `keep`, which protects normal OCR.
+- **The owner's first run.** It permanently deletes every chunk over 30 days old
+  in one pass, so turning it on is the owner's decision, not a side effect of an
+  upgrade.
+
+Tests for that change must cover an old hash getting a fresh reference, active
+OCR, retention and pins, and a failure part way through a run.
