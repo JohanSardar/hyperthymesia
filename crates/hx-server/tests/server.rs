@@ -8,6 +8,7 @@ use hx_schema::{
     ConnectorInstance, Envelope, Kind, ObservationId, ObservationTime, Operation, Revision,
     Sensitivity, SourceKey,
 };
+use hx_server::disclosure::DisclosurePolicy;
 use hx_store::{Store, Token, UploadBatch};
 use serde_json::{Value, json};
 use sqlx::{Row, postgres::PgPoolOptions};
@@ -131,7 +132,25 @@ async fn request(
     secret: &str,
     body: Vec<u8>,
 ) -> (StatusCode, Vec<u8>) {
-    let response = hx_server::router(store.clone())
+    request_with_policy(
+        store,
+        DisclosurePolicy::default(),
+        method,
+        path,
+        secret,
+        body,
+    )
+    .await
+}
+async fn request_with_policy(
+    store: &Store,
+    policy: DisclosurePolicy,
+    method: &str,
+    path: &str,
+    secret: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Vec<u8>) {
+    let response = hx_server::router(store.clone(), policy)
         .oneshot(
             Request::builder()
                 .method(method)
@@ -745,7 +764,7 @@ async fn compressed_upload_preserves_batch_identity_and_tokens_can_be_revoked() 
         envelopes: vec![event("compressed", 8)],
     };
     let data = zstd::stream::encode_all(serde_json::to_vec(&batch).unwrap().as_slice(), 1).unwrap();
-    let response = hx_server::router(f.store.clone())
+    let response = hx_server::router(f.store.clone(), DisclosurePolicy::default())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -778,7 +797,7 @@ async fn compressed_upload_preserves_batch_identity_and_tokens_can_be_revoked() 
 async fn browser_signin_sets_a_private_cookie_and_renders_day() {
     let f = Fixture::new().await;
     let key = secret(&f.store).await;
-    let response = hx_server::router(f.store.clone())
+    let response = hx_server::router(f.store.clone(), DisclosurePolicy::default())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -796,7 +815,7 @@ async fn browser_signin_sets_a_private_cookie_and_renders_day() {
         .to_owned();
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("SameSite=Strict"));
-    let response = hx_server::router(f.store.clone())
+    let response = hx_server::router(f.store.clone(), DisclosurePolicy::default())
         .oneshot(
             Request::builder()
                 .uri("/day/2026-01-01")
@@ -893,18 +912,117 @@ async fn canonical_revision_checks_transitive_namespace_lineage() {
         )
         .await
         .unwrap();
-    let partial = hx_server::timeline_value(&f.store, &token(), w, "episodes")
-        .await
-        .unwrap();
+    let partial = hx_server::timeline_value(
+        &f.store,
+        &token(),
+        &DisclosurePolicy::default(),
+        w,
+        "episodes",
+    )
+    .await
+    .unwrap();
     assert_eq!(partial["revisions"], json!([]));
     let mut complete = token();
     complete.prefixes.push("other:".into());
-    let full = hx_server::timeline_value(&f.store, &complete, w, "episodes")
-        .await
-        .unwrap();
+    let full = hx_server::timeline_value(
+        &f.store,
+        &complete,
+        &DisclosurePolicy::default(),
+        w,
+        "episodes",
+    )
+    .await
+    .unwrap();
     assert_eq!(full["revisions"].as_array().unwrap().len(), 1);
     f.close().await;
 }
+#[tokio::test]
+async fn api_withholds_canonical_revisions_citing_restricted_evidence() {
+    let f = Fixture::new().await;
+    let at = (Utc::now() - Duration::minutes(1))
+        .with_nanosecond(0)
+        .unwrap();
+    let w = hx_store::window_at(at);
+    let mut core = event("disclosure-core", 8);
+    core.time = ObservationTime::point(at);
+    let mut unknown = core.clone();
+    unknown.observation_id = ObservationId::generate();
+    unknown.source_key = SourceKey::new("disclosure-unknown");
+    unknown.kind = Kind::new("extension.note");
+    unknown.payload = json!({"text":"synthetic withheld note"});
+    ingest(&f.store, vec![core, unknown]).await;
+    f.store.normalize_window(w).await.unwrap();
+    let core_id: i64 = sqlx::query_scalar("SELECT id FROM events WHERE kind='web.visit'")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let unknown_id: i64 = sqlx::query_scalar("SELECT id FROM events WHERE kind='extension.note'")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    let reader = f
+        .store
+        .create_token("l3-reader", token().prefixes, vec!["read_l3".into()])
+        .await
+        .unwrap();
+    let raw_reader = f
+        .store
+        .create_token("raw-reader", token().prefixes, vec!["read_raw".into()])
+        .await
+        .unwrap();
+    let timeline = format!(
+        "/v1/timeline?from={}&to={}&level=episodes",
+        w.start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        w.end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    );
+    let grant = DisclosurePolicy::from_json(
+        r#"{"rules":[{"connector_prefix":"test:","kind":"extension.note","class":"normal"}]}"#,
+    )
+    .unwrap();
+    let restrict = DisclosurePolicy::from_json(
+        r#"{"rules":[{"connector_prefix":"test:","kind":"web.visit","class":"restricted"}]}"#,
+    )
+    .unwrap();
+    for (id, withheld, policy) in [
+        (core_id, false, DisclosurePolicy::default()),
+        (unknown_id, true, DisclosurePolicy::default()),
+        (unknown_id, false, grant),
+        (core_id, true, restrict),
+    ] {
+        let interpretation = json!({
+            "episodes":[{"evidence":[core_id],"claims":[{"outcome_evidence":[id]}]}],
+            "tasks":[],"summary":"synthetic stored interpretation"
+        });
+        let generation = f.store.generation(w).await.unwrap();
+        let (revision, published) = f
+            .store
+            .publish_revision(w, generation, interpretation.clone())
+            .await
+            .unwrap();
+        assert!(published);
+        for path in [timeline.as_str(), "/v1/now"] {
+            for (key, hidden) in [(&reader, withheld), (&raw_reader, false)] {
+                let (status, body) =
+                    request_with_policy(&f.store, policy.clone(), "GET", path, key, vec![]).await;
+                assert_eq!(status, StatusCode::OK);
+                let value: Value = serde_json::from_slice(&body).unwrap();
+                assert!(value["coverage"].is_array());
+                assert_eq!(value["observed_through"], json!(at));
+                if hidden {
+                    assert_eq!(value["revisions"], json!([]), "{path}");
+                    assert!(value["interpreted_through"].is_null(), "{path}");
+                } else {
+                    assert_eq!(value["revisions"].as_array().unwrap().len(), 1, "{path}");
+                    assert_eq!(value["revisions"][0]["revision_id"], revision);
+                    assert_eq!(value["revisions"][0]["interpretation"], interpretation);
+                    assert_eq!(value["interpreted_through"], json!(w.end));
+                }
+            }
+        }
+    }
+    f.close().await;
+}
+
 #[tokio::test]
 async fn context_changes_invalidate_dependent_generations() {
     let f = Fixture::new().await;
@@ -1613,7 +1731,7 @@ async fn ocr_backfill_exact_cache_lineage_packet_and_dashboard() {
         .create_token("ocr-reader", token().prefixes, token().scopes)
         .await
         .unwrap();
-    let response = hx_server::router(f.store.clone())
+    let response = hx_server::router(f.store.clone(), DisclosurePolicy::default())
         .oneshot(
             Request::builder()
                 .uri(format!("/evidence/{source_id}"))
@@ -2701,7 +2819,7 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
         format!("/revision/{previous}/run"),
         format!("/revision/{previous}/evidence/{id}"),
     ] {
-        let response = hx_server::router(f.store.clone())
+        let response = hx_server::router(f.store.clone(), DisclosurePolicy::default())
             .oneshot(
                 Request::builder()
                     .uri(&path)

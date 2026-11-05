@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
             if !listen.ip().is_loopback() {
                 bail!("listen must be loopback; use a local Tailscale proxy");
             }
+            let policy = hx_server::disclosure::DisclosurePolicy::from_env()?;
             let listener = tokio::net::TcpListener::bind(listen).await?;
             let runner = Runner {
                 store: store.clone(),
@@ -135,7 +136,7 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             });
-            let result = axum::serve(listener, hx_server::router(store))
+            let result = axum::serve(listener, hx_server::router(store, policy))
                 .with_graceful_shutdown(async {
                     let _ = tokio::signal::ctrl_c().await;
                 })
