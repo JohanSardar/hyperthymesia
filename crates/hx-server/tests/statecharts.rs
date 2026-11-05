@@ -2041,3 +2041,54 @@ async fn close_empty_sweep_candidate_releases_today_for_visible_history() {
     );
     f.close().await;
 }
+
+#[tokio::test]
+async fn ingest_succeeds_while_interpretation_is_running() {
+    struct Blocking {
+        started: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+    impl hx_interpret::Provider for Blocking {
+        fn name(&self) -> String {
+            "synthetic-blocking".into()
+        }
+        async fn complete(&self, _: &str, _: &str) -> Result<String, hx_interpret::InterpretError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(json!({"episodes":[],"tasks":[],"summary":"Synthetic"}).to_string())
+        }
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Store::create(scratch.path()).await.unwrap();
+    let w = window();
+    ingest(&store, vec![event("before-provider", 8)]).await;
+    store.normalize_window(w).await.unwrap();
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let provider = Blocking {
+        started: started.clone(),
+        release: release.clone(),
+    };
+    let running_store = store.clone();
+    let running = tokio::spawn(async move {
+        hx_server::processing::interpret_window(&running_store, w, &provider).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let ingested = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ingest(&store, vec![event("during-provider", 8)]),
+    )
+    .await;
+    release.notify_one();
+    let outcome = running.await.unwrap();
+    assert_eq!(
+        ingested
+            .expect("ingest must proceed while the provider is blocked")
+            .accepted,
+        1
+    );
+    assert!(outcome.is_ok(), "{outcome:?}");
+    store.pool.close().await;
+}
