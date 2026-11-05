@@ -125,6 +125,7 @@ pub fn exposure_by_label(timeline: &Timeline, lane_kind: &str) -> Vec<(String, c
 mod attention;
 pub use attention::AttentionConfig;
 mod compiler;
+pub use compiler::latest_observations;
 
 /// Compile with explicit, reproducible attention thresholds.
 pub fn compile_with_attention_config(

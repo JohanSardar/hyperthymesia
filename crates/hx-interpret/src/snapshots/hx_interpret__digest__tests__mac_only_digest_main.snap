@@ -1,0 +1,15 @@
+---
+source: crates/hx-interpret/src/digest.rs
+expression: digest.text
+---
+window 2026-01-01T10:00:00+00:00 to 2026-01-01T14:00:00+00:00 (UTC). One line per stretch of foreground activity.
+Format: [evidence ids] start-end app | titles | attention | input | urls, then new screen text.
+Cite any listed id; the line's whole interval is supported by each of its ids.
+totals: apps Synthetic Browser 8m00s | attention unknown 240m00s
+
+[1,2,3] 10:00:00-10:05:00 Synthetic Browser | unknown 5m00s | keys 0 clicks 0 scrolls 0
+[99] (screenshot) Synthetic quarterly planning notes
+[4] 11:00:00-11:03:00 Synthetic Browser | unknown 3m00s | keys 0 clicks 0 scrolls 0
+
+Unknown stretches (capture not verified: not idle, not away; write no episodes about them):
+[1,2,3,4] 10:00:00-14:00:00

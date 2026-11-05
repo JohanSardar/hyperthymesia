@@ -43,7 +43,7 @@ impl Store {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<EventRecord>> {
-        sqlx::query_as("SELECT id,received_at,envelope FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 ORDER BY source_start,id").bind(start).bind(end).fetch_all(&self.pool).await
+        sqlx::query_as("WITH candidates AS (SELECT connector_instance,source_key FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1) SELECT e.id,e.received_at,e.envelope FROM events e JOIN (SELECT DISTINCT connector_instance,source_key FROM candidates) c USING (connector_instance,source_key) ORDER BY e.source_start,e.id").bind(start).bind(end).fetch_all(&self.pool).await
     }
     pub async fn source_envelope(&self, id: i64) -> Result<Option<Value>> {
         sqlx::query_scalar("SELECT envelope FROM events WHERE id=$1 UNION ALL SELECT e.envelope FROM ocr_evidence d JOIN events e ON e.id=d.source_event_id WHERE d.id=$1").bind(id).fetch_optional(&self.pool).await
