@@ -107,20 +107,49 @@ impl Broker {
             .max(config.input_gap_s)
             .max(config.health_max_s)
             .max(config.visual_change_s);
-        let rows = sqlx::query("SELECT id,received_at,envelope FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 ORDER BY source_start,id")
+        // Fetch all revisions of candidate identities as well: an edit or
+        // tombstone outside this window can supersede a record inside it.
+        let rows = sqlx::query("WITH candidates AS (SELECT connector_instance,source_key FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1) SELECT e.id,e.received_at,e.envelope FROM events e JOIN (SELECT DISTINCT connector_instance,source_key FROM candidates) c USING (connector_instance,source_key) ORDER BY e.source_start,e.id")
             .bind(self.window.start - Duration::seconds(i64::from(lookback))).bind(self.window.end).fetch_all(&self.store.pool).await?;
         let mut capture = vec![];
         let mut visible = vec![];
         let mut screens = vec![];
         let mut evidence = BTreeMap::new();
         let mut namespaces = std::collections::BTreeSet::new();
-        for row in rows {
-            let e: Envelope = serde_json::from_value(row.get("envelope"))?;
-            let o = hx_compile::Observation {
-                id: row.get("id"),
-                received_at: row.get("received_at"),
-                envelope: e,
-            };
+        let observations: Vec<hx_compile::Observation> = rows
+            .into_iter()
+            .map(|row| {
+                Ok(hx_compile::Observation {
+                    id: row.get("id"),
+                    received_at: row.get("received_at"),
+                    envelope: serde_json::from_value(row.get("envelope"))?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let current: std::collections::BTreeSet<_> = hx_compile::latest_observations(&observations)
+            .into_iter()
+            .filter(|o| o.envelope.operation != hx_schema::Operation::Delete)
+            .map(|o| o.id)
+            .collect();
+        for o in observations {
+            // Extra revisions participate in selection only. Preserve the
+            // original time-bounded capture scan, including its lookback.
+            let at = o
+                .envelope
+                .time
+                .source_start
+                .unwrap_or(o.envelope.time.observed_at);
+            let end = o.envelope.time.source_end.unwrap_or(at);
+            if at >= self.window.end
+                || end < self.window.start - Duration::seconds(i64::from(lookback))
+            {
+                continue;
+            }
+            // Preserve core capture rendering; only current non-core source
+            // records enter the digest or its citable evidence sidecar.
+            if !hx_schema::kinds::is_core(o.envelope.kind.as_str()) && !current.contains(&o.id) {
+                continue;
+            }
             let e = &o.envelope;
             if matches!(
                 e.kind.as_str(),

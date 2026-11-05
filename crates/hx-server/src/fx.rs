@@ -792,8 +792,31 @@ fn citation_support(
             s.intersect(&window)
         }
     };
+    let long_sources: std::collections::BTreeMap<_, _> = observations
+        .iter()
+        .filter_map(|o| {
+            let start = o
+                .envelope
+                .time
+                .source_start
+                .unwrap_or(o.envelope.time.observed_at);
+            let end = o.envelope.time.source_end.unwrap_or(start);
+            (o.envelope
+                .connector_instance
+                .as_str()
+                .starts_with("source:")
+                && end - start > chrono::Duration::hours(4))
+            .then_some((o.id, start))
+        })
+        .collect();
     let mut by_evidence = std::collections::BTreeMap::<i64, Vec<Interval>>::new();
     let mut add = |id: i64, s: Interval| {
+        // Apply the same bound to compiled and raw support so neither path
+        // can restore a long sender-controlled span (or clamp an old start).
+        let s = long_sources.get(&id).map_or(s, |start| Interval {
+            start: *start,
+            end: *start,
+        });
         if let Some(s) = clip(s) {
             let entry = by_evidence.entry(id).or_default();
             if !entry.contains(&s) {
@@ -1065,6 +1088,119 @@ print(json.dumps({'exit_code':0,'model':model,'steps':2,'final_output':'syntheti
         }];
         assert!(digest_excerpt(digest, window, &late).contains("[3] 23:50:00-00:00:00"));
     }
+    #[test]
+    fn long_source_spans_only_support_the_start_but_meetings_keep_their_span() {
+        let window = Interval {
+            start: "2026-01-01T10:00:00Z".parse().unwrap(),
+            end: "2026-01-01T14:00:00Z".parse().unwrap(),
+        };
+        for (connector, start, hours, extra_seconds, point) in [
+            ("source:mail", window.start, 4, 1, true),
+            ("source:mail", window.start, 4, 0, false),
+            ("source:mail", window.start, 1, 0, false),
+            (
+                "source:mail",
+                window.start - chrono::Duration::hours(1),
+                6,
+                0,
+                true,
+            ),
+            ("editor:synthetic", window.start, 6, 0, false),
+        ] {
+            let end =
+                start + chrono::Duration::hours(hours) + chrono::Duration::seconds(extra_seconds);
+            let envelope = serde_json::from_value(json!({
+                "envelope_version":1, "observation_id":"01J0000000000000000000000A",
+                "connector_instance":connector, "source_key":"synthetic-item", "revision":"1",
+                "operation":"upsert", "kind":"source.email", "schema_version":1,
+                "time":{"source_start":start,"source_end":end,"observed_at":end,"resolution_ms":1},
+                "links":[], "sensitivity":"normal", "payload":{"title":"Synthetic meeting"}, "blobs":[]
+            })).unwrap();
+            let observations = [hx_compile::Observation {
+                id: 1,
+                received_at: end,
+                envelope,
+            }];
+            let timeline = hx_compile::compile(&observations, window);
+            let digest = hx_interpret::build_digest(
+                &timeline,
+                &observations,
+                &[],
+                hx_interpret::DigestConfig::default(),
+            );
+            let mut support = citation_support(&timeline, &observations, window);
+            for (id, spans) in digest.support() {
+                support.entry(id).or_default().extend(spans);
+            }
+            let expected = if point {
+                Interval {
+                    start,
+                    end: start + chrono::Duration::seconds(1),
+                }
+            } else {
+                Interval { start, end }.intersect(&window).unwrap()
+            };
+            if window.contains(start) {
+                assert_eq!(
+                    digest.lines,
+                    vec![(expected, vec![1])],
+                    "{connector} {hours}h +{extra_seconds}s"
+                );
+                assert!(digest.text.contains(&format!(
+                    "{}-{} source.email",
+                    expected.start.format("%H:%M:%S"),
+                    expected.end.format("%H:%M:%S")
+                )));
+            } else {
+                assert!(
+                    digest.lines.is_empty(),
+                    "an out-of-window start must not be clamped into the window"
+                );
+            }
+            if point {
+                assert!(
+                    support
+                        .values()
+                        .flatten()
+                        .all(|s| s.start == start && s.end <= start + chrono::Duration::seconds(1)),
+                    "{support:?}"
+                );
+            } else {
+                assert!(support[&1].contains(&expected));
+            }
+            let mut packet = hx_interpret::build_packet(
+                &timeline,
+                &[hx_interpret::EvidenceItem::classified(
+                    1,
+                    start,
+                    "normal:source.email",
+                    "Synthetic meeting",
+                    hx_schema::Sensitivity::Normal,
+                    false,
+                )
+                .unwrap()],
+                &[],
+                &[],
+            );
+            let spans: Vec<_> = support.values().flatten().collect();
+            packet.timeline_text = format!(
+                "time_support={}\ntime_support_by_evidence={}\n",
+                serde_json::to_string(&spans).unwrap(),
+                serde_json::to_string(&support).unwrap()
+            );
+            let claimed = if point { window } else { expected };
+            let interpretation: hx_interpret::Interpretation = serde_json::from_value(json!({
+                "window":window,"episodes":[{"id":"synthetic","intervals":[claimed],"title":"Synthetic meeting","description":"Source reported a meeting",
+                "claims":[{"actor":"source","action":"reported","object":"meeting","outcome":"unknown","basis":"reported_by_source","evidence":[1]}],"evidence":[1],"confidence":0.5}],
+                "tasks":[],"summary":"Synthetic meeting","check_failures":[],"provenance":{"input_digest":packet.input_digest,"compiler_version":timeline.compiler_version,"prompt_version":hx_interpret::PROMPT_VERSION,"model":"synthetic","created_at":window.start}
+            })).unwrap();
+            assert_eq!(
+                hx_interpret::check(&interpretation, &packet).is_empty(),
+                !point
+            );
+        }
+    }
+
     #[test]
     fn citations_support_raw_wall_times_clipped_to_the_window() {
         // A focus span opened before the window whose monotonic duration ends 3 ms
