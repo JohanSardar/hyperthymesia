@@ -176,8 +176,6 @@ async fn interpret_window_key<P: Provider>(
         .await;
     }
     let guard = interpretation_guard(store, w).await?;
-    // Roll back explicitly: a dropped transaction releases the advisory lock only
-    // when the pool later reuses its connection, so an immediate rerun saw it held.
     let result = async {
         let PreparedInput {
             packet,
@@ -212,7 +210,7 @@ async fn interpret_window_key<P: Provider>(
             .1)
     }
     .await;
-    guard.rollback().await?;
+    drop(guard);
     result
 }
 pub(crate) fn self_generated(e: &hx_schema::Envelope) -> bool {
