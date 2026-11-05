@@ -13,6 +13,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+pub(crate) type LiveHealth = Arc<Mutex<Option<serde_json::Value>>>;
 struct Chunk {
     writer: VideoWriter,
     path: std::path::PathBuf,
@@ -58,6 +59,8 @@ fn run_inner(
     context: Arc<Mutex<Option<Focus>>>,
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    mut failure: Option<String>,
+    live: LiveHealth,
 ) -> anyhow::Result<()> {
     let policy = Policy::new(&config)?;
     let mut producer = Producer::new(config.device_id.clone())?.namespace("macos-media");
@@ -69,11 +72,21 @@ fn run_inner(
         blobs: vec![],
     })?;
     let staging = support_dir().join("media-staging");
+    if staging.exists() {
+        for entry in std::fs::read_dir(&staging)? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|ext| ext == "mp4")
+                && entry.metadata()?.len() == 0
+            {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
     if staging.exists()
         && std::fs::read_dir(&staging)?
             .any(|entry| entry.is_ok_and(|e| e.path().extension().is_some_and(|ext| ext == "mp4")))
     {
-        send_health(&mut producer,&tx,CollectorStatus::Failed,"incomplete staging files from an interrupted capture are retained; recovery requires validation before upload".into(),0)?;
+        send_health(&mut producer,&tx, &live, CollectorStatus::Failed,"incomplete staging files from an interrupted capture are retained; recovery requires validation before upload".into(),0)?;
     }
     let mut session: Option<Session> = None;
     let mut chunk: Option<Chunk> = None;
@@ -82,6 +95,7 @@ fn run_inner(
     let mut last_hash = String::new();
     let mut last_health = Instant::now() - Duration::from_secs(45);
     let mut last_screen = None;
+    let mut recording = false;
     let mut retry = Instant::now() - Duration::from_secs(60);
     while !stop.load(Ordering::Relaxed) {
         let mut focus = context.lock().expect("capture context").clone();
@@ -135,18 +149,39 @@ fn run_inner(
                 CollectorStatus::PermissionDenied
             } else if !allowed {
                 CollectorStatus::Paused
-            } else if session.is_some() {
+            } else if recording && failure.is_none() {
                 CollectorStatus::Running
             } else {
                 CollectorStatus::Failed
             };
-            send_health(&mut producer,&tx,status,if !granted {"PermissionDenied: use explicit onboard command"}else if !allowed {"content suppressed: inactive device, policy, unavailable focused-window identity, pause or Secure Input"}else {"foreground-window capture only; full-display coverage unavailable"}.into(),session.as_ref().map_or(0,|s|s.stream.dropped()))?;
+            let detail = if !granted {
+                "Screen Recording permission is off. Enable it in System Settings > Privacy & Security > Screen Recording.".into()
+            } else if !allowed {
+                "Screen recording is paused.".into()
+            } else {
+                failure.clone().unwrap_or_else(|| {
+                    if recording {
+                        "Recording the foreground window.".into()
+                    } else {
+                        "Waiting for screen recording to start.".into()
+                    }
+                })
+            };
+            send_health(
+                &mut producer,
+                &tx,
+                &live,
+                status,
+                detail,
+                session.as_ref().map_or(0, |s| s.stream.dropped()),
+            )?;
         }
         let changed = session
             .as_ref()
             .is_some_and(|s| focus.as_ref() != Some(&s.focus));
         if !allowed || changed {
             session = None;
+            recording = false;
             if let Some(c) = chunk.take() {
                 finish(c, &mut producer, &tx)?;
             }
@@ -164,7 +199,8 @@ fn run_inner(
                         last_hash.clear();
                     }
                     Err(error) => {
-                        send_health(&mut producer, &tx, CollectorStatus::Failed, error, 0)?;
+                        failure = Some(error.clone());
+                        send_health(&mut producer, &tx, &live, CollectorStatus::Failed, error, 0)?;
                     }
                 }
             }
@@ -174,6 +210,9 @@ fn run_inner(
             spent = 0;
         }
         if let Some(s) = &mut session {
+            if let Some(error) = s.stream.failure() {
+                anyhow::bail!("Screen capture stopped: {error}");
+            }
             while let Some(frame) = s.stream.pop() {
                 // Recheck native focus immediately before encoding or writing any frame.
                 let mut now = hx_macos_sys::frontmost();
@@ -203,10 +242,10 @@ fn run_inner(
                 }
                 if chunk.is_none() {
                     let dir = support_dir().join("media-staging");
-                    std::fs::create_dir_all(&dir)?;
-                    let path = dir.join(format!("{}.mp4", ulid::Ulid::generate()));
-                    let writer = VideoWriter::new(&path, s.stream.width, s.stream.height)
-                        .map_err(anyhow::Error::msg)?;
+                    let (path, writer) = staged_writer(&dir, |path| {
+                        VideoWriter::new(path, s.stream.width, s.stream.height)
+                            .map_err(anyhow::Error::msg)
+                    })?;
                     chunk = Some(Chunk {
                         writer,
                         path,
@@ -221,12 +260,31 @@ fn run_inner(
                 if let Some(c) = chunk.as_mut() {
                     if c.writer.append(&frame).map_err(anyhow::Error::msg)? {
                         c.last_frame = frame_time(producer.time(), frame.nanos);
+                        if !recording || failure.is_some() {
+                            send_health(
+                                &mut producer,
+                                &tx,
+                                &live,
+                                CollectorStatus::Running,
+                                "Screen recording recovered.".into(),
+                                0,
+                            )?;
+                            recording = true;
+                            failure = None;
+                        }
                     } else {
                         send_health(
                             &mut producer,
                             &tx,
-                            CollectorStatus::Running,
-                            "encoder backpressure: frame skipped".into(),
+                            &live,
+                            if recording && failure.is_none() {
+                                CollectorStatus::Running
+                            } else {
+                                CollectorStatus::Failed
+                            },
+                            failure.clone().unwrap_or_else(|| {
+                                "The video encoder is not accepting frames.".into()
+                            }),
                             1,
                         )?;
                     }
@@ -275,6 +333,7 @@ fn run_inner(
                             send_health(
                                 &mut producer,
                                 &tx,
+                                &live,
                                 CollectorStatus::Running,
                                 "still skipped: hourly byte budget".into(),
                                 1,
@@ -312,7 +371,8 @@ fn run_inner(
                         })?;
                     }
                     Err(error) => {
-                        send_health(&mut producer, &tx, CollectorStatus::Failed, error, 1)?
+                        failure = Some(error.clone());
+                        send_health(&mut producer, &tx, &live, CollectorStatus::Failed, error, 1)?
                     }
                 }
             }
@@ -325,6 +385,24 @@ fn run_inner(
     }
     Ok(())
 }
+/// Recreate a removed staging directory on every attempt and remove partial
+/// output even when AVAssetWriter fails during construction (Cannot create file).
+pub(crate) fn staged_writer<T>(
+    dir: &std::path::Path,
+    create: impl FnOnce(&std::path::Path) -> anyhow::Result<T>,
+) -> anyhow::Result<(std::path::PathBuf, T)> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("Cannot create the screen recording folder: {e}"))?;
+    let path = dir.join(format!("{}.mp4", ulid::Ulid::generate()));
+    match create(&path) {
+        Ok(writer) => Ok((path, writer)),
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            Err(anyhow::anyhow!("Cannot save screen recording: {error}"))
+        }
+    }
+}
+
 fn finish(
     c: Chunk,
     p: &mut Producer,
@@ -334,8 +412,7 @@ fn finish(
     let result = c.writer.finish();
     if let Err(e) = result {
         let _ = std::fs::remove_file(&c.path);
-        send_health(p, tx, CollectorStatus::Failed, e, 1)?;
-        return Ok(());
+        return Err(anyhow::anyhow!("Could not finish screen recording: {e}"));
     }
     let bytes = std::fs::read(&c.path)?;
     let mut e = p.core(
@@ -375,6 +452,7 @@ fn finish(
 fn send_health(
     p: &mut Producer,
     tx: &tokio::sync::mpsc::Sender<Submission>,
+    live: &LiveHealth,
     status: CollectorStatus,
     detail: String,
     dropped: u64,
@@ -394,6 +472,11 @@ fn send_health(
             detail: Some(detail),
         }),
     );
+    // Update the menu before disk/network persistence: an upload can be blocked
+    // for several HTTP timeouts, but the person still needs the failure now.
+    let mut payload = e.payload.clone();
+    payload["observed_at"] = serde_json::json!(e.time.observed_at);
+    *live.lock().expect("screen health") = Some(serde_json::json!({"media":payload}));
     tx.blocking_send(Submission {
         envelope: e,
         reply: None,
@@ -410,10 +493,12 @@ pub(crate) fn run(
     context: Arc<Mutex<Option<Focus>>>,
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    live: LiveHealth,
 ) -> anyhow::Result<()> {
     // One failed write (a full disk, a codec error) must not end screen capture for
     // the rest of the session: report it, back off, and start a fresh capture.
     let mut backoff = RESTART_MIN;
+    let mut failure = None;
     loop {
         let started = Instant::now();
         let result = run_inner(
@@ -422,11 +507,14 @@ pub(crate) fn run(
             context.clone(),
             paused.clone(),
             stop.clone(),
+            failure.clone(),
+            live.clone(),
         );
         let error = match result {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
+        failure = Some(error.to_string());
         if tx.is_closed() {
             return Err(error);
         }
@@ -434,6 +522,7 @@ pub(crate) fn run(
         send_health(
             &mut producer,
             &tx,
+            &live,
             CollectorStatus::Failed,
             format!("{error}; restarting capture"),
             1,
@@ -442,7 +531,28 @@ pub(crate) fn run(
             backoff = RESTART_MIN;
         }
         let resume = Instant::now() + backoff;
+        let mut was_paused = false;
         while Instant::now() < resume {
+            let is_paused = paused.load(Ordering::Relaxed);
+            if is_paused != was_paused {
+                send_health(
+                    &mut producer,
+                    &tx,
+                    &live,
+                    if is_paused {
+                        CollectorStatus::Paused
+                    } else {
+                        CollectorStatus::Failed
+                    },
+                    if is_paused {
+                        "Screen recording is paused.".into()
+                    } else {
+                        format!("{error}; restarting capture")
+                    },
+                    0,
+                )?;
+                was_paused = is_paused;
+            }
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }

@@ -79,4 +79,28 @@ hardware qualification. UTC accuracy is unmeasured and labeled accordingly.
 
 Real capture evidence and signing logs belong in the locally ignored `artifacts/`
 directory. Do not publish them. Build output stays in ignored `dist/` and target
-directories. The generated LaunchAgent plist is not installed automatically.
+directories. Building the bundle does not register or launch it. On first manual
+launch, certificate-signed builds register their bundled agent with SMAppService;
+ad-hoc builds install `~/Library/LaunchAgents/com.hyperthymesia.agent.plist` and
+bootstrap only the current user's GUI domain. Both launch at login and restart
+failed exits (throttled to 30 seconds). Menu Quit exits successfully and stays quit
+until the next login or manual launch. Reopen the bundle after moving an ad-hoc
+build so its absolute executable path is refreshed. A disabled modern service
+stays disabled; the app reports the Login Items setting rather than bypassing it.
+
+The menu shows `Hx !` with a plain-language explanation for screen capture errors.
+Media health reaches the menu in memory before disk/network delivery, so slow
+uploads cannot hide a writer failure. The menu refreshes every second and detects
+a stalled running heartbeat after 55 seconds. A successful frame clears the error;
+Pause hides it immediately. Failed writer construction removes its partial file,
+and each retry recreates a missing staging directory. Zero-byte interrupted MP4s
+are removed; nonempty interrupted files remain available for manual inspection.
+
+Complete per-record upload rejections go to `dead_letters` in `outbox.sqlite`,
+with the original envelope, batch, reason and rejection time. Referenced blobs
+remain pinned through `dead_letter_refs`. Accepted and duplicate records leave the
+outbox in the same transaction, so subsequent batches continue. Incomplete,
+mismatched, duplicate-ID or unknown-ID acknowledgements preserve the batch, as do
+HTTP authentication/overload failures. `health.json` and `hx-agent status` expose
+the cumulative refusal count under `upload.dropped`. Dead letters require manual
+inspection/removal and retained blobs count against the local media budget.
