@@ -1205,6 +1205,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hx-sources"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "hx-schema",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "hx-store"
 version = "0.1.0"
 dependencies = [
