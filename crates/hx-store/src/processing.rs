@@ -1,12 +1,8 @@
 //! Scheduling and interpretation persistence, with existing transaction boundaries.
 use super::*;
 
-pub struct InterpretationGuard(sqlx::Transaction<'static, sqlx::Postgres>);
-impl InterpretationGuard {
-    pub async fn rollback(self) -> Result<()> {
-        self.0.rollback().await?;
-        Ok(())
-    }
+pub struct InterpretationGuard {
+    _lock: crate::locks::FileLock,
 }
 #[derive(Debug, sqlx::FromRow)]
 pub struct SettledGeneration {
@@ -67,13 +63,10 @@ impl Store {
         &self,
         window: Interval,
     ) -> Result<Option<InterpretationGuard>> {
-        let mut tx = self.pool.begin().await?;
-        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || ':interpret:' || $1,0))")
-        .bind(window.start.to_rfc3339()).fetch_one(&mut *tx).await?;
-        if !locked {
-            return Ok(None);
-        }
-        Ok(Some(InterpretationGuard(tx)))
+        Ok(self
+            .try_file_lock(&format!("interpret-{}", window.start.to_rfc3339()))
+            .await?
+            .map(|lock| InterpretationGuard { _lock: lock }))
     }
     pub async fn settled_generation(
         &self,
