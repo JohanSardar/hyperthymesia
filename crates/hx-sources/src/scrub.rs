@@ -6,6 +6,9 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 pub const REDACTED: &str = "[REDACTED]";
+/// Shorter credential JSON values are labels like "user" or "web". Redacting them
+/// would destroy ordinary text everywhere they occur.
+const MIN_CREDENTIAL_VALUE: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScrubError {
@@ -22,8 +25,8 @@ pub struct Scrubber {
 
 impl Scrubber {
     /// Each supplied key must be at least four UTF-8 bytes. For credential JSON,
-    /// every nonempty string value is also protected, including short values;
-    /// property names, numbers and empty values are not treated as secrets.
+    /// string values of at least eight bytes are also protected; property names,
+    /// numbers and shorter values are not treated as secrets.
     pub fn new<I, S>(secrets: I) -> Result<Self, ScrubError>
     where
         I: IntoIterator<Item = S>,
@@ -90,7 +93,7 @@ pub(crate) fn validate_key(key: &str) -> Result<(), ScrubError> {
 
 fn collect_strings(value: &Value, strings: &mut BTreeSet<String>) {
     match value {
-        Value::String(value) if !value.is_empty() => {
+        Value::String(value) if value.len() >= MIN_CREDENTIAL_VALUE => {
             strings.insert(value.clone());
         }
         Value::Array(values) => {
@@ -159,6 +162,14 @@ mod tests {
     const KEY: &str = "demo+key/42?=\"leaf\"\n☃";
 
     #[test]
+    fn short_credential_values_do_not_wreck_ordinary_text() {
+        let scrubber =
+            Scrubber::new([r#"{"type":"user","x":"a","token":"made-up-refresh-token"}"#]).unwrap();
+        assert_eq!(scrubber.scrub("a user read data"), "a user read data");
+        assert_eq!(scrubber.scrub("made-up-refresh-token"), REDACTED);
+    }
+
+    #[test]
     fn planted_forms_are_redacted() {
         let scrubber = Scrubber::new([KEY]).unwrap();
         let forms = [
@@ -209,7 +220,6 @@ mod tests {
             "66616b652d746f6b656e2f3432",
             r#"fake-token\/42"#,
             "fake-refresh+key",
-            "xy",
         ] {
             assert_eq!(scrubber.scrub(planted), REDACTED);
         }
