@@ -386,9 +386,12 @@ fn repair_fixture() -> (Packet, Interpretation) {
         })
         .collect();
     packet.timeline_text = format!(
-        "time_support={}",
+        // Explicitly bind the browser lane's supported pieces to its evidence;
+        // the item's timestamp alone cannot prove the later episodes.
+        "time_support={}\ntime_support_by_evidence={}\n",
         serde_json::to_string(&episodes.iter().map(|e| e.intervals[0]).collect::<Vec<_>>())
-            .unwrap()
+            .unwrap(),
+        json!({"1":episodes.iter().map(|e| e.intervals[0]).collect::<Vec<_>>()})
     );
     let tasks = episodes
         .iter()
@@ -803,9 +806,148 @@ fn a_source_report_cannot_be_an_observed_action() {
 #[test]
 fn agent_episode_time_must_be_supported_by_its_own_citations() {
     let (mut packet, mut value) = repair_fixture();
-    packet
-        .timeline_text
-        .push_str("time_support_by_evidence={}\n");
+    packet.timeline_text = format!(
+        "time_support={}\ntime_support_by_evidence={{}}\n",
+        json!([window()])
+    );
     check_and_repair(&mut value, &packet);
     assert!(value.episodes.is_empty());
+}
+
+#[test]
+fn other_time_citations_are_context_not_claim_or_outcome_proof() {
+    let claimed = Interval {
+        start: window().start + chrono::Duration::minutes(3),
+        end: window().start + chrono::Duration::minutes(6),
+    };
+    let old = Interval {
+        start: window().start - chrono::Duration::days(1),
+        end: window().start - chrono::Duration::days(1),
+    };
+    let point = |at| Interval { start: at, end: at };
+    for (case, at, spans, inside) in [
+        ("old record", old.start, Some(vec![]), false),
+        (
+            "earlier in same window",
+            window().start,
+            Some(vec![point(window().start)]),
+            false,
+        ),
+        (
+            "no declared time, collected inside",
+            claimed.start,
+            Some(vec![point(claimed.start)]),
+            true,
+        ),
+        (
+            "missing support is authoritative",
+            claimed.start,
+            Some(vec![]),
+            false,
+        ),
+        (
+            "overlaps start",
+            old.start,
+            Some(vec![Interval {
+                start: old.start,
+                end: claimed.start + chrono::Duration::seconds(1),
+            }]),
+            true,
+        ),
+        (
+            "overlaps end",
+            claimed.end - chrono::Duration::seconds(1),
+            Some(vec![Interval {
+                start: claimed.end - chrono::Duration::seconds(1),
+                end: window().end,
+            }]),
+            true,
+        ),
+        (
+            "ends at claim start",
+            old.start,
+            Some(vec![Interval {
+                start: old.start,
+                end: claimed.start,
+            }]),
+            false,
+        ),
+        (
+            "point at claim end",
+            claimed.end,
+            Some(vec![point(claimed.end)]),
+            false,
+        ),
+        ("legacy packet, old point", old.start, None, false),
+        ("legacy packet, inside point", claimed.start, None, true),
+    ] {
+        // Ada's command is the only proof of her action. The owner's current
+        // focus establishes the episode's time, but cannot observe Ada's action.
+        let mut packet = packet("success");
+        packet.evidence[0].at = claimed.start;
+        packet.evidence[0].kind = "normal:focus.span".into();
+        packet.evidence[0].text = json!({"connector_instance":"macos-agent:synthetic"}).to_string();
+        packet.evidence.push(
+            EvidenceItem::classified(
+                2,
+                at,
+                "shell.command",
+                &json!({"subject":"Ada","payload":{"command":"cargo test","exit_code":0}})
+                    .to_string(),
+                Sensitivity::Normal,
+                false,
+            )
+            .unwrap(),
+        );
+        packet.timeline_text = format!("time_support={}\n", json!([claimed]));
+        if let Some(spans) = spans {
+            let mut by_id = json!({"1":[claimed]});
+            if !spans.is_empty() {
+                by_id["2"] = json!(spans);
+            }
+            packet
+                .timeline_text
+                .push_str(&format!("time_support_by_evidence={by_id}\n"));
+        }
+        let mut output = response("success");
+        output["episodes"][0]["intervals"] = json!([claimed]);
+        output["tasks"][0]["intervals"] = json!([claimed]);
+        output["episodes"][0]["evidence"] = json!([1, 2]);
+        output["episodes"][0]["claims"] = json!([
+            {"actor":"Ada","action":"run","object":"cargo test","outcome":"completed","basis":"observed","evidence":[1,2],"outcome_evidence":[2]},
+            // The same old record is allowed alongside real local proof.
+            {"actor":"owner","action":"view","object":"editor","outcome":"unknown","basis":"observed","evidence":[1,2],"outcome_evidence":[]}
+        ]);
+        let mut result =
+            parse_output(&packet, &output.to_string(), "synthetic", PROMPT_VERSION).unwrap();
+        let failures = check_and_repair(&mut result, &packet);
+        assert_eq!(result.episodes.len(), 1, "{case}: {failures:?}");
+        let claims = &result.episodes[0].claims;
+        assert_eq!(claims.len(), 2, "{case}: {failures:?}");
+        assert_eq!(
+            claims[0].basis,
+            if inside {
+                Basis::Observed
+            } else {
+                Basis::ReportedBySource
+            },
+            "{case}"
+        );
+        assert_eq!(
+            claims[0].outcome,
+            if inside { "completed" } else { "attempted" },
+            "{case}"
+        );
+        assert_eq!(
+            claims[1].basis,
+            Basis::Observed,
+            "context must stay allowed: {case}"
+        );
+        assert_eq!(claims[1].evidence, vec![1, 2], "{case}");
+        assert_eq!(failures.is_empty(), inside, "{case}: {failures:?}");
+        assert!(
+            check(&result, &packet).is_empty(),
+            "repair must be idempotent: {case}"
+        );
+    }
 }

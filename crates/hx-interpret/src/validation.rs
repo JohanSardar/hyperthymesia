@@ -65,6 +65,25 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
         .lines()
         .find_map(|line| line.strip_prefix("time_support_by_evidence="))
         .and_then(|json| serde_json::from_str(json).ok());
+    let in_time = |id: &EvidenceId, interval: &Interval| {
+        let contains_point =
+            |at| interval.contains(at) || (interval.is_empty() && interval.start == at);
+        match &support_by_evidence {
+            Some(by_id) => by_id.get(id).is_some_and(|spans| {
+                spans.iter().any(|span| {
+                    if span.is_empty() {
+                        contains_point(span.start)
+                    } else if interval.is_empty() {
+                        span.contains(interval.start)
+                    } else {
+                        span.intersect(interval).is_some()
+                    }
+                })
+            }),
+            // Packets without per-record spans can establish only the item's point.
+            None => evidence.get(id).is_some_and(|e| contains_point(e.at)),
+        }
+    };
     let supported_by_citations = |intervals: &[Interval], ids: &[EvidenceId]| {
         support_by_evidence.as_ref().is_none_or(|by_id| {
             let cited: Vec<Interval> = ids
@@ -147,24 +166,32 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
                 return false;
             }
             // A source describing somebody's action is testimony, even when the
-            // citation is independent. Mixed citations need a direct observation.
+            // citation is independent. Each claimed interval needs a direct
+            // observation in that time; other-time citations remain context.
             if claim.basis == Basis::Observed
-                && !claim.evidence.iter().any(|id| {
-                    independent(id) && evidence.get(id).is_some_and(|e| observes_actor(e, claim))
+                && !episode.intervals.iter().all(|interval| {
+                    claim.evidence.iter().any(|id| {
+                        independent(id)
+                            && in_time(id, interval)
+                            && evidence.get(id).is_some_and(|e| observes_actor(e, claim))
+                    })
                 })
             {
                 claim.basis = Basis::ReportedBySource;
                 fail(
                     &item,
-                    "downgraded source report presented as observed action",
+                    "downgraded source report or other-time evidence presented as observed action",
                 );
             }
             if claim.outcome == "completed"
-                && !claim.outcome_evidence.iter().any(|id| {
-                    independent(id)
-                        && evidence
-                            .get(id)
-                            .is_some_and(|e| supports_completion(e, claim))
+                && !episode.intervals.iter().all(|interval| {
+                    claim.outcome_evidence.iter().any(|id| {
+                        independent(id)
+                            && in_time(id, interval)
+                            && evidence
+                                .get(id)
+                                .is_some_and(|e| supports_completion(e, claim))
+                    })
                 })
             {
                 claim.outcome = "attempted".into();
