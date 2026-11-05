@@ -46,16 +46,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about@0.9.3
-      # Remove this PR-only fallback after installer PR #59 lands on main.
-      - name: Read installer contract before PR 59 merges
-        if: github.event_name == 'pull_request'
-        shell: bash
-        run: |
-          if [[ ! -f scripts/install.sh ]]; then
-            git fetch origin t7/n4-installer-core
-            git show FETCH_HEAD:scripts/install.sh > "$RUNNER_TEMP/install.sh"
-            echo "HX_INSTALLER=$RUNNER_TEMP/install.sh" >> "$GITHUB_ENV"
-          fi
       - name: Import Developer ID on the macOS runner only
         if: runner.os == 'macOS' && github.event_name != 'pull_request'
         shell: bash

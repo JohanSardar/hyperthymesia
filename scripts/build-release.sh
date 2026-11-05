@@ -95,7 +95,7 @@ if platform == 'macos-aarch64':
                 raise SystemExit(f'Link or special file in app: {path}')
             archive.write(path, path.relative_to(work).as_posix())
 PY
-cp "${HX_INSTALLER:-scripts/install.sh}" "$out/install.sh"
+cp scripts/install.sh "$out/install.sh"
 chmod 755 "$out/install.sh"
 python3 - "$out" <<'PY'
 import hashlib
