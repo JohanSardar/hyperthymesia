@@ -6,7 +6,7 @@ pub mod mcp;
 pub mod ocr;
 pub mod processing;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -14,6 +14,7 @@ use axum::{
     routing::{get, post, put},
 };
 use chrono::{DateTime, Utc};
+use disclosure::DisclosurePolicy;
 use hx_schema::{Envelope, Interval};
 use hx_store::{Store, Token, UploadBatch};
 use serde::Deserialize;
@@ -75,7 +76,7 @@ pub async fn auth(store: &Store, headers: &HeaderMap, scope: &str) -> ApiResult<
     }
     Ok(token)
 }
-pub fn router(store: Store) -> Router {
+pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
     Router::new()
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
         .route("/v1/events", post(events))
@@ -94,6 +95,7 @@ pub fn router(store: Store) -> Router {
         )
         .route("/revision/{revision}/run", get(dashboard::run_page))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(Extension(policy))
         .with_state(store)
 }
 async fn events(
@@ -229,6 +231,7 @@ impl Range {
 pub async fn timeline_value(
     store: &Store,
     token: &Token,
+    policy: &DisclosurePolicy,
     w: Interval,
     level: &str,
 ) -> ApiResult<Value> {
@@ -258,15 +261,31 @@ pub async fn timeline_value(
         .cloned()
         .collect();
     let compiled = hx_compile::compile(&visible, w);
-    // A canonical interpretation may combine namespaces. Serve it only when every
-    // input namespace is authorized, rather than attempting to redact derived prose.
+    // Prose cannot be selectively redacted: require every namespace and cited
+    // record to be visible. The owner's read_raw scope deliberately bypasses disclosure.
     let rows=sqlx::query("SELECT r.id,r.input_generation,r.interpretation,r.agent_run IS NOT NULL AS has_agent_run,w.end_at FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at<$2 AND w.end_at>$1 AND NOT EXISTS(SELECT 1 FROM unnest(r.input_namespaces) n WHERE NOT EXISTS(SELECT 1 FROM unnest($3::text[]) p WHERE starts_with(n,p))) ORDER BY w.start_at")
         .bind(w.start).bind(w.end).bind(&token.prefixes).fetch_all(&store.pool).await?;
-    let revisions:Vec<Value>=rows.iter().map(|r|json!({"revision_id":r.get::<i64,_>("id"),"input_generation":r.get::<i64,_>("input_generation"),"interpretation":r.get::<Value,_>("interpretation"),"has_agent_run":r.get::<bool,_>("has_agent_run")})).collect();
-    let interpreted = rows
-        .iter()
-        .map(|r| r.get::<DateTime<Utc>, _>("end_at"))
-        .max();
+    // Sensitive egress controls model transport, not the API reader's access.
+    let broker = mcp::Broker::new(
+        store.clone(),
+        policy.clone(),
+        processing::SensitiveEgress::Full,
+        w,
+    );
+    let mut revisions = vec![];
+    let mut interpreted = None;
+    for row in rows {
+        let interpretation: Value = row.get("interpretation");
+        if !token.has("read_raw")
+            && !broker
+                .allowed_ids(&mcp::revision_evidence(&interpretation))
+                .await?
+        {
+            continue;
+        }
+        interpreted = interpreted.max(Some(row.get::<DateTime<Utc>, _>("end_at")));
+        revisions.push(json!({"revision_id":row.get::<i64,_>("id"),"input_generation":row.get::<i64,_>("input_generation"),"interpretation":interpretation,"has_agent_run":row.get::<bool,_>("has_agent_run")}));
+    }
     let mut out = json!({"observed_through":observed,"interpreted_through":interpreted,"coverage":compiled.coverage,"revisions":revisions});
     if level == "raw" {
         out["observations"] = serde_json::to_value(observations).map_err(|e| bad(e.to_string()))?;
@@ -278,6 +297,7 @@ pub async fn timeline_value(
 }
 async fn timeline(
     State(store): State<Store>,
+    Extension(policy): Extension<DisclosurePolicy>,
     headers: HeaderMap,
     Query(range): Query<Range>,
 ) -> ApiResult<Json<Value>> {
@@ -291,6 +311,7 @@ async fn timeline(
         timeline_value(
             &store,
             &token,
+            &policy,
             range.window()?,
             range.level.as_deref().unwrap_or("episodes"),
         )
@@ -337,13 +358,18 @@ async fn entities(State(store): State<Store>, headers: HeaderMap) -> ApiResult<J
     let values:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',a.id,'entity',a.entity,'assertion',a.assertion,'evidence',a.evidence) FROM entity_assertions a WHERE ($1 OR sensitivity='normal') AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id=ANY(a.evidence) AND NOT EXISTS(SELECT 1 FROM unnest($2::text[]) p WHERE starts_with(e.connector_instance,p)))").bind(token.has("read_raw")).bind(&token.prefixes).fetch_all(&store.pool).await?;
     Ok(Json(json!({"entities":values})))
 }
-async fn now(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn now(
+    State(store): State<Store>,
+    Extension(policy): Extension<DisclosurePolicy>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
     let token = auth(&store, &headers, "read_l3").await?;
     let now = Utc::now();
     Ok(Json(
         timeline_value(
             &store,
             &token,
+            &policy,
             Interval {
                 start: now - chrono::Duration::hours(4),
                 end: now,

@@ -98,6 +98,13 @@ the title too.
 
 ## API and disclosure
 
+`read_raw` is deliberately the owner's raw-reader exception: namespace-authorized
+evidence, raw timelines and stored interpretations remain readable even when the
+current disclosure policy withholds their records. For `read_l3` tokens without
+`read_raw`, `/v1/timeline` and `/v1/now` omit a whole interpretation if any cited
+evidence is withheld by the current policy, checking OCR citations through their
+source records.
+
 - POST /v1/events accepts hx_schema::UploadBatch JSON with optional zstd encoding.
   Acknowledgments echo batch_id. Parseable observation identities get explicit
   rejection reasons for invalid or forbidden envelopes. Invalid JSON, missing
