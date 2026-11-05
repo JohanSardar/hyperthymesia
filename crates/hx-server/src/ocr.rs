@@ -8,19 +8,7 @@ use hx_visual::{OcrEngine, OcrResult, VisionCliEngine};
 use serde_json::json;
 use std::sync::Arc;
 
-/// Includes the helper source/config and OS build: Vision behavior can change with macOS.
-pub fn vision_version() -> Result<String> {
-    anyhow::ensure!(cfg!(target_os = "macos"), "Vision requires macOS");
-    let os = std::process::Command::new("sw_vers")
-        .arg("-buildVersion")
-        .output()?;
-    anyhow::ensure!(os.status.success(), "cannot identify Vision OS build");
-    Ok(format!(
-        "vision:{}:{}",
-        hx_store::hash(include_bytes!("../../hx-visual/swift/ocr.swift")),
-        String::from_utf8(os.stdout)?.trim()
-    ))
-}
+pub use hx_visual::vision_version;
 
 /// Discover both upload orderings and old stills. Called repeatedly, including on startup.
 /// Missing/unpublished blobs do not spend attempts.
@@ -51,20 +39,9 @@ pub async fn run_one<E: OcrEngine + 'static>(
     let result = tokio::task::spawn_blocking(
         move || -> Result<(u64, Option<String>, Option<OcrResult>)> {
             let bytes = std::fs::read(path)?;
-            let mut reader =
-                image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(16384);
-            limits.max_image_height = Some(16384);
-            limits.max_alloc = Some(128 * 1024 * 1024);
-            reader.limits(limits);
-            let thumb = reader
-                .decode()?
-                .resize_exact(8, 8, image::imageops::FilterType::Triangle)
-                .to_luma8();
-            let hash = hx_visual::perceptual_hash(thumb.as_raw().as_slice().try_into()?);
+            let hash = hx_visual::thumbnail_hash(&bytes)?;
             if let Some((sha, prior)) = previous
-                && (hash ^ u64::from_str_radix(&prior, 16)?).count_ones() <= 3
+                && hx_visual::similar_thumbnail_hashes(hash, u64::from_str_radix(&prior, 16)?)
             {
                 return Ok((hash, Some(sha), None));
             }
@@ -141,5 +118,24 @@ pub async fn worker(store: Store) -> Result<()> {
             Ok(false) => {}
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn vision_engine_id_preserves_existing_owner_cache_key() {
+        // Freeze the pre-N2 algorithm independently of the shared implementation.
+        let os = std::process::Command::new("/usr/bin/sw_vers")
+            .arg("-buildVersion")
+            .output()
+            .unwrap();
+        assert!(os.status.success());
+        let legacy = format!(
+            "vision:{}:{}",
+            hx_store::hash(include_bytes!("../../hx-visual/swift/ocr.swift")),
+            String::from_utf8(os.stdout).unwrap().trim()
+        );
+        assert_eq!(super::vision_version().unwrap(), legacy);
     }
 }
