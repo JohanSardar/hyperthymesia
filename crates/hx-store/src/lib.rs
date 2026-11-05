@@ -354,8 +354,9 @@ impl Store {
                 != stored.get("tasks").unwrap_or(&Value::Null)
             {
                 sqlx::query(
-                    "UPDATE windows SET generation=generation+1,dirty=true WHERE start_at>=$1",
+                    "UPDATE windows later SET generation=later.generation+1,dirty=true WHERE later.start_at >= $2 AND (EXISTS (SELECT 1 FROM revisions run WHERE run.id=later.canonical_revision AND (EXISTS (SELECT 1 FROM revisions prior WHERE prior.start_at=$1 AND (run.interpretation->'input_manifest'->'prior_revision_ids' @> jsonb_build_array(prior.id) OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(run.agent_run->'calls','[]'::jsonb)) call WHERE call->>'tool'='prior_context' AND call->'result'->'revisions' @> jsonb_build_array(jsonb_build_object('revision_id',prior.id))))))) OR (later.start_at=$2 AND NOT EXISTS (SELECT 1 FROM revisions run WHERE run.id=later.canonical_revision AND (run.agent_run IS NOT NULL OR run.interpretation->'input_manifest' ? 'prior_revision_ids'))))",
                 )
+                .bind(w.start)
                 .bind(w.end)
                 .execute(&mut *tx)
                 .await?;
@@ -463,7 +464,8 @@ impl Store {
             bail!("unknown evidence");
         }
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE windows SET generation=generation+1,dirty=true")
+        sqlx::query("UPDATE windows w SET generation=generation+1,dirty=true WHERE EXISTS (SELECT 1 FROM events e WHERE e.id=ANY($1) AND e.source_start<w.end_at AND CASE WHEN e.source_end>e.source_start THEN e.source_end>w.start_at ELSE e.source_start>=w.start_at END)")
+            .bind(evidence)
             .execute(&mut *tx)
             .await?;
         let id=sqlx::query_scalar("INSERT INTO entity_assertions(entity,assertion,evidence,sensitivity) VALUES($1,$2,$3,$4) RETURNING id").bind(entity).bind(assertion).bind(evidence).bind(sensitivity).fetch_one(&mut *tx).await?;

@@ -604,3 +604,98 @@ async fn empty_windows_finish_without_provider_and_reopen_on_data() {
     );
     f.close().await;
 }
+
+#[tokio::test]
+async fn task_changes_invalidate_only_dependent_windows() {
+    let f = Fixture::new().await;
+    let w = window();
+    let next = hx_store::window_at(w.end);
+    let used = hx_store::window_at(next.end);
+    let fx_used = hx_store::window_at(used.end);
+    let unrelated = hx_store::window_at(fx_used.end);
+    let distant = hx_store::window_at(w.end + chrono::Duration::days(30));
+    let g = f.store.generation(w).await.unwrap();
+    let (prior, _) = f
+        .store
+        .publish_revision_key(w, g, json!({"tasks":[{"title":"old"}]}), "prior")
+        .await
+        .unwrap();
+    for (win, key, manifest, agent) in [
+        (next, "legacy", json!({}), serde_json::Value::Null),
+        (
+            used,
+            "used",
+            json!({"prior_revision_ids":[prior]}),
+            serde_json::Value::Null,
+        ),
+        (
+            fx_used,
+            "fx-used",
+            json!({}),
+            json!({"calls":[{"tool":"prior_context","result":{"revisions":[{"revision_id":prior}]}}]}),
+        ),
+        (
+            unrelated,
+            "unrelated",
+            json!({"prior_revision_ids":[]}),
+            serde_json::Value::Null,
+        ),
+        (
+            distant,
+            "distant",
+            json!({"prior_revision_ids":[]}),
+            serde_json::Value::Null,
+        ),
+    ] {
+        let generation = f.store.generation(win).await.unwrap();
+        let mut value = json!({"tasks":[],"input_manifest":manifest});
+        if !agent.is_null() {
+            value["agent_run"] = agent;
+        }
+        f.store
+            .publish_revision_key(win, generation, value, key)
+            .await
+            .unwrap();
+    }
+    let before = [next, used, fx_used, unrelated, distant];
+    let mut generations = vec![];
+    for win in before {
+        generations.push(f.store.generation(win).await.unwrap());
+    }
+    f.store
+        .publish_revision_key(w, g, json!({"tasks":[{"title":"changed"}]}), "changed")
+        .await
+        .unwrap();
+    for (i, win) in before.into_iter().enumerate() {
+        assert_eq!(
+            f.store.generation(win).await.unwrap(),
+            generations[i] + i64::from(i < 3),
+            "{win:?}"
+        );
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn entity_changes_invalidate_only_evidence_windows() {
+    let f = Fixture::new().await;
+    let w = window();
+    let unrelated = hx_store::window_at(w.end);
+    let mut span = event("entity-evidence", 8);
+    span.time.source_end = Some(w.end);
+    ingest(&f.store, vec![span]).await;
+    let evidence = f.store.observations(w, false).await.unwrap()[0].id;
+    let old = f.store.generation(w).await.unwrap();
+    let unrelated_g = f.store.generation(unrelated).await.unwrap();
+    f.store
+        .assert_entity(
+            "Synthetic project",
+            json!({"name":"synthetic"}),
+            &[evidence],
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.store.generation(w).await.unwrap(), old + 1);
+    assert_eq!(f.store.generation(unrelated).await.unwrap(), unrelated_g);
+    f.close().await;
+}
