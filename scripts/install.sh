@@ -260,6 +260,9 @@ fi
 
 # No destination changes occur before every download, hash and version check.
 mkdir -p "$prefix/tools/fx-0.0.16"
+# The guards above proved this prefix is absent or ours. Mark it first, so an
+# interrupted install can be retried instead of being refused as unmanaged.
+cp "$work/payload/.installed" "$prefix/.installed"
 if ! exists "$version_dir"; then
     # Copy on the destination filesystem before publishing the version.
     stage=$(mktemp -d "$prefix/.staging.XXXXXXXX")
@@ -268,9 +271,11 @@ if ! exists "$version_dir"; then
 elif [ "$install_app" = true ] && ! exists "$version_dir/Hyperthymesia.app"; then
     cp -R "$work/payload/Hyperthymesia.app" "$version_dir/"
 fi
-cp "$work/fx/fx" "$prefix/tools/fx-0.0.16/fx"
-chmod 755 "$prefix/tools/fx-0.0.16/fx"
-cp "$work/payload/.installed" "$prefix/.installed"
+# Rename, never overwrite: fx may be running, and macOS kills a signed binary
+# whose file changes in place.
+cp "$work/fx/fx" "$prefix/tools/fx-0.0.16/.fx.staging"
+chmod 755 "$prefix/tools/fx-0.0.16/.fx.staging"
+mv "$prefix/tools/fx-0.0.16/.fx.staging" "$prefix/tools/fx-0.0.16/fx"
 if ! exists "$prefix/current"; then ln -s "$version_dir" "$prefix/current"; fi
 if [ "$app_only" = false ]; then
     mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
