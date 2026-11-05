@@ -184,7 +184,7 @@ impl Broker {
         }
         Ok(true)
     }
-    async fn project(&self, id: i64, e: &Envelope) -> Result<Vec<EvidenceItem>> {
+    pub(crate) async fn project(&self, id: i64, e: &Envelope) -> Result<Vec<EvidenceItem>> {
         if !self.visible(e) {
             return Ok(vec![]);
         }

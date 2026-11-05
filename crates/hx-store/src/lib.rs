@@ -288,6 +288,10 @@ impl Store {
         Ok(sqlx::query("UPDATE windows SET timeline=$3,compiler_version=$4,compiled_generation=$2,dirty=false WHERE start_at=$1 AND generation=$2")
             .bind(timeline.window.start).bind(generation).bind(serde_json::to_value(timeline)?).bind(&timeline.compiler_version).execute(&self.pool).await?.rows_affected()==1)
     }
+    pub async fn finish_empty(&self, w: Interval, generation: i64) -> Result<bool> {
+        Ok(sqlx::query("UPDATE windows SET empty_generation=$2,dirty=false WHERE start_at=$1 AND generation=$2")
+            .bind(w.start).bind(generation).execute(&self.pool).await?.rows_affected() == 1)
+    }
     pub async fn publish_revision(
         &self,
         w: Interval,
