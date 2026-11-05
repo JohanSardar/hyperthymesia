@@ -3,7 +3,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{Postgres, Row, Transaction};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -14,20 +14,20 @@ pub struct Job {
     pub attempts: i32,
 }
 pub async fn enqueue(
-    tx: &mut Transaction<'_, Postgres>,
+    store: &hx_store::Store,
     key: &str,
     kind: &str,
     payload: Value,
     backfill: bool,
     at: DateTime<Utc>,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue,available_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(output_key) DO NOTHING")
-        .bind(key).bind(kind).bind(payload).bind(if backfill {"backfill"} else {"interactive"}).bind(at).execute(&mut **tx).await?;
-    Ok(())
+    let mut tx = store.transaction().await?;
+    tx.enqueue(key, kind, payload, backfill, at).await?;
+    tx.commit().await
 }
-pub async fn claim(pool: &PgPool, lease_seconds: i64) -> Result<Option<Job>> {
+pub async fn claim(store: &hx_store::Store, lease_seconds: i64) -> Result<Option<Job>> {
     let owner = ulid::Ulid::generate().to_string();
-    let mut tx = pool.begin().await?;
+    let mut tx = store.pool.begin().await?;
     // Serialize only the short claim transaction. Without this lock, concurrent
     // snapshots could both see no live job for a window and claim distinct rows.
     sqlx::query("SELECT pg_advisory_xact_lock(6847291630281)")
@@ -55,12 +55,12 @@ pub async fn claim(pool: &PgPool, lease_seconds: i64) -> Result<Option<Job>> {
         attempts: r.get("attempts"),
     }))
 }
-pub async fn heartbeat(pool: &PgPool, job: &Job, seconds: i64) -> Result<bool> {
+pub async fn heartbeat(store: &hx_store::Store, job: &Job, seconds: i64) -> Result<bool> {
     Ok(sqlx::query("UPDATE jobs SET lease_until=now()+make_interval(secs=>$3::double precision) WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
-        .bind(job.id).bind(&job.owner).bind(seconds as f64).execute(pool).await?.rows_affected()==1)
+        .bind(job.id).bind(&job.owner).bind(seconds as f64).execute(&store.pool).await?.rows_affected()==1)
 }
-pub async fn finish(pool: &PgPool, job: &Job, error: Option<&str>) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+pub async fn finish(store: &hx_store::Store, job: &Job, error: Option<&str>) -> Result<bool> {
+    let mut tx = store.pool.begin().await?;
     let state: Option<String> = sqlx::query_scalar("UPDATE jobs SET state=CASE WHEN $3::text IS NULL THEN CASE WHEN request_version>leased_version THEN 'ready' ELSE 'done' END WHEN request_version>leased_version THEN 'ready' WHEN attempts>=max_attempts THEN 'failed' ELSE 'ready' END,attempts=CASE WHEN request_version>leased_version AND kind<>'interpret' THEN 0 ELSE attempts END,last_error=$3,available_at=CASE WHEN request_version>leased_version THEN now() WHEN $3::text IS NOT NULL AND attempts>=max_attempts THEN now()+interval '5 minutes' ELSE now()+interval '5 seconds' END,lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now() RETURNING state")
         .bind(job.id).bind(&job.owner).bind(error).fetch_optional(&mut *tx).await?;
     if state.as_deref() == Some("failed") && job.kind == "normalize" {
@@ -87,17 +87,17 @@ async fn quarantine_exhausted(
 /// At most three failed-job revivals after five minutes. Only free compile
 /// jobs reset this budget when their input generation changes.
 /// Existing output keys keep recovery idempotent and the error history bounded.
-pub async fn revive_window_jobs(pool: &PgPool) -> Result<()> {
+pub async fn revive_window_jobs(store: &hx_store::Store) -> Result<()> {
     sqlx::query("UPDATE jobs SET state='ready',attempts=0,revivals=revivals+1,request_version=request_version+1,lease_until=NULL,lease_owner=NULL WHERE id IN (SELECT id FROM jobs WHERE state='failed' AND revivals<3 AND NOT (payload ? 'sweep_day') AND kind IN ('compile','interpret') AND available_at<=now() ORDER BY available_at,id LIMIT 1000 FOR UPDATE SKIP LOCKED)")
-        .execute(pool).await?;
+        .execute(&store.pool).await?;
     Ok(())
 }
 
 pub trait Handler: Send + Sync {
     fn handle(&self, job: &Job) -> impl std::future::Future<Output = Result<()>> + Send;
 }
-pub async fn run_one<H: Handler>(pool: &PgPool, handler: &H) -> Result<bool> {
-    let Some(job) = claim(pool, 120).await? else {
+pub async fn run_one<H: Handler>(store: &hx_store::Store, handler: &H) -> Result<bool> {
+    let Some(job) = claim(store, 120).await? else {
         return Ok(false);
     };
     let future = handler.handle(&job);
@@ -106,18 +106,18 @@ pub async fn run_one<H: Handler>(pool: &PgPool, handler: &H) -> Result<bool> {
         tokio::select! {
             result=&mut future=>break result,
             _=tokio::time::sleep(std::time::Duration::from_secs(30))=>{
-                if !heartbeat(pool,&job,120).await? {return Ok(true)}
+                if !heartbeat(store,&job,120).await? {return Ok(true)}
             }
         }
     };
     if let Err(error) = &result
         && let Some(deferred) = error.downcast_ref::<Deferred>()
     {
-        defer(pool, &job, deferred).await?;
+        defer(store, &job, deferred).await?;
         return Ok(true);
     }
     let description = result.as_ref().err().map(safe_error);
-    finish(pool, &job, description.as_deref()).await?;
+    finish(store, &job, description.as_deref()).await?;
     result?;
     Ok(true)
 }
@@ -143,9 +143,9 @@ impl std::fmt::Display for Deferred {
     }
 }
 impl std::error::Error for Deferred {}
-pub async fn defer(pool: &PgPool, job: &Job, reason: &Deferred) -> Result<bool> {
+pub async fn defer(store: &hx_store::Store, job: &Job, reason: &Deferred) -> Result<bool> {
     Ok(sqlx::query("UPDATE jobs SET state=CASE WHEN $5 AND attempts>=max_attempts THEN 'failed' ELSE 'ready' END,attempts=CASE WHEN $5 THEN attempts WHEN request_version>leased_version AND kind<>'interpret' THEN 0 ELSE greatest(attempts-1,0) END,last_error=$3,available_at=coalesce($4,now()+CASE WHEN $3='subscription rate limited' THEN interval '30 minutes' WHEN $3='subscription credential busy' THEN interval '5 seconds' ELSE interval '1 second' END),lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>now()")
-        .bind(job.id).bind(&job.owner).bind(reason.to_string()).bind(match reason { Deferred::Until(at) => Some(*at), _ => None }).bind(matches!(reason, Deferred::RateLimited)).execute(pool).await?.rows_affected()==1)
+        .bind(job.id).bind(&job.owner).bind(reason.to_string()).bind(match reason { Deferred::Until(at) => Some(*at), _ => None }).bind(matches!(reason, Deferred::RateLimited)).execute(&store.pool).await?.rows_affected()==1)
 }
 // Never persist arbitrary Display strings: SQL/provider/serde errors can contain source text.
 #[derive(Debug)]
