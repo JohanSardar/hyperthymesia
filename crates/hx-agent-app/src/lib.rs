@@ -1,4 +1,5 @@
 //! Menu bar entrypoint; AppKit and Objective-C lifecycle code stay in hx-macos-sys.
+#[cfg(not(feature = "e2e-harness"))]
 pub fn run() -> anyhow::Result<()> {
     if !std::env::args_os().any(|arg| arg == "--managed") {
         match hx_agent::startup::install() {
@@ -12,4 +13,9 @@ pub fn run() -> anyhow::Result<()> {
         menu_bar: true,
         ..Default::default()
     })
+}
+
+#[cfg(feature = "e2e-harness")]
+pub fn run() -> anyhow::Result<()> {
+    hx_agent::harness::main()
 }

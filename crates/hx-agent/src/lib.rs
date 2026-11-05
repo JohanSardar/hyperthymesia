@@ -20,3 +20,12 @@ mod gap;
 mod statechart_regressions;
 
 pub mod startup;
+
+mod first_run;
+pub mod pair;
+
+#[cfg(all(feature = "e2e-harness", not(debug_assertions)))]
+compile_error!("e2e-harness must never be enabled in release builds");
+
+#[cfg(feature = "e2e-harness")]
+pub mod harness;

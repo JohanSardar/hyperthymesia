@@ -29,6 +29,10 @@ pub fn launch_agent(executable: &Path) -> Result<String> {
 /// Returns after handing this manual launch to launchd. The managed process runs
 /// capture; this launcher never opens data or races the managed singleton socket.
 pub fn install() -> Result<()> {
+    ensure!(
+        !cfg!(feature = "e2e-harness"),
+        "e2e-harness cannot register login startup"
+    );
     let exe = std::env::current_exe()?.canonicalize()?;
     let bundle = exe
         .parent()
