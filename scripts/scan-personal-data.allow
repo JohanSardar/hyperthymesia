@@ -3,3 +3,4 @@
 # Never put the matched value here. The paths metadata:commit-author and
 # metadata:commit-message mean commit metadata.
 metadata:commit-author	identity-name	*	the owner's name as commit author
+scripts/build-release.sh	identity-name	1	the public repository URL required in release source notices

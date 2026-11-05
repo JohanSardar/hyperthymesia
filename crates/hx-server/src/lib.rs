@@ -80,6 +80,7 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
         .route("/v1/events", post(events))
+        .route("/v1/device", get(device))
         .route("/v1/blobs/{sha256}", put(upload_blob).get(download_blob))
         .route("/v1/timeline", get(timeline))
         .route("/v1/search", get(search))
@@ -98,6 +99,25 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .layer(Extension(policy))
         .with_state(store)
 }
+async fn device(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> ApiResult<Json<hx_schema::protocol::DeviceResponse>> {
+    use hx_schema::protocol::{DeviceResponse, OcrMode};
+    auth(&store, &headers, "ingest").await?;
+    let available =
+        tokio::task::spawn_blocking(|| hx_visual::VisionCliEngine::default().executable().is_ok())
+            .await
+            .unwrap_or(false);
+    Ok(Json(DeviceResponse {
+        ocr: if available {
+            OcrMode::Server
+        } else {
+            OcrMode::Device
+        },
+    }))
+}
+
 async fn events(
     State(store): State<Store>,
     headers: HeaderMap,

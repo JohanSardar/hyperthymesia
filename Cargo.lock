@@ -993,6 +993,7 @@ dependencies = [
  "hx-connector-sdk",
  "hx-macos-sys",
  "hx-schema",
+ "hx-visual",
  "image",
  "regex",
  "reqwest",
