@@ -53,11 +53,21 @@ pub struct WindowState {
 pub struct JobState {
     pub id: i64,
     pub output_key: String,
+    pub payload: Value,
     pub kind: String,
     pub state: String,
     pub attempts: i32,
 }
 impl Store {
+    pub async fn sweep_reservations(
+        &self,
+    ) -> Result<Vec<(chrono::NaiveDate, DateTime<Utc>, bool)>> {
+        Ok(
+            sqlx::query_as("SELECT day,start_at,started FROM daily_sweeps ORDER BY day")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
     pub async fn window_state(&self, w: Interval) -> Result<WindowState> {
         Ok(sqlx::query_as(
             "SELECT generation,dirty,canonical_revision FROM windows WHERE start_at=$1",
@@ -68,9 +78,11 @@ impl Store {
     }
     pub async fn job_states(&self) -> Result<Vec<JobState>> {
         Ok(
-            sqlx::query_as("SELECT id,output_key,kind,state,attempts FROM jobs ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?,
+            sqlx::query_as(
+                "SELECT id,output_key,payload,kind,state,attempts FROM jobs ORDER BY id",
+            )
+            .fetch_all(&self.pool)
+            .await?,
         )
     }
     pub async fn request_work(&self, kind: &str, w: Interval, generation: i64) -> Result<()> {

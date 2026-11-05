@@ -87,7 +87,7 @@ pub async fn compile_window(store: &Store, w: Interval) -> Result<(Timeline, i64
     if pending > 0 {
         return Err(Deferred::NormalizationPending.into());
     }
-    let cached: Option<serde_json::Value> = sqlx::query_scalar("SELECT timeline FROM windows WHERE start_at=$1 AND generation=$2 AND compiled_generation=$2 AND compiler_version=$3 AND timeline IS NOT NULL")
+    let cached: Option<serde_json::Value> = sqlx::query_scalar("SELECT timeline FROM windows WHERE start_at=$1 AND generation=$2 AND compiled_generation=$2 AND compiler_version=$3 AND timeline IS NOT NULL AND timeline_hash IS NOT NULL")
         .bind(w.start).bind(generation).bind(hx_compile::COMPILER_VERSION).fetch_optional(&store.pool).await?;
     if let Some(timeline) = cached {
         return Ok((serde_json::from_value(timeline)?, generation));
@@ -273,7 +273,7 @@ pub async fn prepare_input_with_policy(
     sensitive: SensitiveEgress,
     disclosure: &DisclosurePolicy,
 ) -> Result<PreparedInput> {
-    let (_, generation) = compile_window(store, w).await?;
+    let (compiled, generation) = compile_window(store, w).await?;
     let expanded = Interval {
         start: w.start - Duration::minutes(30),
         end: w.end,
@@ -378,7 +378,7 @@ pub async fn prepare_input_with_policy(
     safe_timeline.window = w;
     let mut packet = hx_interpret::build_packet(&safe_timeline, &evidence, &entities, &open_tasks);
     packet.window = w;
-    let manifest = json!({"window":w,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"disclosure_policy":{"version":POLICY_VERSION,"digest":disclosure.digest(),"policy":disclosure},"packet":packet,"input_namespaces":namespaces,"prior_revision_ids":prior["revisions"].as_array().into_iter().flatten().filter_map(|r| r["revision_id"].as_i64()).collect::<Vec<_>>()});
+    let manifest = json!({"window":w,"timeline_hash":hx_store::hash(&serde_json::to_vec(&compiled)?),"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"disclosure_policy":{"version":POLICY_VERSION,"digest":disclosure.digest(),"policy":disclosure},"packet":packet,"input_namespaces":namespaces,"prior_revision_ids":prior["revisions"].as_array().into_iter().flatten().take(1).filter(|_| !packet.open_tasks.is_empty()).filter_map(|r| r["revision_id"].as_i64()).collect::<Vec<_>>()});
     packet.input_digest = hx_store::hash(&serde_json::to_vec(&manifest)?);
     Ok(PreparedInput {
         packet,
@@ -408,28 +408,35 @@ impl<P: Provider> Handler for Runner<P> {
                     return Ok(());
                 }
                 let (_, generation) = compile_window(&self.store, w).await?;
+                let state = self.store.interpretation_state(w).await?;
                 let mut tx = self.store.pool.begin().await?;
-                let changed: chrono::DateTime<Utc> =
-                    sqlx::query_scalar("SELECT input_changed_at FROM windows WHERE start_at=$1")
-                        .bind(w.start)
-                        .fetch_one(&mut *tx)
-                        .await?;
-                hx_store::request_interpret_job(
-                    &mut tx,
-                    w,
-                    generation,
-                    false,
-                    w.end.max(changed + Duration::seconds(interpret_settle_s())),
-                )
-                .await?;
-                hx_store::request_interpret_job(
-                    &mut tx,
-                    w,
-                    generation,
-                    true,
-                    w.end + Duration::hours(24),
-                )
-                .await?;
+                if state.canonical_revision.is_none() {
+                    hx_store::request_interpret_job(
+                        &mut tx,
+                        w,
+                        generation,
+                        false,
+                        w.end
+                            .max(state.input_changed_at + Duration::seconds(interpret_settle_s())),
+                    )
+                    .await?;
+                }
+                if state.canonical_revision.is_some() {
+                    // A previously deferred first run is obsolete once any cadence
+                    // has published. Preserve active leases and daily sweep requests.
+                    sqlx::query("UPDATE jobs SET state='done' WHERE output_key=$1 AND state='ready' AND NOT (payload ? 'sweep_day')")
+                        .bind(format!("interpret:{}", w.start)).execute(&mut *tx).await?;
+                }
+                if !state.revision24_finished {
+                    hx_store::request_interpret_job(
+                        &mut tx,
+                        w,
+                        generation,
+                        true,
+                        w.end + Duration::hours(24),
+                    )
+                    .await?;
+                }
                 tx.commit().await?;
             }
             "interpret" => {
@@ -442,21 +449,60 @@ impl<P: Provider> Handler for Runner<P> {
                 if ready_at > Utc::now() {
                     return Err(Deferred::Until(ready_at).into());
                 }
+                if !admit_visible_window(&self.store, w).await? {
+                    return Ok(());
+                }
+                let state = self.store.interpretation_state(w).await?;
+                let sweep_day = job
+                    .payload
+                    .get("sweep_day")
+                    .cloned()
+                    .map(serde_json::from_value::<chrono::NaiveDate>)
+                    .transpose()?;
                 if revision24 {
-                    let unchanged: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1 AND r.input_generation=w.generation)")
-                        .bind(w.start).fetch_one(&self.store.pool).await?;
-                    if unchanged {
+                    if state.revision24_finished {
+                        return Ok(());
+                    }
+                    if !state.timeline_changed {
+                        self.store.finish_revision24(w, state.generation).await?;
+                        return Ok(());
+                    }
+                } else if state.canonical_revision.is_some() {
+                    let Some(day) = sweep_day else {
+                        return Ok(());
+                    };
+                    if !self.store.start_daily_sweep(w, day).await? {
                         return Ok(());
                     }
                 }
-                interpret_window_key(
+                let result = interpret_window_key(
                     &self.store,
                     w,
                     &self.provider,
                     !revision24,
                     &format!("job:{}:{}", job.id, ulid::Ulid::generate()),
                 )
-                .await?;
+                .await;
+                if let (Some(day), Err(error)) = (sweep_day, &result)
+                    && matches!(
+                        error.downcast_ref::<Deferred>(),
+                        Some(
+                            Deferred::RateLimited
+                                | Deferred::ProviderBusy
+                                | Deferred::Until(_)
+                                | Deferred::NormalizationPending
+                        )
+                    )
+                {
+                    self.store.release_daily_sweep(w, day).await?;
+                }
+                result?;
+                if self.store.generation(w).await? != state.generation {
+                    return Err(Deferred::InputChanged.into());
+                }
+                if revision24 {
+                    self.store.finish_revision24(w, state.generation).await?;
+                }
             }
             _ => return Err(Failure::UnsupportedJob.into()),
         }
@@ -480,6 +526,7 @@ pub async fn schedule(store: &Store) -> Result<()> {
         hx_store::request_window_job(&mut tx, "compile", w, generation).await?;
     }
     tx.commit().await?;
+    store.schedule_daily_sweep(Utc::now()).await?;
     Ok(())
 }
 
