@@ -1,16 +1,17 @@
 #!/bin/zsh
 set -euo pipefail
-source "$HOME/.cargo/env"
+[[ ! -f "$HOME/.cargo/env" ]] || source "$HOME/.cargo/env"
 cd "${0:A:h:h}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/.target-native}"
+version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "hx-agent-app"))')
 cargo build --release -p hx-agent -p hx-agent-app
 swiftc -O "$PWD/crates/hx-visual/swift/ocr.swift" -o "$CARGO_TARGET_DIR/release/hx-vision-ocr"
-app="$PWD/dist/Hyperthymesia.app"
+app="${HX_APP_OUTPUT:-$PWD/dist/Hyperthymesia.app}"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$CARGO_TARGET_DIR/release/hx-agent-app" "$app/Contents/MacOS/Hyperthymesia"
 cp "$CARGO_TARGET_DIR/release/hx-agent" "$app/Contents/MacOS/hx-agent"
 cp "$CARGO_TARGET_DIR/release/hx-vision-ocr" "$app/Contents/MacOS/hx-vision-ocr"
-cat > "$app/Contents/Info.plist" <<'PLIST'
+cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -18,8 +19,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Hyperthymesia</string>
 <key>CFBundleExecutable</key><string>Hyperthymesia</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>$version</string>
+<key>CFBundleVersion</key><string>${version%%[-+]*}</string>
 <key>LSUIElement</key><true/>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSAccessibilityUsageDescription</key><string>Record focused window context for your private activity timeline.</string>
@@ -51,7 +52,7 @@ if [[ -z "$identity" ]]; then
   print -u2 -- "warning: no Apple Development identity; ad-hoc signing resets permissions on every rebuild"
 fi
 flags=(--force --sign "$identity")
-[[ "$identity" != - ]] && flags+=(--options runtime)
+[[ "$identity" != - ]] && flags+=(--options runtime --timestamp)
 codesign "${flags[@]}" "$app/Contents/MacOS/hx-agent"
 codesign "${flags[@]}" "$app/Contents/MacOS/hx-vision-ocr"
 codesign "${flags[@]}" "$app"
