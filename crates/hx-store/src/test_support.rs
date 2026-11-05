@@ -177,11 +177,12 @@ impl Store {
         Ok(())
     }
     /// Deterministically defer a worker at the provider guard, after sweep admission.
-    pub async fn hold_interpretation_gate(&self, w: Interval) -> Result<ClaimGate<'_>> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_database() || ':' || current_schema() || ':interpret:' || $1,0))")
-            .bind(w.start.to_rfc3339()).execute(&mut *tx).await?;
-        Ok(ClaimGate(tx))
+    pub async fn hold_interpretation_gate(&self, w: Interval) -> Result<InterpretationGate> {
+        Ok(InterpretationGate(
+            self.try_interpretation_guard(w)
+                .await?
+                .context("interpretation gate already held")?,
+        ))
     }
     pub async fn hold_claim_gate(&self) -> Result<ClaimGate<'_>> {
         let mut tx = self.pool.begin().await?;
@@ -195,6 +196,13 @@ impl Store {
     }
     pub async fn enqueue_due_probe(&self) -> Result<()> {
         sqlx::query("INSERT INTO jobs(output_key,kind,payload,available_at) VALUES('became-due','test','{}',clock_timestamp())").execute(&self.pool).await?;
+        Ok(())
+    }
+}
+pub struct InterpretationGate(InterpretationGuard);
+impl InterpretationGate {
+    pub async fn release(self) -> Result<()> {
+        drop(self.0);
         Ok(())
     }
 }

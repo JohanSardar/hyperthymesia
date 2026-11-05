@@ -549,6 +549,13 @@ impl Store {
             bail!("sha256 mismatch");
         }
         tokio::fs::create_dir_all(path.parent().context("blob parent")?).await?;
+        // Stage and sync the contents before acquiring any database lock. Only
+        // the atomic publication and its directory durability need the row lock.
+        let temp = tempfile::NamedTempFile::new_in(path.parent().context("blob parent")?)?;
+        let mut file = tokio::fs::File::from_std(temp.reopen()?);
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO blobs(sha256) VALUES($1) ON CONFLICT DO NOTHING")
             .bind(sha)
@@ -559,19 +566,21 @@ impl Store {
                 .bind(sha)
                 .fetch_one(&mut *tx)
                 .await?;
-        if published {
+        // A gc crash can leave a published row with no file, so the row alone
+        // doesn't prove the bytes are there.
+        if published && path.try_exists()? {
+            // The client may now discard its copy, so retention restarts here.
+            sqlx::query("UPDATE blobs SET created_at=now() WHERE sha256=$1")
+                .bind(sha)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
             return Ok(false);
         }
-        let temp = tempfile::NamedTempFile::new_in(path.parent().context("blob parent")?)?;
-        let mut file = tokio::fs::File::from_std(temp.reopen()?);
-        file.write_all(bytes).await?;
-        file.sync_all().await?;
-        drop(file);
-        tokio::fs::rename(temp.path(), &path).await?;
+        std::fs::rename(temp.path(), &path)?;
         std::fs::File::open(path.parent().context("blob parent")?)?.sync_all()?;
         sqlx::query(
-            "UPDATE blobs SET published=true,evidence_expired=false,bytes=$2 WHERE sha256=$1",
+            "UPDATE blobs SET published=true,evidence_expired=false,bytes=$2,created_at=now() WHERE sha256=$1",
         )
         .bind(sha)
         .bind(bytes.len() as i64)
@@ -581,10 +590,20 @@ impl Store {
         Ok(true)
     }
     pub async fn gc(&self) -> Result<usize> {
-        let mut tx = self.pool.begin().await?;
-        let hashes:Vec<String>=sqlx::query_scalar("SELECT sha256 FROM blobs WHERE retention_class='chunk' AND pins=0 AND published AND created_at < now()-interval '30 days' FOR UPDATE SKIP LOCKED").fetch_all(&mut *tx).await?;
+        let hashes:Vec<String>=sqlx::query_scalar("SELECT sha256 FROM blobs WHERE retention_class='chunk' AND pins=0 AND published AND created_at < now()-interval '30 days' ORDER BY sha256").fetch_all(&self.pool).await?;
+        let mut expired = 0;
         for sha in &hashes {
-            match tokio::fs::remove_file(self.blob_path(sha)?).await {
+            let mut tx = self.pool.begin().await?;
+            let eligible: Option<String> = sqlx::query_scalar("SELECT sha256 FROM blobs WHERE sha256=$1 AND retention_class='chunk' AND pins=0 AND published AND created_at < now()-interval '30 days' FOR UPDATE SKIP LOCKED")
+                .bind(sha).fetch_optional(&mut *tx).await?;
+            if eligible.is_none() {
+                tx.commit().await?;
+                continue;
+            }
+            // Unlink under the same row lock used by upload's rename. Keep this
+            // synchronous so cancellation cannot leave an unlink in flight after
+            // releasing the transaction and race a later upload.
+            match std::fs::remove_file(self.blob_path(sha)?) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
@@ -593,9 +612,10 @@ impl Store {
                 .bind(sha)
                 .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
+            expired += 1;
         }
-        tx.commit().await?;
-        Ok(hashes.len())
+        Ok(expired)
     }
     pub async fn pin(&self, sha: &str, pinned: bool) -> Result<()> {
         sqlx::query("UPDATE blobs SET pins=pins+$2 WHERE sha256=$1")
@@ -682,14 +702,19 @@ pub async fn request_interpret_job(
     Ok(())
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+
+#[cfg(test)]
+mod concurrency_tests;
 
 mod reads;
 pub use reads::*;
 
 mod processing;
 pub use processing::*;
+
+mod locks;
 
 mod transaction;
 pub use transaction::*;
