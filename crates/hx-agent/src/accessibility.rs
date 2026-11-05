@@ -22,14 +22,16 @@ pub struct Worker {
     pub dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl Worker {
-    pub fn title(&self, focus: &Focus) -> Option<String> {
+    /// The focused window's title. `None` means the app did not answer in time,
+    /// which is not the same as a window without a title (`Some(None)`).
+    pub fn title(&self, focus: &Focus, wait: Duration) -> Option<Option<String>> {
         if !hx_macos_sys::permissions().accessibility {
-            return None;
+            return Some(None);
         }
         while self.titles.try_recv().is_ok() {}
         self.title_request.try_send(focus.clone()).ok()?;
-        let (sample_pid, title) = self.titles.recv_timeout(Duration::from_millis(75)).ok()?;
-        if sample_pid == focus.pid { title } else { None }
+        let (sample_pid, title) = self.titles.recv_timeout(wait).ok()?;
+        (sample_pid == focus.pid).then_some(title)
     }
 
     pub fn start() -> Self {

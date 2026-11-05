@@ -401,6 +401,65 @@ async fn search_filters_restricted_sensitive_and_foreign_namespaces() {
     f.close().await;
 }
 #[test]
+fn dashboard_lists_episodes_in_the_owners_local_time() {
+    let w = hx_schema::Interval {
+        start: Utc.with_ymd_and_hms(2026, 1, 1, 6, 0, 0).unwrap(),
+        end: Utc.with_ymd_and_hms(2026, 1, 2, 6, 0, 0).unwrap(),
+    };
+    let timeline = hx_compile::Timeline {
+        window: w,
+        compiler_version: "test".into(),
+        lanes: vec![],
+        points: vec![],
+        coverage: vec![],
+        aggregates: vec![],
+    };
+    let episode = |id: &str, h: u32, title: &str| {
+        json!({"id":id,"title":title,"description":"Wrote <b>notes</b>","evidence":[7],
+            "intervals":[{"start":Utc.with_ymd_and_hms(2026,1,1,h,0,0).unwrap(),"end":Utc.with_ymd_and_hms(2026,1,1,h,30,0).unwrap()}]})
+    };
+    let revision = json!({"revision_id":1,"has_agent_run":false,"interpretation":{
+        "window":{"start":"2026-01-01T16:00:00Z","end":"2026-01-01T20:00:00Z"},
+        "summary":"Drafted notes.","tasks":[],
+        "episodes":[episode("b",18,"Second"),episode("a",16,"First"),episode("old",2,"Before the day")]}});
+    let zone = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
+    let mut timeline = timeline;
+    // A span in the day's last instant must render rather than panic the worker.
+    timeline.lanes.push(hx_compile::Lane {
+        id: hx_compile::LaneId {
+            key: "device:test".into(),
+            kind: "focus".into(),
+        },
+        intervals: [
+            (0, 60, "Merged"),
+            (60, 120, "Merged"),
+            (86_399, 86_400, "Late"),
+        ]
+        .into_iter()
+        .map(|(a, b, label)| hx_compile::LaneInterval {
+            interval: hx_schema::Interval {
+                start: w.start + chrono::Duration::seconds(a),
+                end: w.start + chrono::Duration::seconds(b),
+            },
+            label: label.into(),
+            attrs: json!({}),
+            evidence: vec![1],
+            uncertain_edges: false,
+        })
+        .collect(),
+    });
+    let html = hx_server::dashboard::render_day(&timeline, &[revision], &[], zone).0;
+    assert_eq!(html.matches("title=\"Merged\"").count(), 1);
+    assert_eq!(html.matches("title=\"Late\"").count(), 1);
+    assert!(html.contains("Thursday, January 1, 2026"), "{html}");
+    assert!(html.contains("UTC−06:00"));
+    assert!(html.contains("10:00–14:00"));
+    let first = html.find("10:00–10:30").unwrap();
+    assert!(first < html.find("12:00–12:30").unwrap());
+    assert!(html.contains(">First</a>") && !html.contains(">Before the day<"));
+    assert!(html.contains("Wrote &lt;b&gt;notes&lt;/b&gt;"));
+}
+#[test]
 fn dashboard_escapes_malicious_title() {
     let w = hx_store::window_at(event("x", 8).time.observed_at);
     let title = "<script>alert('captured')</script>";
@@ -424,7 +483,13 @@ fn dashboard_escapes_malicious_title() {
         coverage: vec![],
         aggregates: vec![],
     };
-    let html = hx_server::dashboard::render_day(&timeline, &[], &[]).0;
+    let html = hx_server::dashboard::render_day(
+        &timeline,
+        &[],
+        &[],
+        chrono::FixedOffset::east_opt(0).unwrap(),
+    )
+    .0;
     assert!(!html.contains("<script>"));
     assert!(html.contains("&lt;script&gt;"));
     assert!(!html.contains("https://"));
@@ -2226,6 +2291,81 @@ async fn mcp_tools_are_bounded_and_current_policy_controls_all_context() {
     f.close().await;
 }
 
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_reads_the_digest_cites_its_printed_times_and_stops_at_the_lookup_cap() {
+    let f = Fixture::new().await;
+    // Sub-second times: the digest prints whole seconds, and those must validate.
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap() + Duration::milliseconds(250);
+    let focus = |key: &str, from: i64, to: i64, app: &str, title: &str| {
+        let mut e = event(key, 1);
+        e.device = Some(hx_schema::DeviceId::new("synthetic-device"));
+        e.kind = Kind::new("focus.span");
+        e.time = ObservationTime::point(base + Duration::seconds(from));
+        e.time.source_end = Some(base + Duration::seconds(to));
+        e.payload = json!({"app_bundle_id":"synthetic.app","app_name":app,"window_title":title,"pid":1,"display":null});
+        e
+    };
+    ingest(
+        &f.store,
+        vec![
+            focus("digest-a", 0, 300, "Synthetic Browser", "Synthetic search"),
+            focus(
+                "digest-b",
+                300,
+                1500,
+                "Synthetic Editor",
+                "Draft the launch note",
+            ),
+        ],
+    )
+    .await;
+    let w = hx_store::window_at(base);
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "digest");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-digest", &config)
+            .await
+            .unwrap()
+    );
+    let value: Value = sqlx::query_scalar(
+        "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-digest'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    // The printed whole-second times validate; only the non-Mac source wording is downgraded.
+    assert_eq!(
+        value["episodes"][0]["intervals"],
+        json!([{"start":"2026-01-01T01:05:00Z","end":"2026-01-01T01:25:00Z"}]),
+        "{}",
+        value["check_failures"]
+    );
+    let run: Value = sqlx::query_scalar(
+        "SELECT agent_run FROM revisions WHERE output_key='synthetic-fx-digest'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    assert!(run["digest"].as_str().unwrap().contains("Synthetic Editor"));
+    let calls = run["calls"].as_array().unwrap();
+    // Repair attempts share the cap: later attempts get no fresh lookups.
+    assert!(calls.len() > hx_server::fx::DIGEST_LOOKUPS);
+    let capped = hx_server::fx::DIGEST_LOOKUPS;
+    assert!(
+        calls[..capped]
+            .iter()
+            .all(|c| c["result"]["error"].is_null())
+    );
+    assert!(
+        calls[capped..]
+            .iter()
+            .all(|c| c["result"]["error"].as_str().unwrap().contains("budget"))
+    );
+    f.close().await;
+}
+
 #[cfg(unix)]
 fn fake_fx(dir: &std::path::Path, mode: &str) -> hx_server::fx::Config {
     use std::os::unix::fs::PermissionsExt;
@@ -2244,17 +2384,30 @@ assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
-assert 'hx-replica/v4' in sys.argv[sys.argv.index('--system')+1]
-assert sys.stdin.read().strip()
+assert 'hx-replica/v9' in sys.argv[sys.argv.index('--system')+1]
+instr=sys.stdin.read()
+assert instr.strip() and ('<digest>' in instr or 'Repair only' in instr)
 if mode=='timeout': time.sleep(3)
 if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
 if mode=='rate': print(json.dumps({'error':'429 rate limited','exit_code':1}));sys.exit(1)
+if mode=='rate-retrying':
+ sys.stderr.write('[notice] Rate limited · HTTP 429 · usage_limit_reached: The usage limit has been reached · retrying request in 30s\n'); sys.stderr.flush(); time.sleep(30)
 server=json.loads((home/'.fx/mcp.json').read_text())['mcpServers']['hyperthymesia']
 def rpc(method,params):
  req=urllib.request.Request(server['url'],data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['HX_MCP_TOKEN']})
  return json.load(urllib.request.urlopen(req))['result']
 rpc('initialize',{})
 assert len(rpc('tools/list',{})['tools'])==8
+if mode=='digest':
+ import re
+ line=next(l for l in instr.splitlines() if l.startswith('[') and 'Synthetic Editor' in l)
+ assert 'Draft the launch note' in line, line
+ m=re.match(r'\[(\d+)[^\]]*\] (\d\d:\d\d:\d\d)-(\d\d:\d\d:\d\d) ',line)
+ i=int(m.group(1)); iv={'start':'2026-01-01T'+m.group(2)+'Z','end':'2026-01-01T'+m.group(3)+'Z'}
+ answer={'episodes':[{'id':'synthetic-digest','intervals':[iv],'title':'Drafted the launch note','description':'Wrote in the synthetic editor','claims':[{'actor':'owner','action':'edited','object':'launch note','outcome':'unknown','basis':'observed','evidence':[i],'outcome_evidence':[]}],'evidence':[i],'confidence':0.8}],'tasks':[],'summary':'Drafted the launch note'}
+ for _ in range(12): rpc('tools/call',{'name':'list_sources','arguments':{}})
+ print(json.dumps({'exit_code':0,'model':'gpt-6.1-sol','steps':2,'final_output':json.dumps(answer),'tool_calls':[{'name':'mcp_hyperthymesia_list_sources','status':'success'}]*12}))
+ sys.exit(0)
 start='2026-01-01T03:58:00Z' if mode=='late' else '2026-01-01T00:00:00Z'
 result=rpc('tools/call',{'name':'window_overview','arguments':{'from':start,'to':'2026-01-01T04:00:00Z'}})
 data=json.loads(result['content'][0]['text'])
@@ -2277,6 +2430,27 @@ if mode=='attention':
  episode['claims'][0].update(action='was probably away',object='Mac',basis='inferred',evidence=ids)
  answer['summary']='Probably away'
 if mode=='invalid': answer='this is not JSON'
+if mode=='empty-repair':
+ counter=pathlib.Path('COUNTER')
+ if counter.exists(): answer={'episodes':[],'tasks':[],'summary':''}
+ else:
+  counter.write_text('1')
+  bad=json.loads(json.dumps(answer['episodes'][0])); bad['id']='synthetic-unknown'; bad['evidence']=[999999999]
+  bad['claims'][0]['evidence']=[999999999]; answer['episodes'].append(bad)
+if mode=='merge-repair':
+ counter=pathlib.Path('COUNTER')
+ good=answer['episodes'][0]
+ fixed=json.loads(json.dumps(good)); fixed['id']='synthetic-second'; fixed['title']='Second visit'
+ if counter.exists():
+  assert 'Repair only these episodes' in instr and '<digest>' in instr and 'synthetic-second' in instr
+  assert 'synthetic-episode' not in instr.split('Rejected episodes:')[1]
+  intruder=json.loads(json.dumps(good)); intruder['id']='intruder'
+  answer={'episodes':[fixed,intruder],'tasks':[],'summary':''}
+ else:
+  counter.write_text('1')
+  bad=json.loads(json.dumps(fixed)); bad['evidence']=[999999999]; bad['claims'][0]['evidence']=[999999999]
+  answer['episodes'].append(bad)
+  answer['tasks']=[{'id':'synthetic-task','title':'Visits','description':'Two visits','intervals':good['intervals'],'episode_ids':['synthetic-episode','synthetic-second'],'goal':None,'aliases':[],'confidence':0.7,'open':False}]
 if mode=='repair-failure':
  counter=pathlib.Path('COUNTER')
  if counter.exists(): print(json.dumps({'error':'synthetic repair failure','exit_code':1}));sys.exit(1)
@@ -2380,7 +2554,7 @@ async fn fx_attention_intervals_are_citable_time_support() {
         2,
         "validation should need no repair turn"
     );
-    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v4");
+    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v9");
 
     // Gap payloads stay private, but the interrupted time must be unknown.
     let mut gap = capture(
@@ -2565,16 +2739,22 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
         .execute(&f.store.pool)
         .await
         .unwrap();
-    for mode in ["invalid", "failure", "timeout", "rate"] {
+    for mode in ["invalid", "failure", "timeout", "rate", "rate-retrying"] {
         let mut config = fake_fx(scratch.path(), mode);
         if mode == "timeout" {
             config.timeout = std::time::Duration::from_millis(100);
         }
+        let started = std::time::Instant::now();
         let result =
             hx_server::fx::interpret_window(&f.store, w, &format!("synthetic-fx-{mode}"), &config)
                 .await;
         assert!(result.is_err(), "{mode}");
-        if mode == "rate" {
+        // A retrying usage limit must be noticed at once, not after the fx timeout.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "{mode}"
+        );
+        if mode.starts_with("rate") {
             assert!(matches!(
                 result.unwrap_err().downcast_ref::<hx_jobs::Deferred>(),
                 Some(hx_jobs::Deferred::RateLimited)
@@ -2628,6 +2808,63 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     .unwrap();
     assert_eq!(value["episodes"][0]["claims"][0]["outcome"], "attempted");
     assert!(!value["check_failures"].as_array().unwrap().is_empty());
+    f.close().await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_keeps_the_fuller_answer_when_a_repair_comes_back_empty() {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("fx-empty-repair", 1)]).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "empty-repair");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-empty-repair", &config)
+            .await
+            .unwrap()
+    );
+    let value: Value = sqlx::query_scalar(
+        "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-empty-repair'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    // The rejected episode triggered one repair; the empty repair must not replace the first answer.
+    assert_eq!(value["episodes"].as_array().unwrap().len(), 1, "{value}");
+    assert!(std::fs::metadata(scratch.path().join("counter")).is_ok());
+    f.close().await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_repair_replaces_only_rejected_episodes_and_keeps_the_rest() {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("fx-merge-repair", 1)]).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    f.store.normalize_window(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "merge-repair");
+    assert!(
+        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-merge-repair", &config)
+            .await
+            .unwrap()
+    );
+    let value: Value = sqlx::query_scalar(
+        "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-merge-repair'",
+    )
+    .fetch_one(&f.store.pool)
+    .await
+    .unwrap();
+    let ids: Vec<&str> = value["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["synthetic-episode", "synthetic-second"], "{value}");
+    assert_eq!(value["tasks"][0]["id"], "synthetic-task", "{value}");
     f.close().await;
 }
 

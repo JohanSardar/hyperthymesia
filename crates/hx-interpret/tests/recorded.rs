@@ -117,7 +117,16 @@ async fn recorded_end_to_end_and_adversarial_cases() {
                 assert_eq!(result.episodes[0].claims[0].outcome, "attempted");
                 assert!(!result.check_failures.is_empty());
             }
-            "overlap" => assert!(result.tasks.is_empty()),
+            "overlap" => {
+                // An overlapping task keeps its episodes' verified intervals instead.
+                assert_eq!(result.tasks[0].intervals, result.episodes[0].intervals);
+                assert!(
+                    result
+                        .check_failures
+                        .iter()
+                        .any(|f| f.reason.starts_with("replaced task intervals"))
+                );
+            }
             _ => {
                 assert!(result.episodes[0].claims.is_empty());
                 assert!(!result.summary.contains("car"));
@@ -230,7 +239,7 @@ fn rejects_bounds_empty_episodes_and_unknown_outcome_refs() {
     assert!(!check(&result, &p).is_empty());
     result.episodes[0].claims[0].outcome_evidence = vec![999];
     check_and_repair(&mut result, &p);
-    assert!(result.tasks.is_empty());
+    assert_eq!(result.tasks[0].intervals, result.episodes[0].intervals);
     assert!(result.episodes[0].claims.is_empty());
     result.episodes[0].evidence.clear();
     check_and_repair(&mut result, &p);
@@ -444,19 +453,22 @@ fn repairs_only_changed_episode_and_dependent_tasks_without_leaking_rejected_tex
             assert_eq!(result.tasks[n], original.tasks[n], "{case}");
         }
         let changed = &result.episodes[1];
-        assert!(changed.title.contains("subject compare project:Orchid"));
+        assert!(changed.title.starts_with("Compare project:Orchid"));
         assert!(!changed.title.contains("Evidence-backed"));
         assert!(result.tasks[1].goal.is_none());
         assert_eq!(result.tasks[1].title, changed.title);
         assert_eq!(result.tasks[1].description, changed.description);
         assert_eq!(
             result.summary,
-            format!("Model title 0; {}; Model title 2", changed.title)
+            format!(
+                "{}. {}. {}.",
+                result.tasks[0].title, changed.title, result.tasks[2].title
+            )
         );
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("INJECTED_ASSERTION"), "{case}");
         if case == "completion" {
-            assert!(changed.title.starts_with("attempted:"));
+            assert!(changed.title.ends_with("(result not confirmed)"));
             assert!(!serialized.contains("completed"));
         }
         let repaired = result.clone();
@@ -485,14 +497,17 @@ fn removal_rebuilds_summary_but_preserves_unaffected_prose() {
             .filter(|e| !remove_episode || e.id != "e1")
             .collect();
         assert_eq!(result.episodes, retained);
-        assert_eq!(
-            result.summary,
-            if remove_episode {
-                "Model title 0; Model title 2"
-            } else {
-                "Model title 0; Model title 1; Model title 2"
-            }
-        );
+        // The removed task's episode is still summarized by its own title.
+        let titles: Vec<String> = if remove_episode {
+            vec![result.tasks[0].title.clone(), result.tasks[1].title.clone()]
+        } else {
+            vec![
+                result.tasks[0].title.clone(),
+                "Model title 1".into(),
+                result.tasks[1].title.clone(),
+            ]
+        };
+        assert_eq!(result.summary, format!("{}.", titles.join(". ")));
     }
 }
 
@@ -522,12 +537,12 @@ fn empty_claims_abstain_and_regenerated_unicode_titles_are_bounded() {
     );
     assert!(result.episodes[0].description.is_empty());
     assert_eq!(result.episodes[1].title.chars().count(), 120);
+    assert!(result.episodes[1].title.starts_with("Compare"));
     assert!(
         result.episodes[1]
             .title
-            .starts_with("attempted: subject compare")
+            .ends_with("… (result not confirmed)")
     );
-    assert!(result.episodes[1].title.ends_with('…'));
     assert_eq!(result.tasks[1].title.chars().count(), 120);
 }
 
