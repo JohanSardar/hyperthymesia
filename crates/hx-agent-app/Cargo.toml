@@ -6,7 +6,17 @@ license.workspace = true
 publish.workspace = true
 [lints]
 workspace = true
+[features]
+e2e-harness = ["hx-agent/e2e-harness"]
 [dependencies]
 hx-agent.workspace = true
 hx-macos-sys.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true
+hx-schema.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+zstd.workspace = true
