@@ -10,7 +10,7 @@ logins, a local stub model and a throwaway Postgres. The stub relies on fx's own
 | Question | Answer |
 | --- | --- |
 | S1 Make the fx provider configurable | **PASS**: a config change, not a broker rewrite. Real logins other than Codex: **BLOCKED** |
-| S2 Fake email is citable today | **FAIL**: the model never sees it |
+| S2 Fake email is citable today | **FAIL**: absent from the initial digest; currently discoverable through broker tools |
 | S2 Mid-run record makes publish refuse the run | **PASS**: confirmed |
 | S3 gws with no desktop session | **BLOCKED** on a real refresh; everything else below is established |
 | Broker tool taking 180 seconds | **FAIL** at today's 15 s setting; **PASS** once the setting is raised |
@@ -65,11 +65,17 @@ logins, a local stub model and a throwaway Postgres. The stub relies on fx's own
 Other results:
 
 - A `completed` claim on an email is downgraded to `attempted`.
-- The broker's own `search` does find these records, because it scans the JSON and ignores the
-  `restricted` column. So the model can read what the HTTP API hides without raw access.
+- Broker tools can read these records. Ingest stores an unknown kind as `restricted` in the column but
+  leaves `normal` in the envelope, and the broker's disclosure policy reads the envelope. That reaches
+  `search`, `read_evidence`, `timeline`, `window_overview`, `list_sources` and `prior_context`. The
+  broker does enforce disclosure policy, and records explicitly marked restricted stay blocked. Fixed by
+  #43, which makes these kinds withheld until a rule grants them.
 - Records with no device add no coverage spans.
 - Core kinds such as calendar and shell are also missing from the digest text, so mapping email to a
   core kind would not fix this.
+
+**Prerequisite.** The disclosure fix (#43) lands first, and a connected source's kinds need a class,
+otherwise the digest would either expose withheld records or show nothing.
 
 **Smallest change.** Change `build_digest` only and leave the checker alone: for records of a non-core
 kind, print `[id] start-end kind | short payload` and register that line as support. A point must print
@@ -84,11 +90,14 @@ at the old generation returned `published=false` and wrote no revision. Publishi
 | Record's date, relative to the running window | Run |
 | --- | --- |
 | Inside the window | **Invalidated** |
-| Previous window, within 30 minutes of the start | **Invalidated** |
-| Previous window, over 30 minutes before the start | Still valid |
+| Previous window, less than 30 minutes before the start | **Invalidated** |
+| Previous window, 30 minutes or more before the start | Still valid |
 | A week older, or the next window | Still valid |
 
-**Source:** every ingest also bumps the record's own window and queues its compile, and compile queues
+The table is for point records. Spans and corrections can invalidate additional windows through their
+ranges.
+
+**Source:** every accepted, nonduplicate observation also bumps the record's own window and queues its compile, and compile queues
 new agent runs for that window (`hx-server/src/processing.rs:378-393`). So an old live answer stored
 through `ingest` can trigger paid reruns of old windows.
 
@@ -99,7 +108,7 @@ through `ingest` can trigger paid reruns of old windows.
 - Add a checker rule for records from another time. **Ran**: an old record alone is rejected, but
   citing an old record plus an in-window focus record, with the claim resting only on the old one, is
   **kept as Observed**. That breaks "context, not proof".
-- Apply the digest change above.
+- Apply the digest change above, after the disclosure fix.
 
 **Decision for #35.** None.
 
@@ -169,7 +178,7 @@ would reset the wait, but the broker sends none. The whole run is still bound by
 - Raise the value above the longest allowed command.
 - Enforce the command deadline and kill the process inside the broker. fx only sends a cancel
   notification, and the broker ignores those (`mcp.rs:675-677`).
-- A timeout is quiet: `fx ask` still exits 0, and the tool call is marked `error`. `fx.rs:323-330`
-  only checks successful calls, so count these failures explicitly.
+- A timeout is quiet: `fx ask` still exits 0, and the tool call is marked `error`. Failures count
+  toward the total-call limit, but error status has no separate rejection or counting policy. Add one.
 - The broker holds its audit lock while a tool runs (`mcp.rs:392,404`), so a long command blocks every
   other tool call. Release the lock during the command.
