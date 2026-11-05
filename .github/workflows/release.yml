@@ -127,9 +127,10 @@ jobs:
           - runner: ubuntu-22.04-arm
             platform: linux-aarch64
     runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
     timeout-minutes: 10
     steps:
-      # Fresh hosted runner: no checkout, Rust, cache, packages, database or fx.
+      # Pristine Ubuntu userspace: no extra packages, Rust, database or fx.
       - uses: actions/download-artifact@v4
         with:
           name: release-${{ matrix.platform }}

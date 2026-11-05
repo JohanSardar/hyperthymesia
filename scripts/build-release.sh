@@ -95,6 +95,16 @@ if platform == 'macos-aarch64':
                 raise SystemExit(f'Link or special file in app: {path}')
             archive.write(path, path.relative_to(work).as_posix())
 PY
+if [[ "$platform" == macos-aarch64 ]]; then
+    # Check the actual zip's signatures/ticket after a round trip, not only the
+    # staging bundle. This also catches packaging that loses notarization data.
+    mkdir "$work/unpacked"
+    unzip -q "$out/Hyperthymesia-$version-$platform.zip" -d "$work/unpacked"
+    codesign --verify --deep --strict "$work/unpacked/Hyperthymesia.app"
+    if [[ "${HX_NOTARIZE:-0}" == 1 ]]; then
+        xcrun stapler validate "$work/unpacked/Hyperthymesia.app"
+    fi
+fi
 cp scripts/install.sh "$out/install.sh"
 chmod 755 "$out/install.sh"
 python3 - "$out" <<'PY'
