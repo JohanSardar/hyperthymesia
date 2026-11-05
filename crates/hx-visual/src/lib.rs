@@ -147,7 +147,9 @@ impl VisionCliEngine {
             target_dir: target_dir.into(),
         }
     }
-    fn executable(&self) -> Result<PathBuf> {
+    /// Resolve the same helper used for OCR (including the development fallback).
+    /// Call on a blocking thread: development resolution may compile Swift.
+    pub fn executable(&self) -> Result<PathBuf> {
         if !cfg!(target_os = "macos") {
             bail!("Apple Vision OCR requires macOS");
         }
