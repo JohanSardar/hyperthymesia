@@ -647,12 +647,14 @@ mod tests {
     #[test]
     fn titles_drop_browser_chrome_and_badges() {
         assert_eq!(
-            clean_title("X - High memory usage - 803 MB - Google Chrome - Johan (Person 1)"),
-            "X"
+            clean_title(
+                "Synthetic page - High memory usage - 803 MB - Google Chrome - Owner (Person 1)"
+            ),
+            "Synthetic page"
         );
         assert_eq!(
-            clean_title("Elections / X - Audio playing - Google Chrome - P"),
-            "Elections / X"
+            clean_title("Synthetic topic / Page - Audio playing - Google Chrome - P"),
+            "Synthetic topic / Page"
         );
         assert_eq!(clean_title("T3 Code (Nightly)"), "T3 Code (Nightly)");
     }
@@ -660,12 +662,12 @@ mod tests {
     #[test]
     fn address_bar_urls_are_extracted() {
         assert_eq!(
-            addresses("Back\nAddress and search bar\nx.com/search?q=5pm\nReload"),
-            vec!["x.com/search?q=5pm".to_owned()]
+            addresses("Back\nAddress and search bar\nexample.test/search?q=synthetic\nReload"),
+            vec!["example.test/search?q=synthetic".to_owned()]
         );
         assert_eq!(
-            addresses("Address and search bar x.com/home"),
-            vec!["x.com/home".to_owned()]
+            addresses("Address and search bar example.test/home"),
+            vec!["example.test/home".to_owned()]
         );
     }
 }
