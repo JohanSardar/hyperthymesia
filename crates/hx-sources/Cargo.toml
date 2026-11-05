@@ -9,10 +9,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+base64 = "0.22"
+libc = "0.2"
+nix = { version = "0.30", features = ["signal", "process"] }
+regex = "1"
+serde_json.workspace = true
+shell-words = "1"
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-nix = { version = "0.30", features = ["signal", "process"] }
-shell-words = "1"
-
-[dev-dependencies]
-tempfile.workspace = true
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"

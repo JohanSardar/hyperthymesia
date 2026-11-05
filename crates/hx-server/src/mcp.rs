@@ -8,7 +8,7 @@ use hx_store::Store;
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::{collections::BTreeMap, sync::Arc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 pub const MAX_RESULT_BYTES: usize = 48 * 1024;
 pub const MAX_CALLS: usize = 240;
@@ -32,6 +32,8 @@ pub struct Broker {
     pub audit: Arc<Mutex<Audit>>,
     /// Lookups answered before the broker asks the model to finish from what it has.
     pub lookup_limit: usize,
+    outside_generation: Option<i64>,
+    input_changed: watch::Sender<bool>,
 }
 #[derive(Default, serde::Serialize)]
 pub struct Audit {
@@ -68,12 +70,37 @@ impl Broker {
             window,
             audit: Arc::default(),
             lookup_limit: MAX_CALLS,
+            outside_generation: None,
+            input_changed: watch::channel(false).0,
         }
+    }
+    /// Fence only durable outside input. Future live snapshots belong in a
+    /// run-local sidecar: they must not ingest events or advance this generation.
+    pub fn for_generation(mut self, generation: i64) -> Self {
+        self.outside_generation = Some(generation);
+        self
+    }
+    pub(crate) async fn check_generation(&self) -> Result<()> {
+        if let Some(expected) = self.outside_generation
+            && !self
+                .store
+                .is_current_generation(self.window, expected)
+                .await?
+        {
+            self.input_changed.send_replace(true);
+            return Err(hx_jobs::Deferred::InputChanged.into());
+        }
+        Ok(())
+    }
+    pub(crate) async fn cancelled(&self) {
+        let mut receiver = self.input_changed.subscribe();
+        let _ = receiver.wait_for(|changed| *changed).await;
     }
     /// Compile the whole window without the exploration row cap and render the
     /// digest the model reads first. Every visible record in the window becomes
     /// citable, and digest segments support their full interval.
     pub async fn digest(&self) -> Result<String> {
+        self.check_generation().await?;
         let config = hx_compile::AttentionConfig::default();
         let lookback = config
             .reading_max_s
@@ -158,6 +185,7 @@ impl Broker {
         audit.digest_evidence = evidence;
         audit.attention.extend(attention);
         audit.input_namespaces.extend(namespaces);
+        self.check_generation().await?;
         Ok(digest.text)
     }
     pub fn visible(&self, e: &Envelope) -> bool {
@@ -184,7 +212,7 @@ impl Broker {
         }
         Ok(true)
     }
-    async fn project(&self, id: i64, e: &Envelope) -> Result<Vec<EvidenceItem>> {
+    pub(crate) async fn project(&self, id: i64, e: &Envelope) -> Result<Vec<EvidenceItem>> {
         if !self.visible(e) {
             return Ok(vec![]);
         }
@@ -366,7 +394,7 @@ impl Broker {
                 }
             }
         }
-        let rows = sqlx::query("SELECT r.id,r.interpretation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 ORDER BY w.end_at DESC LIMIT 4").bind(before).fetch_all(&self.store.pool).await?;
+        let rows = sqlx::query("SELECT r.id,r.interpretation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 AND w.end_at>$1-interval '16 hours' ORDER BY w.end_at DESC LIMIT 4").bind(before).fetch_all(&self.store.pool).await?;
         let mut revisions = vec![];
         for row in rows {
             let value: Value = row.get("interpretation");
@@ -390,6 +418,7 @@ impl Broker {
         );
         // Serialize calls, including budget admission and the log, to prevent concurrent bypass.
         let mut audit = self.audit.lock().await;
+        self.check_generation().await?;
         if audit.calls.len() >= MAX_CALLS {
             audit.exhausted = true;
             bail!("tool budget exhausted");
@@ -402,6 +431,7 @@ impl Broker {
             return Ok(result);
         }
         let result = self.execute(name, &args).await;
+        self.check_generation().await?;
         let result = result.unwrap_or_else(
             |_| json!({"error":"tool request failed; narrow the range or check arguments"}),
         );
@@ -429,9 +459,14 @@ impl Broker {
             .push(json!({"tool":name,"arguments":args,"result":result}));
         Ok(result)
     }
+    async fn live_lookup(&self, _args: &Value) -> Result<Value> {
+        Ok(json!({"status":"no live connectors configured","evidence":[]}))
+    }
     async fn execute(&self, name: &str, args: &Value) -> Result<Value> {
         match name {
-            "live_lookup" => Ok(json!({"status":"no live connectors configured","evidence":[]})),
+            // Run-scoped live lookup seam. Future results stay in this broker's
+            // sidecar and audit, never Store::ingest or the outside generation.
+            "live_lookup" => self.live_lookup(args).await,
             "prior_context" => {
                 self.prior_context(serde_json::from_value(
                     args.get("before")
