@@ -11,16 +11,20 @@ workspace = true
 [dependencies]
 base64 = "0.22"
 libc = "0.2"
+nix = { version = "0.30", features = ["signal", "process"] }
 regex = "1"
 hx-schema.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shell-words = "1"
 tempfile.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
 reqwest.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 axum.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
