@@ -293,6 +293,16 @@ impl Store {
     pub async fn generation(&self, w: Interval) -> Result<i64> {
         Ok(sqlx::query_scalar("INSERT INTO windows(start_at,end_at) VALUES($1,$2) ON CONFLICT(start_at) DO UPDATE SET start_at=EXCLUDED.start_at RETURNING generation").bind(w.start).bind(w.end).fetch_one(&self.pool).await?)
     }
+    /// Read-only fence for a run; unlike generation(), this never creates work.
+    pub async fn is_current_generation(&self, w: Interval, generation: i64) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM windows WHERE start_at=$1 AND generation=$2)",
+        )
+        .bind(w.start)
+        .bind(generation)
+        .fetch_one(&self.pool)
+        .await?)
+    }
     pub async fn save_timeline(&self, timeline: &Timeline, generation: i64) -> Result<bool> {
         Ok(sqlx::query("UPDATE windows SET timeline=$3,compiler_version=$4,compiled_generation=$2,dirty=false,timeline_hash=$5 WHERE start_at=$1 AND generation=$2")
             .bind(timeline.window.start).bind(generation).bind(serde_json::to_value(timeline)?).bind(&timeline.compiler_version).bind(hash(&serde_json::to_vec(timeline)?)).execute(&self.pool).await?.rows_affected()==1)

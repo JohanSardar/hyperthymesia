@@ -225,6 +225,7 @@ async fn run_limited(
     instruction: &str,
     steps: u64,
 ) -> Result<Value> {
+    broker.check_generation().await?;
     let dir = tempfile::Builder::new().prefix("hx-fx-").tempdir()?;
     let profile = dir.path().join(".fx");
     let work = dir.path().join("work");
@@ -304,7 +305,13 @@ async fn run_limited(
         "--system",
         PROMPT,
     ]);
-    let response = output(cmd, instruction, config.timeout).await?;
+    // Dropping output kills the child (kill_on_drop), including an fx process
+    // waiting on a broker response or retrying after a denied tool call.
+    let response = tokio::select! {
+        response = output(cmd, instruction, config.timeout) => response?,
+        _ = broker.cancelled() => return Err(hx_jobs::Deferred::InputChanged.into()),
+    };
+    broker.check_generation().await?;
     let value: Value = serde_json::from_slice(&response.stdout).context("invalid fx response")?;
     if response.status.success() && value["exit_code"] == 0 {
         ensure!(value["model"] == MODEL, "fx model mismatch");
@@ -381,7 +388,7 @@ pub(crate) async fn interpret_window_with_settle(
     if crate::processing::revision_exists(store, window, generation, &identity).await? {
         return Ok(false);
     }
-    let mut broker = Broker::new(store.clone(), policy.clone(), sensitive, window);
+    let mut broker = Broker::new(store.clone(), policy.clone(), sensitive, window).for_generation(generation);
     broker.lookup_limit = DIGEST_LOOKUPS;
     let digest = broker.digest().await?;
     let goal = format!(
@@ -585,6 +592,7 @@ pub(crate) async fn interpret_window_with_settle(
             }
         }
     }
+    broker.check_generation().await?;
     let interpretation = best.context("invalid fx interpretation")?;
     ensure!(
         DisclosurePolicy::from_env()?.digest() == policy.digest()
