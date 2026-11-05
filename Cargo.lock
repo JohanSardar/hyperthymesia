@@ -988,10 +988,12 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "fs2",
  "hx-compile",
  "hx-connector-sdk",
  "hx-macos-sys",
  "hx-schema",
+ "image",
  "regex",
  "reqwest",
  "rusqlite",
@@ -1008,8 +1010,14 @@ name = "hx-agent-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "hx-agent",
  "hx-macos-sys",
+ "hx-schema",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zstd",
 ]
 
 [[package]]
