@@ -1,4 +1,7 @@
 //! Durable evidence, derived generations, credentials and content-addressed files.
+pub mod sqlite;
+pub use sqlite::Ts;
+
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use hx_compile::{Observation, Timeline};
