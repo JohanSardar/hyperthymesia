@@ -2928,23 +2928,34 @@ async fn mcp_ocr_only_dense_results_new_sources_and_prior_revision_filter() {
         .await
         .unwrap();
     assert_eq!(read["evidence"][0], ocr);
-    // Newly connected source kinds require neither prompt nor tool changes.
+    // A new kind stays withheld until a rule grants it, and then needs no prompt or tool changes.
     let mut new_source = event("mcp-new-source", 1);
     new_source.kind = Kind::new("synthetic.document");
     new_source.payload = json!({"text":"synthetic comet discovery"});
     ingest(&f.store, vec![new_source]).await;
-    let search = broker
+    let withheld = broker
+        .call("search", json!({"query":"comet discovery"}))
+        .await
+        .unwrap();
+    assert!(withheld["evidence"].as_array().unwrap().is_empty());
+    let grant = DisclosurePolicy::from_json(
+        r#"{"rules":[{"connector_prefix":"test:","kind":"synthetic.document","class":"normal"}]}"#,
+    )
+    .unwrap();
+    let grant_digest = grant.digest();
+    let granted = Broker::new(f.store.clone(), grant, SensitiveEgress::Full, w);
+    let search = granted
         .call("search", json!({"query":"comet discovery"}))
         .await
         .unwrap();
     assert_eq!(search["evidence"].as_array().unwrap().len(), 1);
     let visible = search["evidence"][0]["id"].as_i64().unwrap();
-    let sources = broker.call("list_sources", json!({})).await.unwrap();
+    let sources = granted.call("list_sources", json!({})).await.unwrap();
     assert!(sources.to_string().contains("synthetic.document"));
     let generation = f.store.generation(w).await.unwrap();
-    f.store.publish_revision(w,generation,json!({"episodes":[{"evidence":[visible]}],"tasks":[],"summary":"synthetic prior","input_manifest":{"disclosure_policy":{"digest":DisclosurePolicy::default().digest()},"sensitive_egress":"full"}})).await.unwrap();
+    f.store.publish_revision(w,generation,json!({"episodes":[{"evidence":[visible]}],"tasks":[],"summary":"synthetic prior","input_manifest":{"disclosure_policy":{"digest":grant_digest},"sensitive_egress":"full"}})).await.unwrap();
     assert_eq!(
-        broker.prior_context(w.end).await.unwrap()["revisions"]
+        granted.prior_context(w.end).await.unwrap()["revisions"]
             .as_array()
             .unwrap()
             .len(),

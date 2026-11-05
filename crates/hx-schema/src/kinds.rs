@@ -427,3 +427,12 @@ pub const CORE_KINDS: &[&str] = &[
 pub fn is_core(kind: &str) -> bool {
     CORE_KINDS.contains(&kind)
 }
+
+/// The class a record holds before any owner rule applies. A producer can only
+/// call a kind normal when the core defines what that kind contains.
+pub fn stored_class(kind: &str, declared: crate::Sensitivity) -> crate::Sensitivity {
+    match declared {
+        crate::Sensitivity::Normal if !is_core(kind) => crate::Sensitivity::Restricted,
+        declared => declared,
+    }
+}
