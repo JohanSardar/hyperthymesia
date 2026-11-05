@@ -3,50 +3,9 @@ use hx_schema::{
     ConnectorInstance, Envelope, Interval, Kind, ObservationId, ObservationTime, Operation,
     Revision, Sensitivity, SourceKey,
 };
+use hx_store::test_support::Fixture;
 use hx_store::{Store, Token, UploadBatch};
 use serde_json::json;
-use sqlx::{PgPool, Row};
-struct Fixture {
-    store: Store,
-    admin: PgPool,
-    db: String,
-    _dir: tempfile::TempDir,
-}
-impl Fixture {
-    async fn new() -> Self {
-        let admin = PgPool::connect("postgres://hx:hx@localhost:55432/postgres")
-            .await
-            .unwrap();
-        let db = format!(
-            "hx_sc_fix_20261031_{}",
-            ulid::Ulid::generate().to_string().to_lowercase()
-        );
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
-            .execute(&admin)
-            .await
-            .unwrap();
-        let pool = PgPool::connect(&format!("postgres://hx:hx@localhost:55432/{db}"))
-            .await
-            .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::new(pool, dir.path());
-        store.migrate().await.unwrap();
-        Self {
-            store,
-            admin,
-            db,
-            _dir: dir,
-        }
-    }
-    async fn close(self) {
-        self.store.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {}", self.db)))
-            .execute(&self.admin)
-            .await
-            .unwrap();
-        self.admin.close().await;
-    }
-}
 fn window() -> Interval {
     hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap())
 }
@@ -55,11 +14,7 @@ async fn exhausted_compile_is_revived_after_cooldown() {
     let f = Fixture::new().await;
     let w = window();
     let g = f.store.generation(w).await.unwrap();
-    let mut tx = f.store.pool.begin().await.unwrap();
-    hx_store::request_window_job(&mut tx, "compile", w, g)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    f.store.request_work("compile", w, g).await.unwrap();
     for _ in 0..5 {
         let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
         assert_eq!(j.kind, "compile");
@@ -68,36 +23,34 @@ async fn exhausted_compile_is_revived_after_cooldown() {
                 .await
                 .unwrap()
         );
-        sqlx::query("UPDATE jobs SET available_at=now() WHERE state='ready'")
-            .execute(&f.store.pool)
-            .await
-            .unwrap();
+        f.store.make_jobs_due("ready", None).await.unwrap();
     }
     hx_server::processing::schedule(&f.store).await.unwrap();
-    let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE state='failed' LIMIT 1")
-        .fetch_one(&f.store.pool)
+    let state = f
+        .store
+        .job_states()
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|j| j.state == "failed")
+        .unwrap()
+        .state;
     assert_eq!(state, "failed");
-    sqlx::query("UPDATE jobs SET available_at=now() WHERE state='failed'")
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    f.store.make_jobs_due("failed", None).await.unwrap();
     for _ in 0..3 {
         hx_server::processing::schedule(&f.store).await.unwrap();
     }
-    let r = sqlx::query("SELECT state,attempts FROM jobs WHERE output_key=$1")
-        .bind(format!("compile:{}", w.start))
-        .fetch_one(&f.store.pool)
+    let r = f
+        .store
+        .job_states()
         .await
+        .unwrap()
+        .into_iter()
+        .find(|j| j.output_key == format!("compile:{}", w.start))
         .unwrap();
-    assert_eq!(r.get::<String, _>("state"), "ready");
-    assert_eq!(r.get::<i32, _>("attempts"), 0);
-    let dirty: bool = sqlx::query_scalar("SELECT dirty FROM windows WHERE start_at=$1")
-        .bind(w.start)
-        .fetch_one(&f.store.pool)
-        .await
-        .unwrap();
+    assert_eq!(r.state, "ready");
+    assert_eq!(r.attempts, 0);
+    let dirty = f.store.window_state(w).await.unwrap().dirty;
     assert!(dirty);
     f.close().await;
 }
@@ -117,60 +70,57 @@ async fn exhausted_interpretations_recover_without_new_input() {
     let f = Fixture::new().await;
     let w = window();
     let g = f.store.generation(w).await.unwrap();
-    let mut tx = f.store.pool.begin().await.unwrap();
-    hx_store::request_window_job(&mut tx, "compile", w, g)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    f.store.request_work("compile", w, g).await.unwrap();
     let runner = hx_server::processing::Runner {
         store: f.store.clone(),
         provider: Fails,
     };
     assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
-    sqlx::query("UPDATE windows SET input_changed_at=now()-interval '1 hour'")
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    f.store.settle_inputs().await.unwrap();
     for _ in 0..10 {
-        sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret' AND state='ready'")
-            .execute(&f.store.pool)
+        f.store
+            .make_jobs_due("ready", Some("interpret"))
             .await
             .unwrap();
         assert!(hx_jobs::run_one(&f.store.pool, &runner).await.is_err());
     }
     hx_server::processing::schedule(&f.store).await.unwrap();
-    let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE state='failed' LIMIT 1")
-        .fetch_one(&f.store.pool)
+    let state = f
+        .store
+        .job_states()
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|j| j.state == "failed")
+        .unwrap()
+        .state;
     assert_eq!(state, "failed");
-    sqlx::query("UPDATE jobs SET available_at=now() WHERE state='failed'")
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    f.store.make_jobs_due("failed", None).await.unwrap();
     for _ in 0..3 {
         hx_server::processing::schedule(&f.store).await.unwrap();
     }
-    let failed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM jobs WHERE kind='interpret' AND state='failed' AND attempts=5",
-    )
-    .fetch_one(&f.store.pool)
-    .await
-    .unwrap();
+    let failed = f
+        .store
+        .job_states()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|j| j.kind == "interpret" && j.state == "failed" && j.attempts == 5)
+        .count();
     assert_eq!(failed, 0);
-    let compile: String = sqlx::query_scalar("SELECT state FROM jobs WHERE output_key=$1")
-        .bind(format!("compile:{}", w.start))
-        .fetch_one(&f.store.pool)
+    let compile = f
+        .store
+        .job_states()
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|j| j.output_key == format!("compile:{}", w.start))
+        .unwrap()
+        .state;
     assert_eq!(compile, "done");
-    let r = sqlx::query("SELECT dirty,canonical_revision FROM windows WHERE start_at=$1")
-        .bind(w.start)
-        .fetch_one(&f.store.pool)
-        .await
-        .unwrap();
-    assert!(!r.get::<bool, _>("dirty"));
-    assert!(r.get::<Option<i64>, _>("canonical_revision").is_none());
+    let r = f.store.window_state(w).await.unwrap();
+    assert!(!r.dirty);
+    assert!(r.canonical_revision.is_none());
     let recovered = hx_server::processing::Runner {
         store: f.store.clone(),
         provider: hx_server::processing::StubProvider,
@@ -179,11 +129,7 @@ async fn exhausted_interpretations_recover_without_new_input() {
     // The scheduler also creates the previous bucket; allow its compile to run.
     for _ in 0..4 {
         assert!(hx_jobs::run_one(&f.store.pool, &recovered).await.unwrap());
-        canonical = sqlx::query_scalar("SELECT canonical_revision FROM windows WHERE start_at=$1")
-            .bind(w.start)
-            .fetch_one(&f.store.pool)
-            .await
-            .unwrap();
+        canonical = f.store.window_state(w).await.unwrap().canonical_revision;
         if canonical.is_some() {
             break;
         }
@@ -196,19 +142,15 @@ async fn workers_serialize_jobs_for_the_same_window() {
     let f = Fixture::new().await;
     let w = window();
     let g = f.store.generation(w).await.unwrap();
-    let mut tx = f.store.pool.begin().await.unwrap();
-    hx_store::request_window_job(&mut tx, "compile", w, g)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    f.store.request_work("compile", w, g).await.unwrap();
     let runner = hx_server::processing::Runner {
         store: f.store.clone(),
         provider: hx_server::processing::StubProvider,
     };
     assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
     // Make both cadences eligible; this test isolates per-window claim fencing.
-    sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret'")
-        .execute(&f.store.pool)
+    f.store
+        .make_jobs_due("ready", Some("interpret"))
         .await
         .unwrap();
     let (a, b) = tokio::join!(
@@ -223,11 +165,10 @@ async fn workers_serialize_jobs_for_the_same_window() {
     // A different window can still run while this window's lease is live.
     let other = hx_store::window_at(w.end);
     let generation = f.store.generation(other).await.unwrap();
-    let mut tx = f.store.pool.begin().await.unwrap();
-    hx_store::request_window_job(&mut tx, "compile", other, generation)
+    f.store
+        .request_work("compile", other, generation)
         .await
         .unwrap();
-    tx.commit().await.unwrap();
     let parallel = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
     assert_eq!(parallel.payload["window"], json!(other));
     assert!(
@@ -237,11 +178,8 @@ async fn workers_serialize_jobs_for_the_same_window() {
     );
     assert!(hx_jobs::finish(&f.store.pool, first, None).await.unwrap());
     let next = hx_jobs::claim(&f.store.pool, 120).await.unwrap();
-    let debug: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(jobs)) FROM jobs")
-        .fetch_one(&f.store.pool)
-        .await
-        .unwrap();
-    assert!(next.is_some(), "{debug}");
+    let debug = f.store.job_states().await.unwrap();
+    assert!(next.is_some(), "{debug:?}");
     f.close().await;
 }
 #[tokio::test]
@@ -255,11 +193,7 @@ async fn windows_controls_stale_defer_and_restart_fencing() {
         .await
         .unwrap();
     assert!(ok);
-    sqlx::query("UPDATE windows SET generation=generation+1,dirty=true WHERE start_at=$1")
-        .bind(w.start)
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    f.store.change_input(w).await.unwrap();
     let (new, ok) = f
         .store
         .publish_revision_key(w, g + 1, json!({"tasks":[]}), "new")
@@ -272,18 +206,9 @@ async fn windows_controls_stale_defer_and_restart_fencing() {
         .await
         .unwrap();
     assert!(!ok);
-    let canonical: i64 =
-        sqlx::query_scalar("SELECT canonical_revision FROM windows WHERE start_at=$1")
-            .bind(w.start)
-            .fetch_one(&f.store.pool)
-            .await
-            .unwrap();
-    assert_eq!(canonical, new);
-    let mut tx = f.store.pool.begin().await.unwrap();
-    hx_store::request_window_job(&mut tx, "compile", w, g + 1)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let canonical: Option<i64> = f.store.window_state(w).await.unwrap().canonical_revision;
+    assert_eq!(canonical, Some(new));
+    f.store.request_work("compile", w, g + 1).await.unwrap();
     let first = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
     assert!(
         hx_jobs::defer(
@@ -294,28 +219,21 @@ async fn windows_controls_stale_defer_and_restart_fencing() {
         .await
         .unwrap()
     );
-    let r = sqlx::query("SELECT state,attempts FROM jobs WHERE id=$1")
-        .bind(first.id)
-        .fetch_one(&f.store.pool)
+    let r = f
+        .store
+        .job_states()
         .await
+        .unwrap()
+        .into_iter()
+        .find(|j| j.id == first.id)
         .unwrap();
-    assert_eq!(r.get::<String, _>("state"), "ready");
-    assert_eq!(r.get::<i32, _>("attempts"), 0);
-    sqlx::query("UPDATE jobs SET available_at=now() WHERE state='ready'")
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    assert_eq!(r.state, "ready");
+    assert_eq!(r.attempts, 0);
+    f.store.make_jobs_due("ready", None).await.unwrap();
     let old = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
-    let mut tx = f.store.pool.begin().await.unwrap();
-    hx_store::request_window_job(&mut tx, "compile", w, g + 2)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    f.store.request_work("compile", w, g + 2).await.unwrap();
     assert!(hx_jobs::heartbeat(&f.store.pool, &old, 120).await.unwrap());
-    sqlx::query("UPDATE jobs SET lease_until=now()-interval '1 second',max_attempts=1")
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    f.store.expire_lease(old.id, Some(1)).await.unwrap();
     let fresh = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
     assert_eq!(fresh.id, old.id);
     assert_ne!(fresh.owner, old.owner);
@@ -368,17 +286,7 @@ async fn ingest(store: &Store, envelopes: Vec<Envelope>) -> hx_store::UploadAck 
         .unwrap()
 }
 async fn count(store: &Store, table: &str) -> i64 {
-    sqlx::query_scalar(match table {
-        "events" => "SELECT count(*) FROM events",
-        "jobs" => "SELECT count(*) FROM jobs",
-        "quarantine" => "SELECT count(*) FROM quarantine",
-        "normalized" => "SELECT count(*) FROM normalized",
-        "revisions" => "SELECT count(*) FROM revisions",
-        _ => panic!("unrecognized table"),
-    })
-    .fetch_one(&store.pool)
-    .await
-    .unwrap()
+    store.record_count(table).await.unwrap()
 }
 
 #[tokio::test]
@@ -416,17 +324,9 @@ async fn shortened_revision_invalidates_tail_and_suppresses_old_winner() {
         .normalize_window(hx_store::window_at(new.time.observed_at))
         .await
         .unwrap();
-    let row = sqlx::query("SELECT generation,dirty FROM windows WHERE start_at=$1")
-        .bind(tail.start)
-        .fetch_one(&f.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        row.get::<i64, _>("generation"),
-        g + 1,
-        "tail generation must advance"
-    );
-    assert!(row.get::<bool, _>("dirty"), "tail must be dirty");
+    let row = f.store.window_state(tail).await.unwrap();
+    assert_eq!(row.generation, g + 1, "tail generation must advance");
+    assert!(row.dirty, "tail must be dirty");
     let obs = f.store.observations(tail, true).await.unwrap();
     assert_eq!(obs.len(), 2);
     let actual = hx_compile::compile(&obs, tail);
@@ -458,31 +358,34 @@ async fn five_crashes_quarantine_pending_normalization() {
         let job = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
         assert_eq!(job.kind, "normalize");
         // Crash after claim: no handler writes, lease expires. Synthetic time advance.
-        sqlx::query("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE id=$1")
-            .bind(job.id)
-            .execute(&f.store.pool)
-            .await
-            .unwrap();
+        f.store.expire_lease(job.id, None).await.unwrap();
     }
     let _ = hx_jobs::claim(&f.store.pool, 120).await.unwrap();
     hx_server::processing::schedule(&f.store).await.unwrap();
-    let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE kind='normalize'")
-        .fetch_one(&f.store.pool)
+    let state = f
+        .store
+        .job_states()
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|j| j.kind == "normalize")
+        .unwrap()
+        .state;
     assert_eq!(state, "failed");
     assert_eq!(count(&f.store, "normalized").await, 0);
     assert_eq!(count(&f.store, "quarantine").await, 1);
-    let reason: String = sqlx::query_scalar("SELECT reason FROM quarantine")
-        .fetch_one(&f.store.pool)
-        .await
-        .unwrap();
+    let reason = f.store.quarantine_reasons().await.unwrap().remove(0);
     assert!(reason.contains("exhaust"));
     ingest(&f.store, vec![event("pending", 0)]).await; // same dedup key cannot revive work
-    let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE kind='normalize'")
-        .fetch_one(&f.store.pool)
+    let state = f
+        .store
+        .job_states()
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|j| j.kind == "normalize")
+        .unwrap()
+        .state;
     assert_eq!(state, "failed");
     f.close().await;
 }
@@ -570,10 +473,7 @@ async fn normalization_errors_quarantine_only_pending_events() {
                 .await
                 .unwrap()
         );
-        sqlx::query("UPDATE jobs SET available_at=now() WHERE state='ready'")
-            .execute(&f.store.pool)
-            .await
-            .unwrap();
+        f.store.make_jobs_due("ready", None).await.unwrap();
     }
     assert_eq!(count(&f.store, "normalized").await, 1);
     assert_eq!(count(&f.store, "quarantine").await, 1);
@@ -590,17 +490,12 @@ async fn normalization_errors_quarantine_only_pending_events() {
 #[tokio::test]
 async fn claim_observes_jobs_that_become_due_while_waiting_for_the_gate() {
     let f = Fixture::new().await;
-    let mut gate = f.store.pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(6847291630281)")
-        .execute(&mut *gate)
-        .await
-        .unwrap();
+    let gate = f.store.hold_claim_gate().await.unwrap();
     let pool = f.store.pool.clone();
     let worker = tokio::spawn(async move { hx_jobs::claim(&pool, 120).await });
     let mut waiting = false;
     for _ in 0..100 {
-        waiting = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))")
-            .fetch_one(&f.store.pool).await.unwrap();
+        waiting = f.store.claim_is_waiting().await.unwrap();
         if waiting {
             break;
         }
@@ -610,9 +505,8 @@ async fn claim_observes_jobs_that_become_due_while_waiting_for_the_gate() {
         waiting,
         "claim must have begun its transaction before the job becomes due"
     );
-    sqlx::query("INSERT INTO jobs(output_key,kind,payload,available_at) VALUES('became-due','test','{}',clock_timestamp())")
-        .execute(&f.store.pool).await.unwrap();
-    gate.commit().await.unwrap();
+    f.store.enqueue_due_probe().await.unwrap();
+    gate.release().await.unwrap();
     assert!(worker.await.unwrap().unwrap().is_some());
     f.close().await;
 }
@@ -636,11 +530,8 @@ async fn batch_watermarks_keep_independent_maxima_and_ignore_duplicates() {
     first.time.observed_at = at + chrono::Duration::hours(4);
     first.sequence = Some(99);
     assert_eq!(ingest(&f.store, vec![first]).await.duplicates, 1);
-    let row = sqlx::query("SELECT observed_through,sequence::text AS sequence FROM watermarks")
-        .fetch_one(&f.store.pool)
-        .await
-        .unwrap();
-    assert_eq!(row.get::<chrono::DateTime<Utc>, _>("observed_through"), at);
-    assert_eq!(row.get::<String, _>("sequence"), "3");
+    let (through, sequence) = f.store.watermark("test:device").await.unwrap();
+    assert_eq!(through, at);
+    assert_eq!(sequence, "3");
     f.close().await;
 }
