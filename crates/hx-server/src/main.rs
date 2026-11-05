@@ -7,6 +7,7 @@ use hx_store::Store;
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser)]
+#[command(version)]
 struct Cli {
     #[arg(
         long,

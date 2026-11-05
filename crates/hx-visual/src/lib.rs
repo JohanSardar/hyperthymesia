@@ -157,7 +157,9 @@ impl VisionCliEngine {
             anyhow::ensure!(helper.is_file(), "HX_VISION_HELPER is not a file");
             return Ok(helper);
         }
-        let helper = std::env::current_exe()?.with_file_name("hx-vision-ocr");
+        let helper = std::env::current_exe()?
+            .canonicalize()?
+            .with_file_name("hx-vision-ocr");
         if helper.is_file() {
             return Ok(helper);
         }
