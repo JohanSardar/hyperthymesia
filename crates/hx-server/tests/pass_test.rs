@@ -40,34 +40,12 @@ const SUBJECT: &str = "Synthetic invoice for the orchid greenhouse";
 #[tokio::test]
 #[ignore = "the product goal: connecting a source does not exist until issue #37"]
 async fn connecting_a_source_is_enough_for_a_cited_day_page_entry() {
-    let admin_url = std::env::var("HX_TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://hx:hx@localhost:55432/hx".into());
-    let database = format!(
-        "hx_pass_{}",
-        ulid::Ulid::generate().to_string().to_lowercase()
-    );
-    let admin = sqlx::PgPool::connect(&admin_url)
-        .await
-        .expect("test Postgres must be running");
-    run_sql(&admin, &format!("CREATE DATABASE {database}")).await;
-    let (server, _) = admin_url.rsplit_once('/').expect("database URL");
-    let outcome = tokio::spawn(scenario(format!("{server}/{database}"))).await;
-    run_sql(&admin, &format!("DROP DATABASE {database} WITH (FORCE)")).await;
-    if let Err(failure) = outcome {
-        std::panic::resume_unwind(failure.into_panic());
-    }
+    scenario().await;
 }
 
-async fn run_sql(pool: &sqlx::PgPool, sql: &str) {
-    sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()))
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
-async fn scenario(database_url: String) {
+async fn scenario() {
     let scratch = tempfile::tempdir().unwrap();
-    let cli = || hx_server_command(&database_url, scratch.path());
+    let cli = || hx_server_command(scratch.path());
     assert!(cli().arg("migrate").status().await.unwrap().success());
     let token = cli()
         .args(["token", "create", "--name", "owner", "--prefix", "source:"])
@@ -149,14 +127,14 @@ fn cited_entry(page: &str) -> Option<i64> {
     link.split_once('"')?.0.parse().ok()
 }
 
-fn hx_server_command(database_url: &str, cwd: &Path) -> Command {
+fn hx_server_command(cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hx-server"));
     // Nothing from the developer's environment or real home reaches the server.
     command
         .env_clear()
         .env("HOME", cwd)
         .env("PATH", "/usr/bin:/bin")
-        .env("DATABASE_URL", database_url)
+        .env("HX_STATE_DIR", cwd.join("state"))
         .current_dir(cwd)
         .kill_on_drop(true);
     command
@@ -168,11 +146,8 @@ async fn start_server(cli: &impl Fn() -> Command, scratch: &Path) -> (String, Ch
     drop(probe);
     let credential = scratch.join("synthetic-auth.json");
     std::fs::write(&credential, "{}").unwrap();
-    let data = scratch.join("data");
-    std::fs::create_dir(&data).unwrap();
     let running = cli()
-        .args(["serve", "--listen", &address, "--data-dir"])
-        .arg(&data)
+        .args(["serve", "--listen", &address])
         .env("HX_PROVIDER", "fx")
         .env("HX_FX_BINARY", write_scripted_fx(scratch))
         .env("HX_FX_CREDENTIAL", &credential)

@@ -115,6 +115,6 @@ PR #7's compiler follow-up is documented in `crates/hx-server/README.md` and the
 ignored `synthetic_browser_point_stress` in `crates/hx-server/tests/server.rs`.
 That crate is unchanged here. To enable it, remove its
 `#[ignore = "known quadratic open-browser-transition cost in hx-compile; run separately in release"]`
-attribute, then run the release hx-server test against its synthetic Postgres
+attribute, then run the release hx-server test against its temporary SQLite
 fixture. The end-to-end 60-second bound includes ingest, normalization, and
 interpretation across seven windows; this crate's timings alone do not verify it.

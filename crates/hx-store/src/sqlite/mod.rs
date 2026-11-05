@@ -1,13 +1,13 @@
-//! SQLite foundation, unused by the Postgres store until the separate port.
+//! SQLite core and the only entry point for write transactions.
 //!
 //! Only `create` initializes a state directory. `open` refuses missing or
 //! unmigrated cores; it never silently creates a new history.
 use anyhow::{Context, Result, ensure};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Sqlite, SqliteConnection, SqlitePool, sqlite::SqliteArguments};
+use sqlx::{Connection, Sqlite, SqliteConnection, SqlitePool, sqlite::SqliteArguments};
 use std::{
     ops::{Deref, DerefMut},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -19,11 +19,22 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations-sqlite")
 #[derive(Clone)]
 pub struct Store {
     pub pool: SqlitePool,
+    pub data_dir: PathBuf,
+    #[cfg(test)]
+    pub(crate) gc_boundary: Option<std::sync::Arc<crate::concurrency_tests::GcBoundary>>,
 }
 
 impl Store {
-    /// Create a new core, refusing to overwrite an existing one. The CLI's
-    /// separate agent outbox initialization belongs to the cutover, not here.
+    pub fn new(pool: SqlitePool, data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            pool,
+            data_dir: data_dir.into(),
+            #[cfg(test)]
+            gc_boundary: None,
+        }
+    }
+
+    /// Create a new core and an empty agent database, refusing an existing core.
     ///
     /// The core is built aside and published last, so a failed or interrupted
     /// create leaves nothing that a retry or `open` would have to refuse.
@@ -49,6 +60,26 @@ impl Store {
         store.pool.close().await;
         tokio::fs::create_dir_all(state_dir.join("blobs")).await?;
         tokio::fs::create_dir_all(state_dir.join("locks")).await?;
+        // Initialize an empty outbox if absent. A failed create can leave this
+        // empty sibling behind; retries preserve it and still publish core last.
+        let agent = state_dir.join("agent.sqlite");
+        if !tokio::fs::try_exists(&agent).await? {
+            let building_agent = aside.path().join("agent.sqlite");
+            let mut conn = sqlx::SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&building_agent)
+                    .create_if_missing(true),
+            )
+            .await?;
+            sqlx::query("VACUUM").execute(&mut conn).await?;
+            conn.close().await?;
+            std::fs::File::open(&building_agent)?.sync_all()?;
+            match tokio::fs::hard_link(&building_agent, &agent).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         // Unlike rename, a hard link cannot replace a core created meanwhile.
         tokio::fs::hard_link(&building, &path)
             .await
@@ -95,6 +126,9 @@ impl Store {
         #[cfg(target_os = "macos")]
         let options = options.pragma("fullfsync", "ON");
         Ok(Self {
+            data_dir: path.parent().context("core parent")?.to_owned(),
+            #[cfg(test)]
+            gc_boundary: None,
             pool: SqlitePoolOptions::new()
                 .max_connections(8)
                 .connect_with(options)

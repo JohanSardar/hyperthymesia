@@ -495,22 +495,12 @@ async fn normalization_errors_quarantine_only_pending_events() {
 #[tokio::test]
 async fn claim_observes_jobs_that_become_due_while_waiting_for_the_gate() {
     let f = Fixture::new().await;
-    let gate = f.store.hold_claim_gate().await.unwrap();
+    let mut gate = f.store.hold_claim_gate().await.unwrap();
     let pool = f.store.clone();
     let worker = tokio::spawn(async move { hx_jobs::claim(&pool, 120).await });
-    let mut waiting = false;
-    for _ in 0..100 {
-        waiting = f.store.claim_is_waiting().await.unwrap();
-        if waiting {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(
-        waiting,
-        "claim must have begun its transaction before the job becomes due"
-    );
-    f.store.enqueue_due_probe().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!worker.is_finished(), "claim must wait for the writer gate");
+    gate.enqueue_due_probe().await.unwrap();
     gate.release().await.unwrap();
     assert!(worker.await.unwrap().unwrap().is_some());
     f.close().await;

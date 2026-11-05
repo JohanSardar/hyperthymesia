@@ -7,8 +7,7 @@ async fn main() -> anyhow::Result<()> {
         start: a[1].parse()?,
         end: a[2].parse()?,
     };
-    let scratch = tempfile::tempdir()?;
-    let store = hx_store::Store::connect(&std::env::var("DATABASE_URL")?, scratch.path()).await?;
+    let store = hx_store::Store::open(std::env::var("HX_STATE_DIR")?).await?;
     let broker = hx_server::mcp::Broker::new(
         store,
         hx_server::disclosure::DisclosurePolicy::from_env()?,
