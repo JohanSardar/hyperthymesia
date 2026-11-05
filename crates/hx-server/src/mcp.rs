@@ -6,7 +6,6 @@ use hx_interpret::EvidenceItem;
 use hx_schema::{Envelope, Interval, Sensitivity};
 use hx_store::Store;
 use serde_json::{Value, json};
-use sqlx::Row;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::{Mutex, watch};
 
@@ -109,8 +108,13 @@ impl Broker {
             .max(config.visual_change_s);
         // Fetch all revisions of candidate identities as well: an edit or
         // tombstone outside this window can supersede a record inside it.
-        let rows = sqlx::query("WITH candidates AS (SELECT connector_instance,source_key FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1) SELECT e.id,e.received_at,e.envelope FROM events e JOIN (SELECT DISTINCT connector_instance,source_key FROM candidates) c USING (connector_instance,source_key) ORDER BY e.source_start,e.id")
-            .bind(self.window.start - Duration::seconds(i64::from(lookback))).bind(self.window.end).fetch_all(&self.store.pool).await?;
+        let rows = self
+            .store
+            .digest_records(
+                self.window.start - Duration::seconds(i64::from(lookback)),
+                self.window.end,
+            )
+            .await?;
         let mut capture = vec![];
         let mut visible = vec![];
         let mut screens = vec![];
@@ -120,9 +124,9 @@ impl Broker {
             .into_iter()
             .map(|row| {
                 Ok(hx_compile::Observation {
-                    id: row.get("id"),
-                    received_at: row.get("received_at"),
-                    envelope: serde_json::from_value(row.get("envelope"))?,
+                    id: row.id,
+                    received_at: row.received_at,
+                    envelope: serde_json::from_value(row.envelope)?,
                 })
             })
             .collect::<Result<_>>()?;
@@ -224,8 +228,7 @@ impl Broker {
             && !matches!(e.kind.as_str(), "policy.gap" | "media.chunk")
     }
     pub async fn allowed_id(&self, id: i64) -> Result<bool> {
-        let source: Option<Value> = sqlx::query_scalar("SELECT envelope FROM events WHERE id=$1 UNION ALL SELECT e.envelope FROM ocr_evidence d JOIN events e ON e.id=d.source_event_id WHERE d.id=$1")
-            .bind(id).fetch_optional(&self.store.pool).await?;
+        let source: Option<Value> = self.store.source_envelope(id).await?;
         Ok(source
             .and_then(|v| serde_json::from_value::<Envelope>(v).ok())
             .is_some_and(|e| self.visible(&e)))
@@ -276,13 +279,18 @@ impl Broker {
             .max(config.input_gap_s)
             .max(config.health_max_s)
             .max(config.visual_change_s);
-        let rows = sqlx::query("SELECT id,received_at,envelope FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 ORDER BY source_start,id LIMIT 2001")
-            .bind(range.start - Duration::seconds(i64::from(lookback))).bind(range.end).fetch_all(&self.store.pool).await?;
+        let rows = self
+            .store
+            .attention_records(
+                range.start - Duration::seconds(i64::from(lookback)),
+                range.end,
+            )
+            .await?;
         let incomplete = rows.len() > 2000;
         let mut observations = Vec::new();
         let mut permitted = BTreeMap::new();
         for row in rows {
-            let e: Envelope = serde_json::from_value(row.get("envelope"))?;
+            let e: Envelope = serde_json::from_value(row.envelope)?;
             if !matches!(
                 e.kind.as_str(),
                 "collector.health"
@@ -296,7 +304,7 @@ impl Broker {
             ) {
                 continue;
             }
-            let id = row.get("id");
+            let id = row.id;
             let class = self.policy.effective_class(&e);
             if class != Sensitivity::Restricted
                 && !(class == Sensitivity::Sensitive && self.sensitive == SensitiveEgress::Redact)
@@ -313,7 +321,7 @@ impl Broker {
             }
             observations.push(hx_compile::Observation {
                 id,
-                received_at: row.get("received_at"),
+                received_at: row.received_at,
                 envelope: e,
             });
         }
@@ -343,21 +351,23 @@ impl Broker {
         range: Interval,
     ) -> Result<(Vec<hx_compile::Observation>, Vec<EvidenceItem>)> {
         // Bound the database work as well as the response. Narrow the range to explore dense data.
-        let rows = sqlx::query("SELECT id,received_at,envelope FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1 ORDER BY source_start,id LIMIT 2000")
-            .bind(range.start).bind(range.end).fetch_all(&self.store.pool).await?;
+        let rows = self
+            .store
+            .exploration_records(range.start, range.end)
+            .await?;
         let mut observations = vec![];
         let mut evidence = vec![];
         for row in rows {
-            let e: Envelope = serde_json::from_value(row.get("envelope"))?;
+            let e: Envelope = serde_json::from_value(row.envelope)?;
             if !self.visible(&e) {
                 continue;
             }
-            let id = row.get("id");
+            let id = row.id;
             evidence.extend(self.project(id, &e).await?);
             if e.kind.as_str() != "media.still" {
                 observations.push(hx_compile::Observation {
                     id,
-                    received_at: row.get("received_at"),
+                    received_at: row.received_at,
                     envelope: e,
                 });
             }
@@ -366,19 +376,14 @@ impl Broker {
     }
     /// Observations for exactly these evidence ids, without the exploration row cap.
     pub async fn observations(&self, ids: &[i64]) -> Result<Vec<hx_compile::Observation>> {
-        let rows = sqlx::query(
-            "SELECT id,received_at,envelope FROM events WHERE id = ANY($1) ORDER BY source_start,id",
-        )
-        .bind(ids)
-        .fetch_all(&self.store.pool)
-        .await?;
+        let rows = self.store.records_by_ids(ids).await?;
         let mut observations = vec![];
         for row in rows {
-            let e: Envelope = serde_json::from_value(row.get("envelope"))?;
+            let e: Envelope = serde_json::from_value(row.envelope)?;
             if self.visible(&e) && e.kind.as_str() != "media.still" {
                 observations.push(hx_compile::Observation {
-                    id: row.get("id"),
-                    received_at: row.get("received_at"),
+                    id: row.id,
+                    received_at: row.received_at,
                     envelope: e,
                 });
             }
@@ -403,30 +408,22 @@ impl Broker {
         Ok(Interval { start, end })
     }
     pub async fn prior_context(&self, before: DateTime<Utc>) -> Result<Value> {
-        let rows = sqlx::query(
-            "SELECT entity,assertion,evidence FROM entity_assertions ORDER BY id DESC LIMIT 100",
-        )
-        .fetch_all(&self.store.pool)
-        .await?;
+        let rows = self.store.recent_entity_assertions().await?;
         let mut entities = vec![];
         for row in rows {
-            let ids: Vec<i64> = row.get("evidence");
+            let ids: Vec<i64> = row.evidence;
             // Producer labels (including the assertion's cached label) are never authority.
             if self.allowed_ids(&ids).await? {
-                let latest: Option<DateTime<Utc>> =
-                    sqlx::query_scalar("SELECT max(source_start) FROM events WHERE id=ANY($1)")
-                        .bind(&ids)
-                        .fetch_one(&self.store.pool)
-                        .await?;
+                let latest: Option<DateTime<Utc>> = self.store.latest_source_start(&ids).await?;
                 if latest.is_some_and(|at| at < before) {
-                    entities.push(json!({"entity":row.get::<String,_>("entity"),"assertion":row.get::<Value,_>("assertion"),"evidence":ids,"self_generated":true}));
+                    entities.push(json!({"entity":row.entity,"assertion":row.assertion,"evidence":ids,"self_generated":true}));
                 }
             }
         }
-        let rows = sqlx::query("SELECT r.id,r.interpretation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 AND w.end_at>$1-interval '16 hours' ORDER BY w.end_at DESC LIMIT 4").bind(before).fetch_all(&self.store.pool).await?;
+        let rows = self.store.prior_revisions(before).await?;
         let mut revisions = vec![];
         for row in rows {
-            let value: Value = row.get("interpretation");
+            let value: Value = row.interpretation;
             // Prose cannot be selectively redacted. Fail closed for legacy/changed policies.
             if value["input_manifest"]["disclosure_policy"]["digest"] != self.policy.digest()
                 || value["input_manifest"]["sensitive_egress"] != json!(self.sensitive)
@@ -435,7 +432,7 @@ impl Broker {
             }
             let ids = revision_evidence(&value);
             if self.allowed_ids(&ids).await? {
-                revisions.push(json!({"revision_id":row.get::<i64,_>("id"),"episodes":value["episodes"],"tasks":value["tasks"],"summary":value["summary"],"evidence":ids,"self_generated":true}));
+                revisions.push(json!({"revision_id":row.id,"episodes":value["episodes"],"tasks":value["tasks"],"summary":value["summary"],"evidence":ids,"self_generated":true}));
             }
         }
         Ok(json!({"entities":entities,"revisions":revisions}))
@@ -477,8 +474,7 @@ impl Broker {
         let mut ids = std::collections::BTreeSet::new();
         collect_provenance(&result, &mut ids);
         for id in ids {
-            let namespace: Option<String> = sqlx::query_scalar("SELECT connector_instance FROM events WHERE id=$1 UNION ALL SELECT e.connector_instance FROM ocr_evidence d JOIN events e ON e.id=d.source_event_id WHERE d.id=$1")
-                .bind(id).fetch_optional(&self.store.pool).await?;
+            let namespace: Option<String> = self.store.source_namespace(id).await?;
             if let Some(namespace) = namespace {
                 audit.input_namespaces.insert(namespace);
             }
@@ -547,11 +543,11 @@ impl Broker {
                 Ok(json!({"evidence":items,"maximum_distance_seconds":30}))
             }
             "list_sources" => {
-                let rows = sqlx::query("SELECT DISTINCT ON(connector_instance,kind) id,envelope FROM events ORDER BY connector_instance,kind,source_start DESC LIMIT 2000").fetch_all(&self.store.pool).await?;
+                let rows = self.store.recent_source_records().await?;
                 let mut items = vec![];
                 for row in rows {
-                    let e = serde_json::from_value(row.get("envelope"))?;
-                    items.extend(self.project(row.get("id"), &e).await?);
+                    let e = serde_json::from_value(row.envelope)?;
+                    items.extend(self.project(row.id, &e).await?);
                     if items.len() >= 32 {
                         break;
                     }

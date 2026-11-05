@@ -13,14 +13,14 @@ async fn exhaust_slot(store: &Store, key: &str) {
     let mut failures = 0;
     while failures < 5 {
         store.make_jobs_due("ready", None).await.unwrap();
-        let j = hx_jobs::claim(&store.pool, 120).await.unwrap().unwrap();
+        let j = hx_jobs::claim(store, 120).await.unwrap().unwrap();
         let target = store
             .job_states()
             .await
             .unwrap()
             .iter()
             .any(|s| s.id == j.id && s.output_key == key);
-        hx_jobs::finish(&store.pool, &j, target.then_some("synthetic failure"))
+        hx_jobs::finish(store, &j, target.then_some("synthetic failure"))
             .await
             .unwrap();
         if target {
@@ -88,12 +88,12 @@ async fn assert_revival_cap(kind: &str) {
     assert_eq!(reset.revivals, 0, "free compile work resets revivals");
     for _ in 0..8 {
         f.store.make_jobs_due("ready", None).await.unwrap();
-        let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+        let j = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
         if j.kind != kind {
-            hx_jobs::finish(&f.store.pool, &j, None).await.unwrap();
+            hx_jobs::finish(&f.store, &j, None).await.unwrap();
             continue;
         }
-        hx_jobs::defer(&f.store.pool, &j, &hx_jobs::Deferred::ProviderBusy)
+        hx_jobs::defer(&f.store, &j, &hx_jobs::Deferred::ProviderBusy)
             .await
             .unwrap();
         let state = f
@@ -148,15 +148,15 @@ async fn workers_serialize_jobs_for_the_same_window() {
     ingest(&f.store, vec![event("synthetic-input", 8)]).await;
     f.store.normalize_window(w).await.unwrap();
     // Complete the ingest-created normalization slot before testing other jobs.
-    let n = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
-    hx_jobs::finish(&f.store.pool, &n, None).await.unwrap();
+    let n = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
+    hx_jobs::finish(&f.store, &n, None).await.unwrap();
     let g = f.store.generation(w).await.unwrap();
     f.store.request_work("compile", w, g).await.unwrap();
     let runner = hx_server::processing::Runner {
         store: f.store.clone(),
         provider: hx_server::processing::StubProvider,
     };
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert!(hx_jobs::run_one(&f.store, &runner).await.unwrap());
     // Explicit synthetic slots isolate claim fencing from automatic age admission.
     for revision24 in [false, true] {
         f.store
@@ -169,15 +169,12 @@ async fn workers_serialize_jobs_for_the_same_window() {
         .make_jobs_due("ready", Some("interpret"))
         .await
         .unwrap();
-    let (a, b) = tokio::join!(
-        hx_jobs::claim(&f.store.pool, 120),
-        hx_jobs::claim(&f.store.pool, 120)
-    );
+    let (a, b) = tokio::join!(hx_jobs::claim(&f.store, 120), hx_jobs::claim(&f.store, 120));
     let claimed: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
     assert_eq!(claimed.len(), 1);
     let first = &claimed[0];
     assert_eq!(first.kind, "interpret");
-    assert!(hx_jobs::claim(&f.store.pool, 120).await.unwrap().is_none());
+    assert!(hx_jobs::claim(&f.store, 120).await.unwrap().is_none());
     // A different window can still run while this window's lease is live.
     let other = hx_store::window_at(w.end);
     let generation = f.store.generation(other).await.unwrap();
@@ -185,15 +182,11 @@ async fn workers_serialize_jobs_for_the_same_window() {
         .request_work("compile", other, generation)
         .await
         .unwrap();
-    let parallel = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    let parallel = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
     assert_eq!(parallel.payload["window"], json!(other));
-    assert!(
-        hx_jobs::finish(&f.store.pool, &parallel, None)
-            .await
-            .unwrap()
-    );
-    assert!(hx_jobs::finish(&f.store.pool, first, None).await.unwrap());
-    let next = hx_jobs::claim(&f.store.pool, 120).await.unwrap();
+    assert!(hx_jobs::finish(&f.store, &parallel, None).await.unwrap());
+    assert!(hx_jobs::finish(&f.store, first, None).await.unwrap());
+    let next = hx_jobs::claim(&f.store, 120).await.unwrap();
     let debug = f.store.job_states().await.unwrap();
     assert!(next.is_some(), "{debug:?}");
     f.close().await;
@@ -225,15 +218,11 @@ async fn windows_controls_stale_defer_and_restart_fencing() {
     let canonical: Option<i64> = f.store.window_state(w).await.unwrap().canonical_revision;
     assert_eq!(canonical, Some(new));
     f.store.request_work("compile", w, g + 1).await.unwrap();
-    let first = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    let first = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
     assert!(
-        hx_jobs::defer(
-            &f.store.pool,
-            &first,
-            &hx_jobs::Deferred::NormalizationPending
-        )
-        .await
-        .unwrap()
+        hx_jobs::defer(&f.store, &first, &hx_jobs::Deferred::NormalizationPending)
+            .await
+            .unwrap()
     );
     let r = f
         .store
@@ -246,16 +235,16 @@ async fn windows_controls_stale_defer_and_restart_fencing() {
     assert_eq!(r.state, "ready");
     assert_eq!(r.attempts, 0);
     f.store.make_jobs_due("ready", None).await.unwrap();
-    let old = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    let old = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
     f.store.request_work("compile", w, g + 2).await.unwrap();
-    assert!(hx_jobs::heartbeat(&f.store.pool, &old, 120).await.unwrap());
+    assert!(hx_jobs::heartbeat(&f.store, &old, 120).await.unwrap());
     f.store.expire_lease(old.id, Some(1)).await.unwrap();
-    let fresh = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    let fresh = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
     assert_eq!(fresh.id, old.id);
     assert_ne!(fresh.owner, old.owner);
     assert_eq!(fresh.attempts, 1);
-    assert!(!hx_jobs::finish(&f.store.pool, &old, None).await.unwrap());
-    assert!(hx_jobs::finish(&f.store.pool, &fresh, None).await.unwrap());
+    assert!(!hx_jobs::finish(&f.store, &old, None).await.unwrap());
+    assert!(hx_jobs::finish(&f.store, &fresh, None).await.unwrap());
     f.close().await;
 }
 
@@ -371,12 +360,12 @@ async fn five_crashes_quarantine_pending_normalization() {
     let f = Fixture::new().await;
     ingest(&f.store, vec![event("pending", 0)]).await;
     for _ in 0..5 {
-        let job = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+        let job = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
         assert_eq!(job.kind, "normalize");
         // Crash after claim: no handler writes, lease expires. Synthetic time advance.
         f.store.expire_lease(job.id, None).await.unwrap();
     }
-    let _ = hx_jobs::claim(&f.store.pool, 120).await.unwrap();
+    let _ = hx_jobs::claim(&f.store, 120).await.unwrap();
     hx_server::processing::schedule(&f.store).await.unwrap();
     let state = f
         .store
@@ -482,10 +471,10 @@ async fn normalization_errors_quarantine_only_pending_events() {
         .unwrap();
     ingest(&f.store, vec![event("crashing", 0)]).await;
     for _ in 0..5 {
-        let job = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+        let job = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
         assert_eq!(job.kind, "normalize");
         assert!(
-            hx_jobs::finish(&f.store.pool, &job, Some("synthetic normalization failure"))
+            hx_jobs::finish(&f.store, &job, Some("synthetic normalization failure"))
                 .await
                 .unwrap()
         );
@@ -507,7 +496,7 @@ async fn normalization_errors_quarantine_only_pending_events() {
 async fn claim_observes_jobs_that_become_due_while_waiting_for_the_gate() {
     let f = Fixture::new().await;
     let gate = f.store.hold_claim_gate().await.unwrap();
-    let pool = f.store.pool.clone();
+    let pool = f.store.clone();
     let worker = tokio::spawn(async move { hx_jobs::claim(&pool, 120).await });
     let mut waiting = false;
     for _ in 0..100 {
@@ -562,7 +551,7 @@ async fn empty_windows_finish_without_provider_and_reopen_on_data() {
     };
     let g = f.store.generation(w).await.unwrap();
     f.store.request_work("compile", w, g).await.unwrap();
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert!(hx_jobs::run_one(&f.store, &runner).await.unwrap());
     assert!(
         !hx_server::processing::interpret_window(&f.store, w, &Fails)
             .await
@@ -782,7 +771,7 @@ impl hx_interpret::Provider for Counts {
 async fn drain(store: &Store, runner: &hx_server::processing::Runner<Counts>) {
     store.settle_inputs().await.unwrap();
     for _ in 0..30 {
-        if !hx_jobs::run_one(&store.pool, runner).await.unwrap() {
+        if !hx_jobs::run_one(store, runner).await.unwrap() {
             return;
         }
     }
@@ -1069,7 +1058,7 @@ async fn review_revision24_waits_for_upload_backlog_to_settle() {
     for batch in 0..3 {
         ingest(&f.store, vec![at(&format!("backlog-{batch}"))]).await;
         for _ in 0..10 {
-            if !hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
+            if !hx_jobs::run_one(&f.store, &runner).await.unwrap() {
                 break;
             }
         }
@@ -1218,8 +1207,8 @@ async fn stale_sweep_window(store: &Store, hour: u32) -> Interval {
         .await
         .unwrap();
     // Retire upload-created jobs so the next claim isolates the sweep.
-    while let Some(j) = hx_jobs::claim(&store.pool, 120).await.unwrap() {
-        hx_jobs::finish(&store.pool, &j, None).await.unwrap();
+    while let Some(j) = hx_jobs::claim(store, 120).await.unwrap() {
+        hx_jobs::finish(store, &j, None).await.unwrap();
     }
     store.settle_inputs().await.unwrap();
     w
@@ -1248,16 +1237,16 @@ async fn review_failed_sweep_does_not_hold_future_days() {
         store: f.store.clone(),
         provider: CountsFail(std::sync::atomic::AtomicUsize::new(0)),
     };
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.is_err());
+    assert!(hx_jobs::run_one(&f.store, &runner).await.is_err());
     f.store.make_jobs_due("ready", None).await.unwrap();
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert!(hx_jobs::run_one(&f.store, &runner).await.unwrap());
     assert_eq!(
         runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "retrying queue bookkeeping must not retry a paid sweep attempt"
     );
     f.store.make_jobs_due("failed", None).await.unwrap();
-    hx_jobs::revive_window_jobs(&f.store.pool).await.unwrap();
+    hx_jobs::revive_window_jobs(&f.store).await.unwrap();
     f.store
         .schedule_daily_sweep(now + chrono::Duration::days(1))
         .await
@@ -1339,7 +1328,7 @@ async fn review_sweep_rescues_newest_exhausted_window_without_a_revision() {
             exhaust_slot(&f.store, &format!("interpret:{}", w.start)).await;
             if revival < 3 {
                 f.store.make_jobs_due("failed", None).await.unwrap();
-                hx_jobs::revive_window_jobs(&f.store.pool).await.unwrap();
+                hx_jobs::revive_window_jobs(&f.store).await.unwrap();
             }
         }
     }
@@ -1360,7 +1349,7 @@ async fn review_sweep_rescues_newest_exhausted_window_without_a_revision() {
         store: f.store.clone(),
         provider: Counts::default(),
     };
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert!(hx_jobs::run_one(&f.store, &runner).await.unwrap());
     assert_eq!(
         runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
         1
@@ -1442,7 +1431,7 @@ async fn review_deferred_sweep_releases_its_unspent_start_but_not_future_days() 
             store: f.store.clone(),
             provider: Counts::default(),
         };
-        assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+        assert!(hx_jobs::run_one(&f.store, &runner).await.unwrap());
         assert_eq!(
             runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
             0
@@ -1469,7 +1458,7 @@ async fn review_deferred_sweep_releases_its_unspent_start_but_not_future_days() 
             f.store.expire_sweep_day().await.unwrap();
         }
         f.store.make_jobs_due("ready", None).await.unwrap();
-        assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+        assert!(hx_jobs::run_one(&f.store, &runner).await.unwrap());
         assert_eq!(
             runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
             usize::from(retry_today)
@@ -1522,13 +1511,10 @@ async fn cap_upgrade_never_interpreted_backlog_uses_only_the_sweep() {
             f.store.request_interpretation(w, g, false).await.unwrap();
             // A pre-upgrade failure has no recorded revival history. Leave the
             // compile backlog intact so all three windows can try to buy runs.
-            sqlx::query(
-                "UPDATE jobs SET state='failed',attempts=5,available_at=now() WHERE output_key=$1",
-            )
-            .bind(format!("interpret:{}", w.start))
-            .execute(&f.store.pool)
-            .await
-            .unwrap();
+            f.store
+                .fail_legacy_job(format!("interpret:{}", w.start))
+                .await
+                .unwrap();
         }
     }
     f.store.migrate().await.unwrap();
@@ -1580,13 +1566,13 @@ async fn cap_generation_changes_preserve_paid_attempts_and_revivals() {
         .request_interpretation(live, g, false)
         .await
         .unwrap();
-    let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    let j = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
     f.store.change_input(live).await.unwrap();
     f.store
         .request_interpretation(live, g + 1, false)
         .await
         .unwrap();
-    hx_jobs::finish(&f.store.pool, &j, Some("synthetic failure"))
+    hx_jobs::finish(&f.store, &j, Some("synthetic failure"))
         .await
         .unwrap();
     assert_eq!(
@@ -1594,21 +1580,19 @@ async fn cap_generation_changes_preserve_paid_attempts_and_revivals() {
         1,
         "finishing an older lease cannot refund paid attempts on a generation bump"
     );
-    let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    let j = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
     f.store.change_input(live).await.unwrap();
     f.store
         .request_interpretation(live, g + 2, false)
         .await
         .unwrap();
     f.store.expire_lease(j.id, None).await.unwrap();
-    let recovered = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    let recovered = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
     assert_eq!(
         recovered.attempts, 3,
         "crash recovery cannot refill the paid budget"
     );
-    hx_jobs::finish(&f.store.pool, &recovered, None)
-        .await
-        .unwrap();
+    hx_jobs::finish(&f.store, &recovered, None).await.unwrap();
     f.store.change_input(live).await.unwrap();
     f.store
         .request_interpretation(live, g + 3, false)
@@ -1639,7 +1623,7 @@ async fn cap_generation_changes_preserve_paid_attempts_and_revivals() {
             exhaust_slot(&f.store, &key).await;
             if revival < 3 {
                 f.store.make_jobs_due("failed", None).await.unwrap();
-                hx_jobs::revive_window_jobs(&f.store.pool).await.unwrap();
+                hx_jobs::revive_window_jobs(&f.store).await.unwrap();
             }
         }
     }
@@ -1683,18 +1667,14 @@ async fn cap_generation_changes_preserve_paid_attempts_and_revivals() {
 async fn cap_exhausted_24h_pass_reaches_the_sweep() {
     let f = Fixture::new().await;
     let w = stale_sweep_window(&f.store, 8).await;
-    sqlx::query("UPDATE windows SET revision24_finished=false WHERE start_at=$1")
-        .bind(w.start)
-        .execute(&f.store.pool)
-        .await
-        .unwrap();
+    f.store.reset_revision24(w.start).await.unwrap();
     let g = f.store.generation(w).await.unwrap();
     f.store.request_interpretation(w, g, true).await.unwrap();
     for revival in 0..=3 {
         exhaust_slot(&f.store, &format!("revision24:{}", w.start)).await;
         if revival < 3 {
             f.store.make_jobs_due("failed", None).await.unwrap();
-            hx_jobs::revive_window_jobs(&f.store.pool).await.unwrap();
+            hx_jobs::revive_window_jobs(&f.store).await.unwrap();
         }
     }
     f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
@@ -1731,8 +1711,8 @@ async fn cap_failed_or_deferred_sweep_retries_after_seven_days() {
         let now = Utc::now();
         f.store.schedule_daily_sweep(now).await.unwrap();
         if deferred {
-            let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
-            hx_jobs::defer(&f.store.pool, &j, &hx_jobs::Deferred::RateLimited)
+            let j = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
+            hx_jobs::defer(&f.store, &j, &hx_jobs::Deferred::RateLimited)
                 .await
                 .unwrap();
             f.store.expire_sweep_day().await.unwrap();
@@ -1741,7 +1721,7 @@ async fn cap_failed_or_deferred_sweep_retries_after_seven_days() {
                 store: f.store.clone(),
                 provider: Counts::default(),
             };
-            assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+            assert!(hx_jobs::run_one(&f.store, &runner).await.unwrap());
             assert_eq!(
                 runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
                 0
@@ -1751,9 +1731,9 @@ async fn cap_failed_or_deferred_sweep_retries_after_seven_days() {
                 store: f.store.clone(),
                 provider: CountsFail(std::sync::atomic::AtomicUsize::new(0)),
             };
-            assert!(hx_jobs::run_one(&f.store.pool, &runner).await.is_err());
+            assert!(hx_jobs::run_one(&f.store, &runner).await.is_err());
             f.store.make_jobs_due("ready", None).await.unwrap();
-            assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+            assert!(hx_jobs::run_one(&f.store, &runner).await.unwrap());
         }
         let day = f.store.sweep_reservations().await.unwrap()[0].0;
         let boundary = day.and_hms_opt(0, 0, 0).unwrap().and_utc();
@@ -1772,8 +1752,8 @@ async fn cap_failed_or_deferred_sweep_retries_after_seven_days() {
         );
         assert_eq!(reservations[1].1, w.start);
         // Changed input bypasses the cooldown, but still cannot reserve twice in a day.
-        let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
-        hx_jobs::finish(&f.store.pool, &j, None).await.unwrap();
+        let j = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
+        hx_jobs::finish(&f.store, &j, None).await.unwrap();
         f.store.change_input(w).await.unwrap();
         hx_server::processing::compile_window(&f.store, w)
             .await
@@ -1852,7 +1832,7 @@ async fn cap_sweep_leaves_healthy_ready_and_running_jobs_alone() {
         let g = f.store.generation(w).await.unwrap();
         f.store.request_interpretation(w, g, true).await.unwrap();
         let claimed = if running {
-            hx_jobs::claim(&f.store.pool, 120).await.unwrap()
+            hx_jobs::claim(&f.store, 120).await.unwrap()
         } else {
             None
         };
@@ -1867,7 +1847,7 @@ async fn cap_sweep_leaves_healthy_ready_and_running_jobs_alone() {
         let after = f.store.job_states().await.unwrap();
         assert_eq!(format!("{before:?}"), format!("{after:?}"));
         if let Some(j) = claimed {
-            hx_jobs::finish(&f.store.pool, &j, None).await.unwrap();
+            hx_jobs::finish(&f.store, &j, None).await.unwrap();
         }
         f.close().await;
     }
@@ -1997,10 +1977,7 @@ async fn close_sweep_requires_a_changed_recorded_timeline_hash() {
         hx_server::processing::compile_window(&f.store, w)
             .await
             .unwrap();
-        sqlx::query("UPDATE jobs SET state='done'")
-            .execute(&f.store.pool)
-            .await
-            .unwrap();
+        f.store.finish_all_jobs().await.unwrap();
         f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
         assert!(
             f.store.sweep_reservations().await.unwrap().is_empty(),
@@ -2011,10 +1988,7 @@ async fn close_sweep_requires_a_changed_recorded_timeline_hash() {
         hx_server::processing::compile_window(&f.store, w)
             .await
             .unwrap();
-        sqlx::query("UPDATE jobs SET state='done'")
-            .execute(&f.store.pool)
-            .await
-            .unwrap();
+        f.store.finish_all_jobs().await.unwrap();
         f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
         assert_eq!(
             f.store.sweep_reservations().await.unwrap().len(),

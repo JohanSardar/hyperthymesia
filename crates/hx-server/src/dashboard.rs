@@ -173,11 +173,7 @@ fn coalesced(spans: &[hx_compile::LaneInterval]) -> Vec<hx_compile::LaneInterval
 
 /// The owner's current UTC offset, from the newest capture that recorded one.
 async fn owner_zone(store: &Store) -> ApiResult<chrono::FixedOffset> {
-    let minutes: Option<i32> = sqlx::query_scalar(
-        "SELECT (envelope->'time'->>'utc_offset_min')::int FROM events WHERE envelope->'time'->>'utc_offset_min' IS NOT NULL ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_optional(&store.pool)
-    .await?;
+    let minutes: Option<i32> = store.owner_utc_offset().await?;
     let utc = chrono::FixedOffset::east_opt(0).expect("zero offset");
     Ok(chrono::FixedOffset::east_opt(minutes.unwrap_or(0) * 60).unwrap_or(utc))
 }
@@ -340,12 +336,13 @@ async fn authorized_run(
     headers: &HeaderMap,
     revision: i64,
 ) -> ApiResult<serde_json::Value> {
-    use sqlx::Row;
     let token = auth(store, headers, "read_raw").await?;
-    let row = sqlx::query("SELECT agent_run,input_namespaces,interpretation FROM revisions WHERE id=$1 AND agent_run IS NOT NULL")
-        .bind(revision).fetch_optional(&store.pool).await?.ok_or(crate::ApiError(axum::http::StatusCode::NOT_FOUND,"run not found".into()))?;
-    let namespaces: Vec<String> = row.get("input_namespaces");
-    let interpretation: serde_json::Value = row.get("interpretation");
+    let row = store.revision_run(revision).await?.ok_or(crate::ApiError(
+        axum::http::StatusCode::NOT_FOUND,
+        "run not found".into(),
+    ))?;
+    let namespaces: Vec<String> = row.input_namespaces;
+    let interpretation: serde_json::Value = row.interpretation;
     let broker = crate::mcp::Broker::new(
         store.clone(),
         crate::disclosure::DisclosurePolicy::from_env()?,
@@ -362,7 +359,7 @@ async fn authorized_run(
             "run unavailable under current policy".into(),
         ));
     }
-    let value: serde_json::Value = row.get("agent_run");
+    let value: serde_json::Value = row.agent_run;
     for id in value["evidence"]
         .as_object()
         .into_iter()
