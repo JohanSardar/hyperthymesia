@@ -166,10 +166,10 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
                 return false;
             }
             // A source describing somebody's action is testimony, even when the
-            // citation is independent. Each claimed interval needs a direct
+            // citation is independent. Some claimed interval needs a direct
             // observation in that time; other-time citations remain context.
             if claim.basis == Basis::Observed
-                && !episode.intervals.iter().all(|interval| {
+                && !episode.intervals.iter().any(|interval| {
                     claim.evidence.iter().any(|id| {
                         independent(id)
                             && in_time(id, interval)
@@ -184,7 +184,7 @@ pub fn check_and_repair(value: &mut Interpretation, packet: &Packet) -> Vec<Chec
                 );
             }
             if claim.outcome == "completed"
-                && !episode.intervals.iter().all(|interval| {
+                && !episode.intervals.iter().any(|interval| {
                     claim.outcome_evidence.iter().any(|id| {
                         independent(id)
                             && in_time(id, interval)

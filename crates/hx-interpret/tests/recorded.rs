@@ -951,3 +951,48 @@ fn other_time_citations_are_context_not_claim_or_outcome_proof() {
         );
     }
 }
+
+#[test]
+fn proof_in_one_interval_is_enough_for_an_episode_split_across_time() {
+    let morning = Interval {
+        start: window().start + chrono::Duration::minutes(3),
+        end: window().start + chrono::Duration::minutes(6),
+    };
+    let afternoon = Interval {
+        start: window().start + chrono::Duration::minutes(60),
+        end: window().start + chrono::Duration::minutes(63),
+    };
+    let mut packet = packet("success");
+    packet.evidence[0].at = morning.start;
+    packet.evidence[0].kind = "normal:focus.span".into();
+    packet.evidence[0].text = json!({"connector_instance":"macos-agent:synthetic"}).to_string();
+    packet.evidence.push(
+        EvidenceItem::classified(
+            2,
+            afternoon.start,
+            "shell.command",
+            &json!({"subject":"Ada","payload":{"command":"cargo test","exit_code":0}}).to_string(),
+            Sensitivity::Normal,
+            false,
+        )
+        .unwrap(),
+    );
+    packet.timeline_text = format!(
+        "time_support={}\ntime_support_by_evidence={}\n",
+        json!([morning, afternoon]),
+        json!({"1":[morning,afternoon],"2":[afternoon]})
+    );
+    let mut output = response("success");
+    output["episodes"][0]["intervals"] = json!([morning, afternoon]);
+    output["tasks"][0]["intervals"] = json!([morning, afternoon]);
+    output["episodes"][0]["evidence"] = json!([1, 2]);
+    output["episodes"][0]["claims"] = json!([
+        {"actor":"Ada","action":"run","object":"cargo test","outcome":"completed","basis":"observed","evidence":[1,2],"outcome_evidence":[2]}
+    ]);
+    let mut result =
+        parse_output(&packet, &output.to_string(), "synthetic", PROMPT_VERSION).unwrap();
+    let failures = check_and_repair(&mut result, &packet);
+    let claim = &result.episodes[0].claims[0];
+    assert_eq!(claim.basis, Basis::Observed, "{failures:?}");
+    assert_eq!(claim.outcome, "completed", "{failures:?}");
+}
