@@ -25,6 +25,22 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 <key>NSInputMonitoringUsageDescription</key><string>Measure input activity without recording key identities.</string>
 </dict></plist>
 PLIST
+# SMAppService supervises certificate-signed builds using a bundle-relative path.
+# Ad-hoc builds install an equivalent per-user plist on first launch instead.
+mkdir -p "$app/Contents/Library/LaunchAgents"
+cat > "$app/Contents/Library/LaunchAgents/com.hyperthymesia.agent.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.hyperthymesia.agent</string>
+<key>BundleProgram</key><string>Contents/MacOS/Hyperthymesia</string>
+<key>ProgramArguments</key><array><string>Hyperthymesia</string><string>--managed</string></array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>LimitLoadToSessionType</key><string>Aqua</string>
+<key>ThrottleInterval</key><integer>30</integer>
+</dict></plist>
+PLIST
 # A certificate signature keeps macOS privacy grants across rebuilds; ad-hoc grants
 # are pinned to one binary hash. Override with HX_SIGN_IDENTITY (use - for ad-hoc).
 identity="${HX_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development:/ {print $2; exit}')}"
@@ -38,16 +54,3 @@ codesign "${flags[@]}" "$app/Contents/MacOS/hx-agent"
 codesign "${flags[@]}" "$app"
 codesign --verify --deep --strict "$app"
 print -r -- "$app"
-python3 - "$app" "$PWD/dist/com.hyperthymesia.agent.plist" <<'PY'
-import plistlib, pathlib, sys
-app, output = sys.argv[1:]
-with open(output, 'wb') as stream:
-    plistlib.dump({
-        'Label': 'com.hyperthymesia.agent',
-        'ProgramArguments': [str(pathlib.Path(app) / 'Contents/MacOS/Hyperthymesia')],
-        'RunAtLoad': True,
-        'KeepAlive': {'SuccessfulExit': False},
-        'LimitLoadToSessionType': 'Aqua',
-        'ThrottleInterval': 30,
-    }, stream)
-PY

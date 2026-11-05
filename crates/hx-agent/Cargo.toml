@@ -24,3 +24,4 @@ regex = "1"
 tempfile.workspace = true
 axum.workspace = true
 hx-compile.workspace = true
+hx-connector-sdk.workspace = true
