@@ -19,7 +19,6 @@ use hx_schema::{Envelope, Interval};
 use hx_store::{Store, Token, UploadBatch};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::Row;
 
 #[derive(Debug)]
 pub struct ApiError(StatusCode, String);
@@ -187,14 +186,11 @@ async fn download_blob(
     if !hx_store::valid_hash(&sha) {
         return Err(bad("invalid hash"));
     }
-    let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM event_blobs eb JOIN events e ON e.id=eb.event_id WHERE eb.sha256=$1 AND EXISTS(SELECT 1 FROM unnest($2::text[]) p WHERE starts_with(e.connector_instance,p)))").bind(&sha).bind(&token.prefixes).fetch_one(&store.pool).await?;
+    let allowed: bool = store.blob_allowed(&sha, &token.prefixes).await?;
     if !allowed {
         return Err(ApiError(StatusCode::NOT_FOUND, "blob not found".into()));
     }
-    let published: bool = sqlx::query_scalar("SELECT published FROM blobs WHERE sha256=$1")
-        .bind(&sha)
-        .fetch_one(&store.pool)
-        .await?;
+    let published: bool = store.blob_published(&sha).await?;
     if !published {
         return Err(ApiError(StatusCode::GONE, "evidence_expired".into()));
     }
@@ -263,8 +259,9 @@ pub async fn timeline_value(
     let compiled = hx_compile::compile(&visible, w);
     // Prose cannot be selectively redacted: require every namespace and cited
     // record to be visible. The owner's read_raw scope deliberately bypasses disclosure.
-    let rows=sqlx::query("SELECT r.id,r.input_generation,r.interpretation,r.agent_run IS NOT NULL AS has_agent_run,w.end_at FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at<$2 AND w.end_at>$1 AND NOT EXISTS(SELECT 1 FROM unnest(r.input_namespaces) n WHERE NOT EXISTS(SELECT 1 FROM unnest($3::text[]) p WHERE starts_with(n,p))) ORDER BY w.start_at")
-        .bind(w.start).bind(w.end).bind(&token.prefixes).fetch_all(&store.pool).await?;
+    let rows = store
+        .canonical_revisions(w.start, w.end, &token.prefixes)
+        .await?;
     // Sensitive egress controls model transport, not the API reader's access.
     let broker = mcp::Broker::new(
         store.clone(),
@@ -275,7 +272,7 @@ pub async fn timeline_value(
     let mut revisions = vec![];
     let mut interpreted = None;
     for row in rows {
-        let interpretation: Value = row.get("interpretation");
+        let interpretation: Value = row.interpretation;
         if !token.has("read_raw")
             && !broker
                 .allowed_ids(&mcp::revision_evidence(&interpretation))
@@ -283,8 +280,8 @@ pub async fn timeline_value(
         {
             continue;
         }
-        interpreted = interpreted.max(Some(row.get::<DateTime<Utc>, _>("end_at")));
-        revisions.push(json!({"revision_id":row.get::<i64,_>("id"),"input_generation":row.get::<i64,_>("input_generation"),"interpretation":interpretation,"has_agent_run":row.get::<bool,_>("has_agent_run")}));
+        interpreted = interpreted.max(Some(row.end_at));
+        revisions.push(json!({"revision_id":row.id,"input_generation":row.input_generation,"interpretation":interpretation,"has_agent_run":row.has_agent_run}));
     }
     let mut out = json!({"observed_through":observed,"interpreted_through":interpreted,"coverage":compiled.coverage,"revisions":revisions});
     if level == "raw" {
@@ -355,7 +352,9 @@ async fn evidence(
 }
 async fn entities(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let token = auth(&store, &headers, "read_l3").await?;
-    let values:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',a.id,'entity',a.entity,'assertion',a.assertion,'evidence',a.evidence) FROM entity_assertions a WHERE ($1 OR sensitivity='normal') AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id=ANY(a.evidence) AND NOT EXISTS(SELECT 1 FROM unnest($2::text[]) p WHERE starts_with(e.connector_instance,p)))").bind(token.has("read_raw")).bind(&token.prefixes).fetch_all(&store.pool).await?;
+    let values: Vec<Value> = store
+        .visible_entities(token.has("read_raw"), &token.prefixes)
+        .await?;
     Ok(Json(json!({"entities":values})))
 }
 async fn now(
