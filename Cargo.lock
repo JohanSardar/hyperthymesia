@@ -1209,11 +1209,15 @@ name = "hx-sources"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "hx-schema",
+ "libc",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

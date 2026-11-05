@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use hx_schema::{Envelope, Sensitivity};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub const POLICY_VERSION: &str = "hx-disclosure/v1";
 
@@ -24,10 +25,13 @@ pub struct DisclosureRule {
 pub struct DisclosurePolicy {
     /// First matching rule wins. Put specific rules before broader rules.
     pub rules: Vec<DisclosureRule>,
+    /// Current owner grants, separate from the serialized base policy and digest.
+    #[serde(skip)]
+    pub source_grants: BTreeSet<String>,
 }
 
 impl DisclosurePolicy {
-    /// No file selects the owner's laptop defaults; `off` retains producer labels.
+    /// No file selects the owner's laptop defaults; `off` selects no base rules.
     /// A file replaces the defaults entirely. Invalid configuration fails closed.
     pub fn from_env() -> Result<Self> {
         match std::env::var("HX_DISCLOSURE") {
@@ -104,7 +108,10 @@ impl DisclosurePolicy {
         ] {
             add(prefix, "*", Sensitivity::Sensitive, None);
         }
-        Self { rules }
+        Self {
+            rules,
+            ..Self::default()
+        }
     }
 
     /// Ingest has already bound each stored connector instance to its token's
@@ -113,6 +120,14 @@ impl DisclosurePolicy {
         // Gap payloads are never disclosed, even under an owner wildcard grant.
         if envelope.kind.as_str() == "policy.gap" {
             return envelope.sensitivity;
+        }
+        let source = envelope.connector_instance.as_str().starts_with("source:");
+        if source
+            && !self
+                .source_grants
+                .contains(envelope.connector_instance.as_str())
+        {
+            return Sensitivity::Restricted;
         }
         self.rules
             .iter()
@@ -133,7 +148,16 @@ impl DisclosurePolicy {
                     })
             })
             .map_or_else(
-                || hx_schema::kinds::stored_class(envelope.kind.as_str(), envelope.sensitivity),
+                || {
+                    if source {
+                        Sensitivity::Sensitive
+                    } else if hx_schema::kinds::is_core(envelope.kind.as_str()) {
+                        envelope.sensitivity
+                    } else {
+                        // Opaque content needs an owner rule, regardless of its producer label.
+                        Sensitivity::Restricted
+                    }
+                },
                 |rule| rule.class,
             )
     }
@@ -161,11 +185,98 @@ mod tests {
     }
 
     #[test]
+    fn laptop_digest_stays_compatible_with_existing_revisions() {
+        // Recorded on main at cb5dde5, before adding source grants.
+        let golden = "3b37fcc74ece98e904e8bafa9d29fc0916c1cdbdbbc7fa8129b0c72345c747c1";
+        let mut policy = DisclosurePolicy::laptop();
+        assert!(policy.source_grants.is_empty());
+        assert_eq!(policy.digest(), golden);
+        let base_json = serde_json::to_string(&policy).unwrap();
+        policy
+            .source_grants
+            .extend(["source:ab".into(), "source:abc".into()]);
+        assert_eq!(policy.digest(), golden);
+        assert_eq!(serde_json::to_string(&policy).unwrap(), base_json);
+        let reloaded = DisclosurePolicy::from_json(&base_json).unwrap();
+        assert!(reloaded.source_grants.is_empty());
+        assert_eq!(reloaded.digest(), golden);
+    }
+
+    #[test]
+    fn an_off_source_beats_a_wildcard_base_rule() {
+        let mut policy = DisclosurePolicy::from_json(
+            r#"{"rules":[
+            {"connector_prefix":"source:", "kind":"*", "class":"normal"}
+        ]}"#,
+        )
+        .unwrap();
+        let mut source = envelope("source:ab", "source.document");
+        for kind in ["source.document", "web.visit"] {
+            source.kind = hx_schema::Kind::new(kind);
+            assert_eq!(policy.effective_class(&source), Sensitivity::Restricted);
+        }
+        policy.source_grants.insert("source:ab".into());
+        assert_eq!(policy.effective_class(&source), Sensitivity::Normal);
+        source.kind = hx_schema::Kind::new("policy.gap");
+        assert_eq!(policy.effective_class(&source), Sensitivity::Restricted);
+    }
+
+    #[test]
+    fn source_grants_require_an_exact_current_namespace() {
+        for mut policy in [DisclosurePolicy::default(), DisclosurePolicy::laptop()] {
+            assert!(policy.source_grants.is_empty());
+            policy.source_grants.insert("source:ab".into());
+            let mut granted = envelope("source:ab", "source.document");
+            for declared in [
+                Sensitivity::Normal,
+                Sensitivity::Sensitive,
+                Sensitivity::Restricted,
+            ] {
+                granted.sensitivity = declared;
+                assert_eq!(policy.effective_class(&granted), Sensitivity::Sensitive);
+            }
+            for namespace in ["source:abc", "source:AB", "source:ab:other"] {
+                let mut off = envelope(namespace, "source.document");
+                off.sensitivity = Sensitivity::Sensitive;
+                assert_eq!(policy.effective_class(&off), Sensitivity::Restricted);
+            }
+            policy.source_grants.remove("source:ab");
+            assert_eq!(policy.effective_class(&granted), Sensitivity::Restricted);
+        }
+    }
+
+    #[test]
+    fn base_rules_can_tighten_a_granted_source() {
+        let mut policy = DisclosurePolicy::from_json(
+            r#"{"rules":[
+            {"connector_prefix":"source:ab", "kind":"source.document", "class":"restricted"},
+            {"connector_prefix":"source:", "kind":"*", "class":"normal"}
+        ]}"#,
+        )
+        .unwrap();
+        policy.source_grants.insert("source:ab".into());
+        assert_eq!(
+            policy.effective_class(&envelope("source:ab", "source.document")),
+            Sensitivity::Restricted
+        );
+        assert_eq!(
+            policy.effective_class(&envelope("source:ab", "source.other")),
+            Sensitivity::Normal
+        );
+    }
+
+    #[test]
     fn unknown_kinds_stay_withheld_until_a_rule_grants_them() {
         let mut unknown = envelope("mcp-source:synthetic", "synthetic.document");
-        unknown.sensitivity = Sensitivity::Normal;
-        for policy in [DisclosurePolicy::default(), DisclosurePolicy::laptop()] {
-            assert_eq!(policy.effective_class(&unknown), Sensitivity::Restricted);
+        for declared in [
+            Sensitivity::Normal,
+            Sensitivity::Sensitive,
+            Sensitivity::Restricted,
+        ] {
+            unknown.sensitivity = declared;
+            for policy in [DisclosurePolicy::default(), DisclosurePolicy::laptop()] {
+                assert_eq!(policy.effective_class(&unknown), Sensitivity::Restricted);
+            }
         }
         let mut known = envelope("mcp-source:synthetic", "web.visit");
         known.sensitivity = Sensitivity::Normal;
@@ -180,6 +291,7 @@ mod tests {
                 class: Sensitivity::Normal,
                 field_present: None,
             }],
+            ..DisclosurePolicy::default()
         };
         assert_eq!(grant.effective_class(&unknown), Sensitivity::Normal);
     }
@@ -205,7 +317,8 @@ mod tests {
             ("macos-media:synthetic", "text.snapshot"),
             ("macos-media:synthetic", "media.still"),
             ("companion:browser:synthetic", "browser.navigation"),
-            ("companion:editor:synthetic", "editor.selection"),
+            ("companion:editor:synthetic", "editor.focus"),
+            ("companion:editor:synthetic", "editor.debug"),
             ("companion:shell:synthetic", "shell.command"),
         ] {
             assert_eq!(
@@ -274,6 +387,7 @@ mod tests {
             r#"{"rules":[{"connector_prefix":"macos-agent:","kind":"fo*o","class":"normal"}]}"#,
             r#"{"rules":[{"connector_prefix":"macos-agent:","kind":"*","class":"public"}]}"#,
             r#"{"rules":[],"typo":true}"#,
+            r#"{"rules":[],"source_grants":["source:ab"]}"#,
         ] {
             assert!(DisclosurePolicy::from_json(json).is_err());
         }
