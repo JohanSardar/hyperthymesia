@@ -572,6 +572,26 @@ async fn empty_windows_finish_without_provider_and_reopen_on_data() {
             .await
             .unwrap()
     );
+    // An older canonical entry must not make an empty current version eligible
+    // for the daily sweep after the ordinary scheduler has finished it.
+    let emptied = hx_store::window_at(w.end + chrono::Duration::days(2));
+    let old = f.store.generation(emptied).await.unwrap();
+    f.store
+        .publish_revision(emptied, old, json!({"tasks":[]}))
+        .await
+        .unwrap();
+    f.store.change_input(emptied).await.unwrap();
+    assert!(
+        !hx_server::processing::interpret_window(&f.store, emptied, &Fails)
+            .await
+            .unwrap()
+    );
+    f.store.finish_revision24(emptied, old + 1).await.unwrap();
+    f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
+    assert!(
+        f.store.sweep_reservations().await.unwrap().is_empty(),
+        "an empty completed version must not be scheduled by the daily sweep"
+    );
     f.close().await;
 }
 
@@ -667,5 +687,182 @@ async fn entity_changes_invalidate_only_evidence_windows() {
         .unwrap();
     assert_eq!(f.store.generation(w).await.unwrap(), old + 1);
     assert_eq!(f.store.generation(unrelated).await.unwrap(), unrelated_g);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn packet_tracks_only_prior_tasks_it_sent() {
+    let f = Fixture::new().await;
+    let w = window();
+    let mut ids = vec![];
+    for hours in [12, 8, 4] {
+        let prior = hx_store::window_at(w.start - chrono::Duration::hours(hours));
+        let mut e = event(&format!("prior-evidence-{hours}"), 8);
+        e.time = ObservationTime::point(prior.start);
+        ingest(&f.store, vec![e]).await;
+        let evidence = f.store.observations(prior, false).await.unwrap()[0].id;
+        let g = f.store.generation(prior).await.unwrap();
+        let value = json!({"episodes":[{"evidence":[evidence]}],"summary":"Synthetic prior", "tasks":[{
+            "id":format!("synthetic-{hours}"),"title":"Synthetic task","description":"Synthetic",
+            "intervals":[],"episode_ids":[],"confidence":0.5,"open":true
+        }],"input_manifest":{"disclosure_policy":{"digest":hx_server::disclosure::DisclosurePolicy::default().digest()},"sensitive_egress":"full"}});
+        ids.push(f.store.publish_revision(prior, g, value).await.unwrap().0);
+    }
+    let prepared = hx_server::processing::prepare_input_with_policy(
+        &f.store,
+        w,
+        "stub",
+        hx_server::processing::SensitiveEgress::Full,
+        &hx_server::disclosure::DisclosurePolicy::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.packet.open_tasks.len(), 1);
+    assert_eq!(prepared.manifest["prior_revision_ids"], json!([ids[2]]));
+    f.close().await;
+}
+
+#[derive(Default)]
+struct Counts(std::sync::atomic::AtomicUsize);
+impl hx_interpret::Provider for Counts {
+    fn name(&self) -> String {
+        "synthetic-counting".into()
+    }
+    async fn complete(&self, _: &str, _: &str) -> Result<String, hx_interpret::InterpretError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({"episodes":[],"tasks":[],"summary":"Synthetic"}).to_string())
+    }
+}
+async fn drain(store: &Store, runner: &hx_server::processing::Runner<Counts>) {
+    store.settle_inputs().await.unwrap();
+    for _ in 0..30 {
+        if !hx_jobs::run_one(&store.pool, runner).await.unwrap() {
+            return;
+        }
+    }
+    panic!("synthetic queue did not drain");
+}
+#[tokio::test]
+async fn late_data_recompiles_without_unbounded_paid_reruns() {
+    let f = Fixture::new().await;
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: Counts::default(),
+    };
+    for hour in [8, 12] {
+        ingest(&f.store, vec![event(&format!("first-{hour}"), hour)]).await;
+    }
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    for hour in [8, 12] {
+        ingest(&f.store, vec![event(&format!("late-{hour}"), hour)]).await;
+    }
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        f.store
+            .search("nebula", true, &["test:".into()])
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "late data compiles cheaply, without primary reruns"
+    );
+    let (a, b) = tokio::join!(
+        hx_server::processing::schedule(&f.store),
+        hx_server::processing::schedule(&f.store)
+    );
+    a.unwrap();
+    b.unwrap();
+    let pending = f.store.job_states().await.unwrap();
+    assert!(
+        pending
+            .iter()
+            .filter(|j| j.kind == "interpret" && j.state == "ready")
+            .count()
+            <= 1,
+        "{pending:?}, sweeps: {:?}",
+        f.store.sweep_reservations().await.unwrap()
+    );
+    for _ in 0..3 {
+        hx_server::processing::schedule(&f.store).await.unwrap();
+        drain(&f.store, &runner).await;
+    }
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "daily sweep admits at most one stale window globally"
+    );
+    // The unswept window remains available for an explicit owner request.
+    let mut owner_ran = false;
+    for hour in [8, 12] {
+        owner_ran |= hx_server::processing::interpret_window(
+            &f.store,
+            hx_store::window_at(event("at", hour).time.observed_at),
+            &runner.provider,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(owner_ran);
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        4
+    );
+    f.close().await;
+}
+#[tokio::test]
+async fn revision24_compares_timeline_hash_instead_of_generation() {
+    let f = Fixture::new().await;
+    let w = window();
+    ingest(&f.store, vec![event("first", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
+    let p = Counts::default();
+    assert!(
+        hx_server::processing::interpret_window(&f.store, w, &p)
+            .await
+            .unwrap()
+    );
+    f.store.change_input(w).await.unwrap(); // Context changed; timeline did not.
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: p,
+    };
+    let g = f.store.generation(w).await.unwrap();
+    f.store.request_work("compile", w, g).await.unwrap();
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "unchanged timeline must not buy the 24h pass"
+    );
+    let other = hx_store::window_at(w.end);
+    ingest(&f.store, vec![event("other-first", 12)]).await;
+    f.store.normalize_window(other).await.unwrap();
+    assert!(
+        hx_server::processing::interpret_window(&f.store, other, &runner.provider)
+            .await
+            .unwrap()
+    );
+    ingest(&f.store, vec![event("other-late-before-pass", 12)]).await;
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "changed timeline gets its one 24h pass"
+    );
+    hx_server::processing::schedule(&f.store).await.unwrap();
+    drain(&f.store, &runner).await;
+    assert_eq!(
+        runner.provider.0.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "the capped daily sweep can refresh changed prior context even when the timeline is unchanged"
+    );
     f.close().await;
 }

@@ -369,7 +369,7 @@ pub(crate) async fn interpret_window_with_settle(
     // Roll back explicitly: a dropped transaction releases the advisory lock only
     // when the pool later reuses its connection, so an immediate rerun saw it held.
     let result = async {
-    let (_, generation) = crate::processing::compile_window(store, window).await?;
+    let (compiled, generation) = crate::processing::compile_window(store, window).await?;
     if primary {
         crate::processing::ensure_settled(store, window, generation).await?;
     }
@@ -595,7 +595,7 @@ pub(crate) async fn interpret_window_with_settle(
     ensure!(!audit.exhausted, "MCP budget exhausted");
     let namespaces: Vec<String> = audit.input_namespaces.iter().cloned().collect();
     let mut value = serde_json::to_value(interpretation)?;
-    value["input_manifest"] = json!({"window":window,"input_generation":generation,"provider":"fx","fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
+    value["input_manifest"] = json!({"window":window,"timeline_hash":hx_store::hash(&serde_json::to_vec(&compiled)?),"input_generation":generation,"provider":"fx","fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
     value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     Ok(store
         .publish_revision_manifest(window, generation, value, output_key, &namespaces)

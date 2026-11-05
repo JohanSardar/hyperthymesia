@@ -3036,7 +3036,7 @@ async fn settle_for_test(store: &Store) {
 }
 
 #[tokio::test]
-async fn interpretation_storm_coalesces_settles_skips_and_reruns_once() {
+async fn interpretation_storm_coalesces_and_late_data_waits_for_rerun_policy() {
     use std::sync::atomic::Ordering;
     let f = Fixture::new().await;
     let w = hx_store::window_at(event("batch", 8).time.observed_at);
@@ -3095,14 +3095,13 @@ async fn interpretation_storm_coalesces_settles_skips_and_reruns_once() {
         compile_for_test(&runner, w).await;
     }
     settle_for_test(&f.store).await;
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
     assert!(!hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
-    assert_eq!(runner.provider.0.load(Ordering::SeqCst), 2);
-    assert_eq!(count(&f.store, "revisions").await, 2);
+    assert_eq!(runner.provider.0.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&f.store, "revisions").await, 1);
     let published: i64 = sqlx::query_scalar("SELECT r.input_generation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1")
         .bind(w.start).fetch_one(&f.store.pool).await.unwrap();
-    assert_eq!(published, f.store.generation(w).await.unwrap());
+    assert_eq!(published, g);
+    assert!(published < f.store.generation(w).await.unwrap());
     f.close().await;
 }
 
@@ -3213,6 +3212,8 @@ async fn revision_identity_includes_prompt_model_and_disclosure() {
     for field in ["prompt_version", "provider", "policy", "sensitive_egress"] {
         let f = Fixture::new().await;
         let w = hx_store::window_at(event("identity", 8).time.observed_at);
+        ingest(&f.store, vec![event("identity-input", 8)]).await;
+        f.store.normalize_window(w).await.unwrap();
         let provider = CountingProvider(std::sync::atomic::AtomicUsize::new(0));
         let prepared = hx_server::processing::prepare_input(&f.store, w, "counting/model-v1")
             .await
@@ -3261,6 +3262,9 @@ async fn interpretation_cadences_wait_for_window_end_and_day_boundary() {
         store: f.store.clone(),
         provider: CountingProvider(std::sync::atomic::AtomicUsize::new(0)),
     };
+    let mut input = event("cadence-input", 8);
+    input.time = hx_schema::ObservationTime::point(w.start);
+    ingest(&f.store, vec![input]).await;
     compile_for_test(&runner, w).await;
     settle_for_test(&f.store).await;
     // Force early claims to exercise the handler guard independently of queue dates.
