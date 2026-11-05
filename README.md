@@ -51,4 +51,4 @@ Requires Rust 1.99 (pinned in `rust-toolchain.toml`), Docker, and macOS for the 
 
 ## License
 
-Not yet chosen. The bundled pstack skills under `.claude/skills/` are MIT licensed ([PSTACK-LICENSE](.claude/skills/PSTACK-LICENSE)).
+Not yet chosen.
