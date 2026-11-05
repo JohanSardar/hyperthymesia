@@ -365,8 +365,11 @@ impl Store {
                AND NOT w.dirty AND w.compiled_generation=w.generation
                AND (
                  w.canonical_revision IS NULL
-                 OR (r.input_generation<w.generation AND (
-                   w.revision24_finished OR EXISTS (
+                 OR (w.timeline_hash IS NOT NULL
+                   AND r.interpretation#>>'{input_manifest,timeline_hash}' IS NOT NULL
+                   AND w.timeline_hash IS DISTINCT FROM r.interpretation#>>'{input_manifest,timeline_hash}' AND (
+                   w.end_at+interval '48 hours'<=$1
+                   OR w.revision24_finished OR EXISTS (
                      SELECT 1 FROM jobs exhausted
                      WHERE exhausted.kind='interpret' AND exhausted.state='failed'
                        AND exhausted.revivals>=3
@@ -425,6 +428,15 @@ impl Store {
     }
     pub async fn release_daily_sweep(&self, w: Interval, day: chrono::NaiveDate) -> Result<()> {
         sqlx::query("UPDATE daily_sweeps SET started=false WHERE day=$1 AND start_at=$2")
+            .bind(day)
+            .bind(w.start)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    /// Empty admission did no provider work; let the next candidate use this day.
+    pub async fn skip_empty_daily_sweep(&self, w: Interval, day: chrono::NaiveDate) -> Result<()> {
+        sqlx::query("DELETE FROM daily_sweeps WHERE day=$1 AND start_at=$2 AND NOT started")
             .bind(day)
             .bind(w.start)
             .execute(&self.pool)

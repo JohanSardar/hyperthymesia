@@ -438,8 +438,8 @@ impl<P: Provider> Handler for Runner<P> {
                         .bind(format!("interpret:{}", w.start)).execute(&mut *tx).await?;
                 }
                 if !state.revision24_finished
-                    && (state.canonical_revision.is_some()
-                        || Utc::now() < w.end + Duration::hours(24))
+                    // Allow brief downtime around T+24h, never historical catch-up.
+                    && Utc::now() < w.end + Duration::hours(48)
                 {
                     hx_store::request_interpret_job(
                         &mut tx,
@@ -462,19 +462,27 @@ impl<P: Provider> Handler for Runner<P> {
                 if ready_at > Utc::now() {
                     return Err(Deferred::Until(ready_at).into());
                 }
-                if !admit_visible_window(&self.store, w).await? {
-                    return Ok(());
-                }
-                let state = self.store.interpretation_state(w).await?;
-                ensure_settled(&self.store, w, state.generation).await?;
                 let sweep_day = job
                     .payload
                     .get("sweep_day")
                     .cloned()
                     .map(serde_json::from_value::<chrono::NaiveDate>)
                     .transpose()?;
+                if !admit_visible_window(&self.store, w).await? {
+                    if let Some(day) = sweep_day {
+                        self.store.skip_empty_daily_sweep(w, day).await?;
+                        self.store.schedule_daily_sweep(Utc::now()).await?;
+                    }
+                    return Ok(());
+                }
+                let state = self.store.interpretation_state(w).await?;
+                ensure_settled(&self.store, w, state.generation).await?;
                 if revision24 {
-                    if state.revision24_finished || state.canonical_revision.is_none() {
+                    // Jobs queued during the grace period may survive prolonged downtime.
+                    if Utc::now() >= w.end + Duration::hours(48)
+                        || state.revision24_finished
+                        || state.canonical_revision.is_none()
+                    {
                         return Ok(());
                     }
                     if !state.timeline_changed {
@@ -505,8 +513,7 @@ impl<P: Provider> Handler for Runner<P> {
                     && matches!(
                         error.downcast_ref::<Deferred>(),
                         Some(
-                            Deferred::RateLimited
-                                | Deferred::ProviderBusy
+                            Deferred::ProviderBusy
                                 | Deferred::Until(_)
                                 | Deferred::NormalizationPending
                         )
@@ -533,7 +540,7 @@ pub async fn schedule(store: &Store) -> Result<()> {
     hx_jobs::revive_window_jobs(&store.pool).await?;
     let current = hx_store::window_at(Utc::now() - Duration::hours(4));
     store.generation(current).await?;
-    let rows=sqlx::query("SELECT start_at,end_at,generation FROM windows WHERE dirty OR (end_at<=now() AND canonical_revision IS NULL AND empty_generation IS DISTINCT FROM generation) ORDER BY start_at LIMIT 1000").fetch_all(&store.pool).await?;
+    let rows=sqlx::query("SELECT start_at,end_at,generation FROM windows WHERE dirty OR (end_at<=now() AND canonical_revision IS NULL AND empty_generation IS DISTINCT FROM generation) ORDER BY start_at DESC LIMIT 1000").fetch_all(&store.pool).await?;
     let mut tx = store.pool.begin().await?;
     for r in rows {
         let w = Interval {

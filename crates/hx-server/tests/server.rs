@@ -1194,23 +1194,33 @@ async fn canonical_pointer_never_moves_backwards_on_retry() {
 
 #[tokio::test]
 async fn synthetic_day_burst() {
-    synthetic_burst(false).await;
+    synthetic_burst(false, false).await;
 }
 
 #[tokio::test]
 async fn synthetic_browser_point_stress() {
-    synthetic_burst(true).await;
+    synthetic_burst(true, false).await;
 }
 
-async fn synthetic_burst(browser_points: bool) {
+#[tokio::test]
+async fn synthetic_recent_agent_message_burst() {
+    synthetic_burst(false, true).await;
+}
+
+async fn synthetic_burst(browser_points: bool, recent: bool) {
     let f = Fixture::new().await;
     let started = std::time::Instant::now();
+    let base = if recent {
+        hx_store::window_at(Utc::now() - Duration::hours(24)).start
+    } else {
+        event("base", 0).time.observed_at
+    };
     for chunk in 0..40 {
         let events = (chunk * 500..(chunk + 1) * 500)
             .map(|i| {
                 let mut e = event(&format!("burst-{i}"), 0);
                 e.time =
-                    ObservationTime::point(e.time.observed_at + Duration::milliseconds(i * 4320));
+                    ObservationTime::point(base + Duration::milliseconds(i * 4320));
                 if !browser_points {
                     e.kind = Kind::new("agent.message");
                     e.payload = json!({"provider":"synthetic","thread_id":format!("thread-{}",i/100),"role":"assistant","text":"Synthetic activity."});
@@ -1237,7 +1247,6 @@ async fn synthetic_burst(browser_points: bool) {
     settle_for_test(&f.store).await;
     let mut normalized_compiled = None;
     while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
-        settle_for_test(&f.store).await;
         if normalized_compiled.is_none() {
             let pending: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM jobs WHERE kind IN ('normalize','compile') AND state!='done'",
@@ -1251,27 +1260,31 @@ async fn synthetic_burst(browser_points: bool) {
         }
     }
     assert_eq!(count(&f.store, "normalized").await, 20_000);
-    let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state!='done'")
+    let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state!='done' AND NOT (kind='interpret' AND payload->>'revision24'='true' AND state='ready' AND available_at>now())")
         .fetch_one(&f.store.pool)
         .await
         .unwrap();
     assert_eq!(unfinished, 0);
     let canonical: i64 = sqlx::query_scalar("SELECT count(*) FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE r.input_generation=w.generation").fetch_one(&f.store.pool).await.unwrap();
     assert_eq!(
-        canonical, 0,
-        "historical burst data compiles without buying uncapped primary runs"
+        canonical,
+        if recent { 6 } else { 0 },
+        "each recent closed window gets a revision; historical data waits for the sweep"
     );
     hx_server::processing::schedule(&f.store).await.unwrap();
-    while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
-        settle_for_test(&f.store).await;
-    }
+    while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {}
     let canonical: i64 =
         sqlx::query_scalar("SELECT count(*) FROM windows WHERE canonical_revision IS NOT NULL")
             .fetch_one(&f.store.pool)
             .await
             .unwrap();
-    assert_eq!(canonical, 1, "the burst shares one capped daily sweep");
-    let tail = hx_store::window_at(event("tail", 0).time.observed_at + Duration::days(1));
+    assert_eq!(canonical, if recent { 6 } else { 1 });
+    assert_eq!(
+        f.store.sweep_reservations().await.unwrap().len(),
+        usize::from(!recent),
+        "the recent burst must need zero sweeps"
+    );
+    let tail = hx_store::window_at(base + Duration::days(1));
     let state = f.store.window_state(tail).await.unwrap();
     assert!(state.canonical_revision.is_none());
     assert!(!state.dirty);
@@ -1288,7 +1301,9 @@ async fn synthetic_burst(browser_points: bool) {
         started.elapsed(),
         started.elapsed() - ingested
     );
-    assert!(started.elapsed().as_secs_f64() < 60.0);
+    // Shared CI can be much slower than a local Postgres; this is a runaway
+    // guard, while the durable assertions above enforce coalescing and cost.
+    assert!(started.elapsed().as_secs_f64() < 180.0);
     f.close().await;
 }
 
@@ -2520,6 +2535,8 @@ import sys,os,json,pathlib,time,urllib.request
 if '--version' in sys.argv:
  print('0.0.16');sys.exit(0)
 mode = 'MODE'
+if mode in ('rate','generate','rate-retrying'):
+ with (pathlib.Path(__file__).parent/'paid-calls').open('a') as calls: calls.write('launch\n')
 home=pathlib.Path(os.environ['HOME']); work=pathlib.Path.cwd()
 settings=json.loads((home/'.fx/settings.json').read_text())
 assert settings['context'] is False and settings['permission']['*']=='deny'
@@ -2534,6 +2551,7 @@ instr=sys.stdin.read()
 assert instr.strip() and ('<digest>' in instr or 'Repair only' in instr)
 if mode=='timeout': time.sleep(3)
 if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
+if mode=='generate': print(json.dumps({'error':'could not generate output','exit_code':1}));sys.exit(1)
 if mode=='rate': print(json.dumps({'error':'429 rate limited','exit_code':1}));sys.exit(1)
 if mode=='rate-retrying':
  sys.stderr.write('[notice] Rate limited · HTTP 429 · usage_limit_reached: The usage limit has been reached · retrying request in 30s\n'); sys.stderr.flush(); time.sleep(30)
@@ -3443,5 +3461,187 @@ async fn interpretation_cadences_wait_for_window_end_and_day_boundary() {
         );
         assert_eq!(row.get::<i32, _>("attempts"), 0);
     }
+    f.close().await;
+}
+
+// A subprocess scopes fx configuration to this regression, without mutating the
+// multithreaded test runner's environment or opening a real credential.
+#[tokio::test]
+#[cfg(unix)]
+async fn close_launched_fx_errors_spend_paid_budgets() {
+    const CASE_ENV: &str = "HX_SYNTHETIC_PAID_CASE";
+    let Ok(case) = std::env::var(CASE_ENV) else {
+        let mut failures = vec![];
+        for cadence in ["sweep", "primary", "24h"] {
+            for mode in ["rate", "generate", "rate-retrying"] {
+                let scratch = tempfile::tempdir().unwrap();
+                let config = fake_fx(scratch.path(), mode);
+                let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "close_launched_fx_errors_spend_paid_budgets",
+                        "--nocapture",
+                    ])
+                    .env(CASE_ENV, format!("{cadence}:{mode}"))
+                    .env("HX_FX_BINARY", config.binary)
+                    .env("HX_FX_CREDENTIAL", config.credential)
+                    .env("HX_FX_TIMEOUT_S", "5")
+                    .env("HX_SYNTHETIC_PAID_CALLS", scratch.path().join("paid-calls"))
+                    .status()
+                    .await
+                    .unwrap();
+                if !status.success() {
+                    failures.push(format!("{cadence}:{mode}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "failed fake fx cases: {failures:?}");
+        return;
+    };
+    struct ToolAgent;
+    impl hx_interpret::Provider for ToolAgent {
+        fn name(&self) -> String {
+            "synthetic-fx".into()
+        }
+        fn tool_agent(&self) -> bool {
+            true
+        }
+        async fn complete(&self, _: &str, _: &str) -> Result<String, hx_interpret::InterpretError> {
+            panic!("only the isolated fake fx may run")
+        }
+    }
+    let (cadence, mode) = case.split_once(':').unwrap();
+    let f = Fixture::new().await;
+    let w = if cadence == "sweep" {
+        hx_store::window_at(event("old", 8).time.observed_at)
+    } else {
+        hx_store::window_at(Utc::now() - Duration::hours(if cadence == "24h" { 32 } else { 4 }))
+    };
+    let mut first = event("paid-error", 8);
+    first.time = ObservationTime::point(w.start);
+    ingest(&f.store, vec![first.clone()]).await;
+    f.store.normalize_window(w).await.unwrap();
+    if cadence == "24h" {
+        hx_server::processing::interpret_window(&f.store, w, &hx_server::processing::StubProvider)
+            .await
+            .unwrap();
+        first.source_key = SourceKey::new("paid-error-change");
+        first.observation_id = ObservationId::generate();
+        ingest(&f.store, vec![first]).await;
+        f.store.normalize_window(w).await.unwrap();
+    }
+    let (_, g) = hx_server::processing::compile_window(&f.store, w)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET state='done'")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    if cadence == "sweep" {
+        f.store.schedule_daily_sweep(Utc::now()).await.unwrap();
+    } else {
+        f.store
+            .request_interpretation(w, g, cadence == "24h")
+            .await
+            .unwrap();
+    }
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: ToolAgent,
+    };
+    let calls_path = std::path::PathBuf::from(std::env::var("HX_SYNTHETIC_PAID_CALLS").unwrap());
+    for run in 0..6 {
+        settle_for_test(&f.store).await;
+        let result = hx_jobs::run_one(&f.store.pool, &runner).await;
+        if run == 0 {
+            assert_eq!(
+                result.is_ok(),
+                mode != "generate",
+                "generate is a provider failure, not a rate limit"
+            );
+            let job = f
+                .store
+                .job_states()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|j| j.kind == "interpret")
+                .unwrap();
+            assert_eq!(job.attempts, 1, "launched fx spends the attempt for {case}");
+            if cadence == "sweep" {
+                assert!(
+                    f.store.sweep_reservations().await.unwrap()[0].2,
+                    "a launched fx error keeps the sweep start spent"
+                );
+            }
+        }
+    }
+    let calls = std::fs::read_to_string(calls_path).unwrap().lines().count();
+    assert_eq!(
+        calls,
+        if cadence == "sweep" { 1 } else { 5 },
+        "fx launches for {case}"
+    );
+    if cadence == "sweep" {
+        sqlx::query("UPDATE jobs SET state='done'")
+            .execute(&f.store.pool)
+            .await
+            .unwrap();
+        f.store
+            .schedule_daily_sweep(Utc::now() + Duration::days(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            f.store.sweep_reservations().await.unwrap().len(),
+            1,
+            "seven-day cooldown"
+        );
+        f.store
+            .schedule_daily_sweep(Utc::now() + Duration::days(7))
+            .await
+            .unwrap();
+        assert_eq!(f.store.sweep_reservations().await.unwrap().len(), 2);
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn recent_interpretation_storm_coalesces_108_generations_into_one_paid_run() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new().await;
+    let w = hx_store::window_at(Utc::now() - Duration::hours(4));
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: CountingProvider(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    for i in 0..108 {
+        let mut e = event(&format!("recent-storm-{i}"), 8);
+        e.time = ObservationTime::point(w.start);
+        ingest(&f.store, vec![e]).await;
+        compile_for_test(&runner, w).await;
+    }
+    let g = f.store.generation(w).await.unwrap();
+    let slots: Vec<i64> = sqlx::query_scalar("SELECT (payload->>'generation')::bigint FROM jobs WHERE kind='interpret' AND state='ready'")
+        .fetch_all(&f.store.pool).await.unwrap();
+    assert_eq!(
+        slots,
+        vec![g, g],
+        "one primary and one future 24h slot coalesce to the latest generation"
+    );
+    // Force queue readiness only: the handler still enforces the settle gate.
+    sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret'")
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert_eq!(runner.provider.0.load(Ordering::SeqCst), 0);
+    settle_for_test(&f.store).await;
+    while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {}
+    assert_eq!(runner.provider.0.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&f.store, "revisions").await, 1);
+    let published: i64 = sqlx::query_scalar("SELECT r.input_generation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1")
+        .bind(w.start).fetch_one(&f.store.pool).await.unwrap();
+    assert_eq!(published, g);
+    assert!(f.store.sweep_reservations().await.unwrap().is_empty());
     f.close().await;
 }

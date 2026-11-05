@@ -344,7 +344,7 @@ async fn run_limited(
         return Ok(value);
     }
     let rate_limited = value["error"].to_string().to_lowercase();
-    if rate_limited.contains("rate")
+    if rate_limited.contains("rate limit")
         || rate_limited.contains("429")
         || rate_limited.contains("usage limit")
     {
