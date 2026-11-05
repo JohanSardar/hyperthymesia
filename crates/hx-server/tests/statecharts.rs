@@ -866,3 +866,80 @@ async fn revision24_compares_timeline_hash_instead_of_generation() {
     );
     f.close().await;
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_stops_on_changed_input_at_tool_boundary_and_live_lookup_is_local() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new().await;
+    let w = window();
+    ingest(&f.store, vec![event("before-run", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
+    let g = f.store.generation(w).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let binary = scratch.path().join("synthetic-fx");
+    std::fs::write(&binary, r#"#!/usr/bin/python3
+import sys, os, json, pathlib, urllib.request, time
+if '--version' in sys.argv:
+ print('0.0.16'); sys.exit(0)
+sys.stdin.read()
+root=pathlib.Path(__file__).parent
+server=json.loads((pathlib.Path(os.environ['HOME'])/'.fx/mcp.json').read_text())['mcpServers']['hyperthymesia']
+def call(name, args):
+ request=urllib.request.Request(server['url'], data=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':name,'arguments':args}}).encode(), headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['HX_MCP_TOKEN']})
+ return json.load(urllib.request.urlopen(request))['result']
+assert not call('live_lookup', {'source':'synthetic','request':'synthetic lookup'})['isError']
+(root/'ready').touch()
+while not (root/'changed').exists(): time.sleep(0.005)
+call('list_sources', {})
+time.sleep(10)
+(root/'finished-doomed-run').touch()
+"#).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let credential = scratch.path().join("synthetic-auth.json");
+    std::fs::write(&credential, "synthetic-test-only").unwrap();
+    let config = hx_server::fx::Config {
+        binary,
+        credential,
+        timeout: std::time::Duration::from_secs(8),
+        max_steps: 10,
+    };
+    let store = f.store.clone();
+    let mut task = tokio::spawn(async move {
+        hx_server::fx::interpret_window(&store, w, "synthetic-cancelled", &config).await
+    });
+    for _ in 0..1000 {
+        if scratch.path().join("ready").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        scratch.path().join("ready").exists(),
+        "scripted fx did not reach live lookup"
+    );
+    assert_eq!(
+        f.store.generation(w).await.unwrap(),
+        g,
+        "live lookup must not mutate outside input"
+    );
+    ingest(&f.store, vec![event("outside-change", 8)]).await;
+    std::fs::write(scratch.path().join("changed"), "").unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await;
+    if outcome.is_err() {
+        task.abort();
+        let _ = task.await;
+        panic!("fx did not stop at the tool boundary after outside input changed");
+    }
+    let error = outcome.unwrap().unwrap().unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<hx_jobs::Deferred>(),
+            Some(hx_jobs::Deferred::InputChanged)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(f.store.record_count("revisions").await.unwrap(), 0);
+    assert!(!scratch.path().join("finished-doomed-run").exists());
+    f.close().await;
+}
