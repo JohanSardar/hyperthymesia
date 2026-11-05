@@ -24,9 +24,14 @@ Use HTTPS at the private proxy. REST callers use Authorization: Bearer credentia
 Revocation is currently administrative: set device_tokens.revoked=true for the
 credential hash.
 
-    cargo run -p hx-server -- compile --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
-    cargo run -p hx-server -- interpret --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
+    cargo run -p hx-server -- compile --data-dir ./data --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
+    cargo run -p hx-server -- interpret --data-dir ./data --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
     cargo run -p hx-server -- gc --data-dir ./data
+
+Use the same `--data-dir` for `serve`, `compile` and `interpret`. Provider runs
+hold OS locks in `<data-dir>/locks/interpret-<window-start>` so a manual run and
+the job worker cannot buy the same window concurrently. Lock files remain on
+disk; dropping the guard or killing its process releases the lock immediately.
 
 Interpretation uses a stub provider unless `HX_PROVIDER=claude` selects the
 `claude -p` CLI (model from `HX_MODEL`, default `sonnet`). Restricted evidence
@@ -201,8 +206,9 @@ On macOS, `serve` starts an independent OCR worker using `hx-visual`'s Apple Vis
 helper (`swiftc` must be installed). It discovers published `media.still` blobs on
 startup and while serving, including old stills and either event/blob upload
 ordering. Migration 0005 stores results per exact blob hash and engine identity
-(helper source/configuration plus macOS build). One database advisory lock limits
-OCR concurrency to one across server processes. Decoding and OCR run on a blocking
+(helper source/configuration plus macOS build). One OS file lock in
+`<data-dir>/locks/hx-ocr` limits OCR concurrency to one across server processes
+sharing that directory. Decoding and OCR run on a blocking
 thread, independently of the interpretation queue. PNG, JPEG and TIFF stills are
 supported by the sampling decoder; decode/engine failures retry five times with a
 30-second delay, then remain visibly `failed` in `ocr_jobs`. An operator can reset
