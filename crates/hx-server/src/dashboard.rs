@@ -1,5 +1,6 @@
-use crate::{ApiResult, auth, authorized_evidence};
+use crate::{ApiResult, auth, authorized_evidence, disclosure::DisclosurePolicy};
 use axum::{
+    Extension,
     extract::{Path, Query, State},
     http::HeaderMap,
     response::Html,
@@ -186,12 +187,14 @@ pub struct DayQuery {
 }
 pub async fn today(
     State(store): State<Store>,
+    Extension(policy): Extension<DisclosurePolicy>,
     headers: HeaderMap,
     Query(q): Query<DayQuery>,
 ) -> ApiResult<Html<String>> {
     let zone = owner_zone(&store).await?;
     day(
         State(store),
+        Extension(policy),
         headers,
         Path(Utc::now().with_timezone(&zone).date_naive().to_string()),
         Query(q),
@@ -200,6 +203,7 @@ pub async fn today(
 }
 pub async fn day(
     State(store): State<Store>,
+    Extension(policy): Extension<DisclosurePolicy>,
     headers: HeaderMap,
     Path(day): Path<String>,
     Query(q): Query<DayQuery>,
@@ -225,7 +229,7 @@ pub async fn day(
         .filter(|o| token.allows(o.envelope.connector_instance.as_str()))
         .collect();
     let timeline = hx_compile::compile(&observations, w);
-    let l3 = crate::timeline_value(&store, &token, w, "episodes").await?;
+    let l3 = crate::timeline_value(&store, &token, &policy, w, "episodes").await?;
     let results = if let Some(q) = q.q {
         store.search(&q, true, &token.prefixes).await?
     } else {
