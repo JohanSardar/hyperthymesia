@@ -106,6 +106,50 @@ fn point(t: &mut Timeline, o: &Observation, label: String) {
     });
 }
 
+// Use the compiler's revision order at egress too; timeline points deliberately
+// retain superseded records for lossless indexing.
+fn unique_observations(observations: &[Observation]) -> Vec<&Observation> {
+    let mut unique = BTreeMap::new();
+    for o in observations {
+        unique
+            .entry(o.envelope.dedup_key())
+            .and_modify(|old: &mut &Observation| {
+                if (o.id, o.received_at) < (old.id, old.received_at) {
+                    *old = o;
+                }
+            })
+            .or_insert(o);
+    }
+    unique.into_values().collect()
+}
+
+fn latest_revisions<'a>(
+    observations: impl IntoIterator<Item = &'a Observation>,
+) -> BTreeMap<(&'a hx_schema::ConnectorInstance, &'a hx_schema::SourceKey), &'a Observation> {
+    let mut latest = BTreeMap::new();
+
+    for o in observations {
+        let identity = (&o.envelope.connector_instance, &o.envelope.source_key);
+        latest
+            .entry(identity)
+            .and_modify(|old: &mut &Observation| {
+                if rank(o) > rank(old) {
+                    *old = o;
+                }
+            })
+            .or_insert(o);
+    }
+    latest
+}
+
+/// Latest revision of each connector/source identity, including tombstones.
+/// Uses the same deduplication and ordering as timeline compilation.
+pub fn latest_observations(observations: &[Observation]) -> Vec<&Observation> {
+    latest_revisions(unique_observations(observations))
+        .into_values()
+        .collect()
+}
+
 pub(super) fn compile(
     observations: &[Observation],
     window: Interval,
@@ -122,29 +166,8 @@ pub(super) fn compile(
     if window.start >= window.end {
         return t;
     }
-    let mut unique = BTreeMap::new();
-    for o in observations {
-        unique
-            .entry(o.envelope.dedup_key())
-            .and_modify(|old: &mut &Observation| {
-                if (o.id, o.received_at) < (old.id, old.received_at) {
-                    *old = o;
-                }
-            })
-            .or_insert(o);
-    }
-    let mut latest = BTreeMap::new();
-    for o in unique.values().copied() {
-        let identity = (&o.envelope.connector_instance, &o.envelope.source_key);
-        latest
-            .entry(identity)
-            .and_modify(|old: &mut &Observation| {
-                if rank(o) > rank(old) {
-                    *old = o;
-                }
-            })
-            .or_insert(o);
-    }
+    let unique = unique_observations(observations);
+    let latest = latest_revisions(unique.iter().copied());
     let active: Vec<_> = latest
         .values()
         .copied()
@@ -427,7 +450,7 @@ pub(super) fn compile(
         .chain(t.points.iter().map(|p| p.evidence))
         .chain(t.aggregates.iter().flat_map(|a| a.evidence.iter().copied()))
         .collect();
-    for o in unique.values() {
+    for o in &unique {
         if overlaps(o, window) && !referenced.contains(&o.id) {
             if o.envelope.kind.as_str() == "usage.aggregate" {
                 let winner = latest[&(&o.envelope.connector_instance, &o.envelope.source_key)];
