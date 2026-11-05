@@ -366,7 +366,7 @@ impl Broker {
                 }
             }
         }
-        let rows = sqlx::query("SELECT r.id,r.interpretation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 ORDER BY w.end_at DESC LIMIT 4").bind(before).fetch_all(&self.store.pool).await?;
+        let rows = sqlx::query("SELECT r.id,r.interpretation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 AND w.end_at>$1-interval '16 hours' ORDER BY w.end_at DESC LIMIT 4").bind(before).fetch_all(&self.store.pool).await?;
         let mut revisions = vec![];
         for row in rows {
             let value: Value = row.get("interpretation");

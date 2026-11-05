@@ -936,7 +936,8 @@ async fn context_changes_invalidate_dependent_generations() {
         .assert_entity("project", json!({"name":"synthetic"}), &[id])
         .await
         .unwrap();
-    assert_eq!(f.store.generation(later).await.unwrap(), before + 2);
+    assert_eq!(f.store.generation(later).await.unwrap(), before + 1);
+    assert_eq!(f.store.generation(early).await.unwrap(), generation + 1);
     f.close().await;
 }
 #[tokio::test]
