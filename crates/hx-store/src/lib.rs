@@ -566,14 +566,21 @@ impl Store {
                 .bind(sha)
                 .fetch_one(&mut *tx)
                 .await?;
-        if published {
+        // A gc crash can leave a published row with no file, so the row alone
+        // doesn't prove the bytes are there.
+        if published && path.try_exists()? {
+            // The client may now discard its copy, so retention restarts here.
+            sqlx::query("UPDATE blobs SET created_at=now() WHERE sha256=$1")
+                .bind(sha)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
             return Ok(false);
         }
         std::fs::rename(temp.path(), &path)?;
         std::fs::File::open(path.parent().context("blob parent")?)?.sync_all()?;
         sqlx::query(
-            "UPDATE blobs SET published=true,evidence_expired=false,bytes=$2 WHERE sha256=$1",
+            "UPDATE blobs SET published=true,evidence_expired=false,bytes=$2,created_at=now() WHERE sha256=$1",
         )
         .bind(sha)
         .bind(bytes.len() as i64)

@@ -92,7 +92,14 @@ async fn main() -> Result<()> {
                 processing::compile_window(&store, w).await?;
             }
         }
-        Command::Interpret { from, to, .. } => {
+        Command::Interpret { from, to, data_dir } => {
+            // Paid-run exclusion only works inside one folder, so a mistyped path
+            // must not create a second one beside the server's.
+            anyhow::ensure!(
+                data_dir.join("blobs").is_dir(),
+                "{} has no blobs folder; pass the server's --data-dir",
+                data_dir.display()
+            );
             for w in windows(from, to)? {
                 processing::interpret_window(
                     &store,
