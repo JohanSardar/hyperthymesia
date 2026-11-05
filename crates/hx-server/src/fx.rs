@@ -225,6 +225,7 @@ async fn run_limited(
     instruction: &str,
     steps: u64,
 ) -> Result<Value> {
+    broker.check_generation().await?;
     let dir = tempfile::Builder::new().prefix("hx-fx-").tempdir()?;
     let profile = dir.path().join(".fx");
     let work = dir.path().join("work");
@@ -304,7 +305,13 @@ async fn run_limited(
         "--system",
         PROMPT,
     ]);
-    let response = output(cmd, instruction, config.timeout).await?;
+    // Dropping output kills the child (kill_on_drop), including an fx process
+    // waiting on a broker response or retrying after a denied tool call.
+    let response = tokio::select! {
+        response = output(cmd, instruction, config.timeout) => response?,
+        _ = broker.cancelled() => return Err(hx_jobs::Deferred::InputChanged.into()),
+    };
+    broker.check_generation().await?;
     let value: Value = serde_json::from_slice(&response.stdout).context("invalid fx response")?;
     if response.status.success() && value["exit_code"] == 0 {
         ensure!(value["model"] == MODEL, "fx model mismatch");
@@ -337,7 +344,7 @@ async fn run_limited(
         return Ok(value);
     }
     let rate_limited = value["error"].to_string().to_lowercase();
-    if rate_limited.contains("rate")
+    if rate_limited.contains("rate limit")
         || rate_limited.contains("429")
         || rate_limited.contains("usage limit")
     {
@@ -360,14 +367,17 @@ pub(crate) async fn interpret_window_with_settle(
     window: Interval,
     output_key: &str,
     config: &Config,
-    primary: bool,
+    require_settled: bool,
 ) -> Result<bool> {
+    if !crate::processing::admit_visible_window(store, window).await? {
+        return Ok(false);
+    }
     let guard = crate::processing::interpretation_guard(store, window).await?;
     // Roll back explicitly: a dropped transaction releases the advisory lock only
     // when the pool later reuses its connection, so an immediate rerun saw it held.
     let result = async {
     let (_, generation) = crate::processing::compile_window(store, window).await?;
-    if primary {
+    if require_settled {
         crate::processing::ensure_settled(store, window, generation).await?;
     }
     let policy = DisclosurePolicy::from_env()?;
@@ -378,7 +388,7 @@ pub(crate) async fn interpret_window_with_settle(
     if crate::processing::revision_exists(store, window, generation, &identity).await? {
         return Ok(false);
     }
-    let mut broker = Broker::new(store.clone(), policy.clone(), sensitive, window);
+    let mut broker = Broker::new(store.clone(), policy.clone(), sensitive, window).for_generation(generation);
     broker.lookup_limit = DIGEST_LOOKUPS;
     let digest = broker.digest().await?;
     let goal = format!(
@@ -582,6 +592,7 @@ pub(crate) async fn interpret_window_with_settle(
             }
         }
     }
+    broker.check_generation().await?;
     let interpretation = best.context("invalid fx interpretation")?;
     ensure!(
         DisclosurePolicy::from_env()?.digest() == policy.digest()
@@ -592,7 +603,9 @@ pub(crate) async fn interpret_window_with_settle(
     ensure!(!audit.exhausted, "MCP budget exhausted");
     let namespaces: Vec<String> = audit.input_namespaces.iter().cloned().collect();
     let mut value = serde_json::to_value(interpretation)?;
-    value["input_manifest"] = json!({"window":window,"input_generation":generation,"provider":"fx","fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
+    let timeline_hash = store.compiled_timeline_hash(window, generation).await?
+        .ok_or(hx_jobs::Deferred::InputChanged)?;
+    value["input_manifest"] = json!({"window":window,"timeline_hash":timeline_hash,"input_generation":generation,"provider":"fx","fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
     value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     Ok(store
         .publish_revision_manifest(window, generation, value, output_key, &namespaces)

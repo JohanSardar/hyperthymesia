@@ -4,6 +4,7 @@
   "description": "Semantic editor focus and debug session observations for the local Hyperthymesia agent.",
   "publisher": "hyperthymesia",
   "version": "0.1.0",
+  "license": "AGPL-3.0-only",
   "engines": { "vscode": "^1.85.0" },
   "main": "./dist/extension.js",
   "activationEvents": ["onStartupFinished"],
