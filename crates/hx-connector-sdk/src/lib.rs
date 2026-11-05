@@ -270,7 +270,46 @@ pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 fn deliver(path: &Path, state: &mut State, server: &str, token: &str) -> Result<()> {
     let pending = state.pending.as_ref().context("missing pending batch")?;
-    upload(server, token, &pending.batch)?;
+    let ack = upload(server, token, &pending.batch)?;
+    let dead_letter_path = path.with_extension("dead-letter.sqlite");
+    if !ack.rejected.is_empty() {
+        let file = private_open(&dead_letter_path)?;
+        drop(file);
+        let mut db = rusqlite::Connection::open(&dead_letter_path)?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS dead_letters (identity TEXT PRIMARY KEY, batch_id TEXT NOT NULL, json BLOB NOT NULL, reason TEXT NOT NULL, rejected_at INTEGER NOT NULL DEFAULT(unixepoch()));")?;
+        let tx = db.transaction()?;
+        for rejection in &ack.rejected {
+            let envelope = pending
+                .batch
+                .envelopes
+                .iter()
+                .find(|e| e.observation_id == rejection.observation_id)
+                .expect("validated rejection");
+            tx.execute(
+                "INSERT OR IGNORE INTO dead_letters(identity,batch_id,json,reason) VALUES(?,?,?,?)",
+                rusqlite::params![
+                    envelope.observation_id.to_string(),
+                    pending.batch.batch_id.to_string(),
+                    serde_json::to_vec(envelope)?,
+                    rejection.reason
+                ],
+            )?;
+        }
+        tx.commit()?;
+    }
+    if dead_letter_path.exists() {
+        let db = rusqlite::Connection::open(&dead_letter_path)?;
+        let dropped: i64 = db.query_row("SELECT COUNT(*) FROM dead_letters", [], |r| r.get(0))?;
+        atomic_json(
+            &path.with_extension("health.json"),
+            &json!({
+                "collector":"upload", "status":"failed", "dropped":dropped,
+                "detail":"The server refused some records. They are saved locally for inspection.",
+                "observed_at":Utc::now(),
+            }),
+        )?;
+    }
     state.cursor = pending.next.clone();
     state.pending = None;
     atomic_json(path, state)
@@ -281,11 +320,13 @@ pub fn client() -> Result<reqwest::blocking::Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
-pub fn upload(server: &str, token: &str, batch: &UploadBatch) -> Result<()> {
+/// Returns only complete per-record acknowledgements. Callers must durably retain
+/// `rejected` envelopes before advancing their cursor (as `run_cli` does).
+pub fn upload(server: &str, token: &str, batch: &UploadBatch) -> Result<UploadAck> {
     let body = zstd::encode_all(serde_json::to_vec(batch)?.as_slice(), 3)?;
     let client = client()?;
     for attempt in 0..3 {
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<UploadAck> {
             let response = client
                 .post(format!("{}/v1/events", server.trim_end_matches('/')))
                 .bearer_auth(token)
@@ -299,14 +340,8 @@ pub fn upload(server: &str, token: &str, batch: &UploadBatch) -> Result<()> {
                 response.status()
             );
             let ack: UploadAck = response.json()?;
-            ensure!(
-                ack.batch_id == batch.batch_id
-                    && ack.rejected.is_empty()
-                    && u64::from(ack.accepted) + u64::from(ack.duplicates)
-                        == batch.envelopes.len() as u64,
-                "incomplete or mismatched upload acknowledgement"
-            );
-            Ok(())
+            ack.validate_for(batch).map_err(anyhow::Error::msg)?;
+            Ok(ack)
         })();
         if result.is_ok() || attempt == 2 {
             return result;

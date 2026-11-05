@@ -764,3 +764,6 @@ mod tests {
         assert!(!chromium(&f));
     }
 }
+
+mod startup;
+pub use startup::register_launch_agent;

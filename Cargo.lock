@@ -989,6 +989,7 @@ dependencies = [
  "chrono",
  "clap",
  "hx-compile",
+ "hx-connector-sdk",
  "hx-macos-sys",
  "hx-schema",
  "regex",
