@@ -401,3 +401,100 @@ async fn default_stub_warns_even_when_logging_is_disabled() {
     );
     assert!(status.unwrap().unwrap().success());
 }
+
+#[tokio::test]
+async fn device_capability_requires_ingest_auth() {
+    const CASE: &str = "HX_N6_ROUTE_MODE";
+    if cfg!(target_os = "macos") && std::env::var_os(CASE).is_none() {
+        let scratch = tempfile::tempdir().unwrap();
+        let helper = scratch.path().join("hx-vision-ocr");
+        executable(&helper, "#!/bin/sh\nexit 0\n");
+        for mode in ["server", "device"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "device_capability_requires_ingest_auth",
+                    "--nocapture",
+                ])
+                .env(CASE, mode)
+                .env("PATH", "")
+                .env(
+                    "HX_VISION_HELPER",
+                    if mode == "server" {
+                        helper.clone()
+                    } else {
+                        scratch.path().join("missing-helper")
+                    },
+                )
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let f = Fixture::new().await;
+    let app = hx_server::router(f.store.clone(), DisclosurePolicy::default());
+    let anonymous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/device")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), axum::http::StatusCode::UNAUTHORIZED);
+    let reader = f
+        .store
+        .create_token(
+            "synthetic-reader",
+            vec!["test:".into()],
+            vec!["read_raw".into()],
+        )
+        .await
+        .unwrap();
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/device")
+                .header("authorization", format!("Bearer {reader}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), axum::http::StatusCode::FORBIDDEN);
+    let ingest = f
+        .store
+        .create_token(
+            "synthetic-ingest",
+            vec!["test:".into()],
+            vec!["ingest".into()],
+        )
+        .await
+        .unwrap();
+    let allowed = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/device")
+                .header("authorization", format!("Bearer {ingest}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), axum::http::StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&allowed.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let expected = std::env::var(CASE).unwrap_or_else(|_| "device".into());
+    assert_eq!(body, json!({"ocr":expected}));
+    f.close().await;
+}
