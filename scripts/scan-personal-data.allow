@@ -1,5 +1,5 @@
 # Approved matches for scripts/scan-personal-data.py. Keep this file small.
 # Tab-separated: path, pattern, most matches allowed per file version (or *), reason.
-# Never put the matched value here. The paths commit-author and commit-message mean
-# commit metadata.
-commit-author	identity-name	*	the owner's name as commit author
+# Never put the matched value here. The paths metadata:commit-author and
+# metadata:commit-message mean commit metadata.
+metadata:commit-author	identity-name	*	the owner's name as commit author

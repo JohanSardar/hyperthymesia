@@ -6,14 +6,16 @@
     scripts/scan-personal-data.py --history  blobs and commit metadata on branches,
                                              remotes and tags (not stash or agent refs)
 
-Prints where and which pattern, never the matched value. Exits 1 on any match not
-covered by scripts/scan-personal-data.allow, 0 otherwise, 2 if it cannot run.
+Prints where and which pattern, never the matched value; a path that itself matches
+prints as a hash. Exits 1 on any match not covered by scripts/scan-personal-data.allow,
+0 otherwise, 2 if it cannot run. A file too large to scan counts as a match.
 
 The owner's names are read from git authors so that this public script never has to
 contain them. To also look for names that must not be published (family, employer),
 point HX_SCAN_PRIVATE_TERMS at a file outside the repo with one term per line.
 """
 import argparse
+import hashlib
 import os
 import pathlib
 import re
@@ -33,7 +35,7 @@ CAPTURED_PATH = re.compile(r"(^|/)(fixtures|snapshots)/")
 
 EMAIL = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b")
 EMAIL_OK = re.compile(
-    r"(?i)^git@github\.com$|^noreply@|@users\.noreply\.github\.com$"
+    r"(?i)^git@github\.com$|^noreply@(?:github|anthropic|openai)\.com$|@users\.noreply\.github\.com$"
     r"|@example\.(com|org|net)$|\.(test|invalid|example|localhost)$"
 )
 HOME_PATH = re.compile(r"(?<![\w/.-])(?:/Users|/home|[A-Za-z]:\\+Users)[/\\]+([A-Za-z0-9._-]+)")
@@ -48,6 +50,7 @@ PATTERNS = {
     "bearer-token": re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{24,}"),
     "secret-value": re.compile(
         r"""(?i)\b(?:api[_-]?key|secret|token|passw(?:or)?d)["']?\s*[:=]\s*["'][^"'\s$<{]{16,}["']"""
+        r"""|(?m:^\s*(?:export\s+)?[A-Z0-9_]*(?:API_?KEY|SECRET|TOKEN|PASSW(?:OR)?D)[A-Z0-9_]*=[^\s"'$<{]{16,})"""
     ),
     "url-credentials": re.compile(r"\b[a-z][a-z0-9+.-]*://[^/\s:@\"']+:[^/\s@\"'{]+@(?!localhost\b|127\.0\.0\.1\b|example\.|[^/\s]*\.(?:test|invalid)\b)"),
     "phone": re.compile(r"(?<![\w+.])\+\d{10,14}\b"),
@@ -61,6 +64,8 @@ PATTERNS = {
         r"|[a-z0-9-]+\.slack\.com/archives/|notion\.so/[a-z0-9-]+)"
     ),
 }
+# A secret is only made up if it says so itself; nearby prose proves nothing.
+SECRETS = {"api-key", "private-key", "jwt", "bearer-token", "secret-value", "url-credentials"}
 # Prose in a recorded-data file: fixtures hold hashes, x-runs and short authored labels.
 CAPTURED_PROSE = re.compile(r"[A-Za-z]{2,}(?:[ \t]+[A-Za-z]{2,}){5,}")
 MAIL_HEADER = re.compile(r"(?m)^\W*(?:From|To|Cc|Subject):\s+\S")
@@ -119,7 +124,11 @@ class Scanner:
         hits["email"] = sum(1 for m in EMAIL.finditer(text) if not EMAIL_OK.search(m.group()))
         hits["home-path"] = sum(1 for m in HOME_PATH.finditer(text) if m.group(1).lower() not in HOME_OK)
         for name, pattern in PATTERNS.items():
-            hits[name] = sum(1 for m in pattern.finditer(text) if not made_up(text, m))
+            hits[name] = sum(
+                1
+                for m in pattern.finditer(text)
+                if not (MADE_UP.search(m.group()) if name in SECRETS else made_up(text, m))
+            )
         if CAPTURED_PATH.search(path) and not path.endswith("README.md"):
             hits["captured-prose"] = sum(1 for m in CAPTURED_PROSE.finditer(text) if not made_up(text, m))
             hits["mail-header"] = sum(1 for _ in MAIL_HEADER.finditer(text))
@@ -143,7 +152,6 @@ class Report:
         self.allowed = allowed
         self.findings = defaultdict(lambda: {"largest": 0, "versions": 0})
         self.approved = 0
-        self.skipped = 0
 
     def add(self, scope, path, hits):
         for pattern, count in hits.items():
@@ -158,28 +166,37 @@ class Report:
     def finish(self):
         for (scope, path, pattern), f in sorted(self.findings.items()):
             print(f"{scope}\t{path}\tpattern={pattern}\tmatches={f['largest']}\tversions={f['versions']}")
-        print(
-            f"scan: {len(self.findings)} unapproved, {self.approved} approved, "
-            f"{self.skipped} binary or oversized files skipped"
-        )
+        print(f"scan: {len(self.findings)} unapproved, {self.approved} approved")
         return 1 if self.findings else 0
 
 
-def readable(data):
-    return len(data) <= MAX_BYTES and b"\0" not in data[:8192]
+def as_text(data):
+    """Everything is scanned: UTF-16 and text inside binaries show up once NULs are gone."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    return data.replace(b"\0", b"").decode(errors="replace")
+
+
+def scan_file(scanner, report, scope, path, data):
+    name_hits = scanner.count(path, path)
+    # Metadata labels start with "metadata:", so a file can't borrow their approvals.
+    shown = f"<path {hashlib.sha256(path.encode()).hexdigest()[:12]}>" if name_hits else path
+    shown = f"./{shown}" if shown.startswith("metadata:") else shown
+    report.add(scope, shown, {f"filename-{k}": v for k, v in name_hits.items()})
+    if len(data) > MAX_BYTES:
+        report.add(scope, shown, {"too-large-to-scan": 1})
+    else:
+        report.add(scope, shown, scanner.count(as_text(data), path))
 
 
 def scan_tree(scanner, report):
     for raw in git("ls-files", "-z", "-co", "--exclude-standard").split(b"\0"):
         path = raw.decode(errors="replace")
         file = ROOT / path
-        if not path or file.is_symlink() or not file.is_file():
+        if not path or not (file.is_symlink() or file.is_file()):
             continue
-        data = file.read_bytes()
-        if not readable(data):
-            report.skipped += 1
-            continue
-        report.add("tree", path, scanner.count(data.decode(errors="replace"), path))
+        data = os.readlink(file).encode() if file.is_symlink() else file.read_bytes()
+        scan_file(scanner, report, "tree", path, data)
 
 
 def history_blobs():
@@ -206,11 +223,8 @@ def history_blobs():
 
 def scan_history(scanner, report):
     for path, data in history_blobs():
-        if not readable(data):
-            report.skipped += 1
-            continue
-        report.add("history", path, scanner.count(data.decode(errors="replace"), path))
-    fields = {"commit-author": "%an%n%ae%n%cn%n%ce", "commit-message": "%B"}
+        scan_file(scanner, report, "history", path, data)
+    fields = {"metadata:commit-author": "%an%n%ae%n%cn%n%ce", "metadata:commit-message": "%B"}
     for label, fmt in fields.items():
         for entry in git("log", *HISTORY_REFS, f"--format={fmt}%x00").decode(errors="replace").split("\0"):
             if entry.strip():
