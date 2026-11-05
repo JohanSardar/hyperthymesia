@@ -1205,6 +1205,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hx-sources"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "libc",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "hx-store"
 version = "0.1.0"
 dependencies = [
