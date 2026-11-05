@@ -112,6 +112,63 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .filter(|n| *n > 0)
         .unwrap_or(default)
 }
+
+/// Local readiness only: never read login contents or invoke `ask`/`login`.
+pub async fn doctor(config: &Config) -> Result<()> {
+    let selection = Selection::from_env()?;
+    if login_file(&selection.provider).is_some() {
+        let metadata = std::fs::symlink_metadata(&config.credential)
+            .context("fx login missing; run fx login for HX_FX_PROVIDER")?;
+        ensure!(
+            metadata.is_file(),
+            "fx login must be a regular file, not a symlink"
+        );
+        for parent in config
+            .credential
+            .ancestors()
+            .skip(1)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            ensure!(
+                !std::fs::symlink_metadata(parent)?.file_type().is_symlink(),
+                "fx login parent must not be a symlink"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            ensure!(
+                metadata.permissions().mode() & 0o7777 == 0o600,
+                "fx login mode must be 600"
+            );
+            ensure!(metadata.nlink() == 1, "fx login must not have hard links");
+        }
+    } else {
+        let key = std::env::var("AI_GATEWAY_API_KEY").unwrap_or_default();
+        ensure!(
+            !key.trim().is_empty() && !key.chars().any(char::is_control),
+            "fx gateway login requires a nonempty AI_GATEWAY_API_KEY"
+        );
+    }
+    // fx version checks must not load the owner's profile or auto-upgrade.
+    let home = tempfile::Builder::new().prefix("hx-doctor-").tempdir()?;
+    let mut command = tokio::process::Command::new(&config.binary);
+    command
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("FX_AUTO_UPGRADE", "0")
+        .env("FX_DISABLE_KEYCHAIN", "1")
+        .env("FX_NO_OPEN_BROWSER", "1")
+        .current_dir(home.path())
+        .arg("--version");
+    let version = output(command, "", Duration::from_secs(5)).await?;
+    ensure!(
+        version.status.success() && String::from_utf8_lossy(&version.stdout).trim() == FX_VERSION,
+        "fx version must be pinned to {FX_VERSION}"
+    );
+    Ok(())
+}
 // Share fx's own advisory lock name so refreshed subscription credentials survive
 // the isolated profile and concurrent jobs cannot rotate the same refresh token.
 struct CredentialLease {
@@ -122,6 +179,17 @@ struct CredentialLease {
 }
 impl CredentialLease {
     fn acquire(source: &std::path::Path, isolated: PathBuf) -> Result<Self> {
+        // Check before opening the lock: first-run installs can lack the entire
+        // login directory. Only absence defers; invalid or unreadable files fail.
+        if let Err(error) = std::fs::symlink_metadata(source) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Err(hx_jobs::Deferred::Until(
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                )
+                .into());
+            }
+            return Err(error.into());
+        }
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -314,6 +382,12 @@ async fn run_limited(
         .transpose()?;
     let gateway_key = if selection.provider == "gateway" {
         let key = std::env::var("AI_GATEWAY_API_KEY").unwrap_or_default();
+        if key.trim().is_empty() {
+            return Err(anyhow::Error::new(hx_jobs::Deferred::Until(
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+            )))
+            .context("fx gateway login requires a nonempty AI_GATEWAY_API_KEY");
+        }
         ensure!(
             !key.trim().is_empty() && !key.chars().any(char::is_control),
             "fx gateway login requires a nonempty AI_GATEWAY_API_KEY"

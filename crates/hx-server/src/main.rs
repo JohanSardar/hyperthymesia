@@ -7,6 +7,7 @@ use hx_store::Store;
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser)]
+#[command(version)]
 struct Cli {
     #[arg(
         long,
@@ -20,6 +21,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    /// Check provider readiness without connecting to the database or calling a model.
+    Doctor,
     Serve {
         #[arg(long, default_value = "127.0.0.1:7377")]
         listen: SocketAddr,
@@ -64,12 +67,21 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Doctor) {
+        if matches!(ProviderConfig::from_env(), ProviderConfig::Stub) {
+            bail!("HX_PROVIDER selects the stub; set HX_PROVIDER=fx for real interpretation");
+        }
+        hx_server::fx::doctor(&hx_server::fx::Config::from_env()).await?;
+        println!("ok: provider configured, fx version and login checks passed (no model call)");
+        return Ok(());
+    }
     let dir = match &cli.command {
         Command::Serve { data_dir, .. } | Command::Gc { data_dir } => data_dir.clone(),
         _ => PathBuf::from("."),
     };
     let store = Store::connect(&cli.database_url, dir).await?;
     match cli.command {
+        Command::Doctor => unreachable!("doctor runs without a database"),
         Command::Migrate => store.migrate().await?,
         Command::Token {
             command:
@@ -100,10 +112,22 @@ async fn main() -> Result<()> {
                 bail!("listen must be loopback; use a local Tailscale proxy");
             }
             let policy = hx_server::disclosure::DisclosurePolicy::from_env()?;
+            let shutdown = shutdown_signal()?;
             let listener = tokio::net::TcpListener::bind(listen).await?;
+            let provider = ProviderConfig::from_env();
+            if matches!(provider, ProviderConfig::Stub) {
+                eprintln!(
+                    "WARNING: HX_PROVIDER selects the stub; no real interpretation will run. Set HX_PROVIDER=fx and run hx-server doctor."
+                );
+            }
+            // See docs/gc-safety.md: old hashes can lose freshly uploaded bytes,
+            // and filesystem deletion cannot roll back with the transaction.
+            eprintln!(
+                "WARNING: automatic blob GC is disabled pending retention and crash-safety fixes; disk usage will grow. See docs/gc-safety.md."
+            );
             let runner = Runner {
                 store: store.clone(),
-                provider: processing::coordinator_provider(ProviderConfig::from_env()),
+                provider: processing::coordinator_provider(provider),
             };
             let ocr_worker = if cfg!(target_os = "macos") {
                 let store = store.clone();
@@ -136,19 +160,43 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             });
+            let stop_worker = worker.abort_handle();
+            let stop_ocr = ocr_worker.as_ref().map(|worker| worker.abort_handle());
             let result = axum::serve(listener, hx_server::router(store, policy))
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
+                .with_graceful_shutdown(async move {
+                    shutdown.await;
+                    // Cancel provider work before waiting for HTTP connections
+                    // to drain. Dropping fx's output future kills its child.
+                    stop_worker.abort();
+                    if let Some(worker) = stop_ocr {
+                        worker.abort();
+                    }
                 })
                 .await;
             worker.abort();
+            let _ = worker.await;
             if let Some(worker) = ocr_worker {
                 worker.abort();
+                let _ = worker.await;
             }
             result?;
         }
     }
     Ok(())
+}
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    // Register SIGTERM before starting workers; service managers don't send Ctrl-C.
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
 fn windows(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Interval>> {
     if to <= from || to - from > chrono::Duration::days(366) {
