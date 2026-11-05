@@ -1,4 +1,4 @@
-//! Subscription-backed fx runs, with a fresh private profile and one MCP broker.
+//! Configurable fx runs, with a fresh private profile and one MCP broker.
 use crate::{
     disclosure::DisclosurePolicy,
     mcp::{Broker, HttpState},
@@ -35,16 +35,74 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let provider = std::env::var("HX_FX_PROVIDER").unwrap_or_else(|_| "codex".into());
+        let credential_name = login_file(&provider).unwrap_or("chatgpt-auth.json");
         Self {
             binary: std::env::var_os("HX_FX_BINARY")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".local/bin/fx")),
             credential: std::env::var_os("HX_FX_CREDENTIAL")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".fx/chatgpt-auth.json")),
+                .unwrap_or_else(|| home.join(".fx").join(credential_name)),
             timeout: Duration::from_secs(env_u64("HX_FX_TIMEOUT_S", DEFAULT_TIMEOUT_S)),
             max_steps: env_u64("HX_FX_MAX_STEPS", DEFAULT_MAX_STEPS),
         }
+    }
+}
+// Only these login mechanisms are proven under an isolated HOME (see unknowns.md).
+fn login_file(provider: &str) -> Option<&'static str> {
+    match provider {
+        "codex" => Some("chatgpt-auth.json"),
+        "grok" => Some("grok-auth.json"),
+        _ => None,
+    }
+}
+/// HX_FX_PROVIDER / HX_FX_MODEL / HX_FX_EFFORT, captured once per run.
+struct Selection {
+    provider: String,
+    model: String,
+    effort: String,
+}
+impl Selection {
+    fn from_env() -> Result<Self> {
+        let read = |name, default: &str| -> Result<String> {
+            let value = match std::env::var(name) {
+                Ok(value) => value,
+                Err(std::env::VarError::NotPresent) => default.into(),
+                Err(_) => anyhow::bail!("{name} must be valid UTF-8"),
+            };
+            ensure!(!value.trim().is_empty(), "{name} must not be empty");
+            Ok(value)
+        };
+        let selection = Self {
+            provider: read("HX_FX_PROVIDER", "codex")?,
+            model: read("HX_FX_MODEL", MODEL)?,
+            effort: read("HX_FX_EFFORT", "xhigh")?,
+        };
+        ensure!(
+            login_file(&selection.provider).is_some() || selection.provider == "gateway",
+            "unsupported fx provider; HX_FX_PROVIDER must be codex, grok or gateway"
+        );
+        Ok(selection)
+    }
+    fn manifest_provider(&self) -> String {
+        // Historical Codex manifests must keep their original provider identity.
+        if self.provider == "codex" {
+            "fx".into()
+        } else {
+            format!("fx:{}", self.provider)
+        }
+    }
+    fn input_manifest(
+        &self,
+        window: Interval,
+        timeline_hash: &str,
+        generation: i64,
+        policy: &DisclosurePolicy,
+        sensitive: SensitiveEgress,
+        namespaces: &[String],
+    ) -> Value {
+        json!({"window":window,"timeline_hash":timeline_hash,"input_generation":generation,"provider":self.manifest_provider(),"fx_version":FX_VERSION,"model":self.model,"effort":self.effort,"fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces})
     }
 }
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -86,6 +144,10 @@ impl CredentialLease {
             "fx credential too large"
         );
         let original = std::fs::read(source)?;
+        ensure!(
+            serde_json::from_slice::<Value>(&original).is_ok_and(|value| value.is_object()),
+            "invalid fx credential JSON object"
+        );
         std::fs::write(&isolated, &original)?;
         #[cfg(unix)]
         {
@@ -214,13 +276,20 @@ fn usage_limited(stderr: &[u8]) -> bool {
 pub async fn run(config: &Config, broker: &Broker, instruction: &str) -> Result<Value> {
     tokio::time::timeout(
         config.timeout,
-        run_limited(config, broker, instruction, config.max_steps),
+        run_limited(
+            config,
+            &Selection::from_env()?,
+            broker,
+            instruction,
+            config.max_steps,
+        ),
     )
     .await
     .context("fx run timeout")?
 }
 async fn run_limited(
     config: &Config,
+    selection: &Selection,
     broker: &Broker,
     instruction: &str,
     steps: u64,
@@ -233,8 +302,26 @@ async fn run_limited(
     std::fs::create_dir(&work)?;
     // Never inherit user settings, instructions, MCP servers, history or skill roots.
     // A regular credential file is required by fx; a symlink is rejected by fx.
-    let _credential =
-        CredentialLease::acquire(&config.credential, profile.join("chatgpt-auth.json"))?;
+    let _credential = login_file(&selection.provider)
+        .map(|name| {
+            CredentialLease::acquire(&config.credential, profile.join(name)).with_context(|| {
+                format!(
+                    "fx {} credential unavailable; check HX_FX_CREDENTIAL or run fx login {}",
+                    selection.provider, selection.provider
+                )
+            })
+        })
+        .transpose()?;
+    let gateway_key = if selection.provider == "gateway" {
+        let key = std::env::var("AI_GATEWAY_API_KEY").unwrap_or_default();
+        ensure!(
+            !key.trim().is_empty() && !key.chars().any(char::is_control),
+            "fx gateway login requires a nonempty AI_GATEWAY_API_KEY"
+        );
+        Some(key)
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let secret = format!("{}{}", ulid::Ulid::generate(), ulid::Ulid::generate());
@@ -248,8 +335,8 @@ async fn run_limited(
     std::fs::write(
         profile.join("settings.json"),
         serde_json::to_vec(&json!({
-            "provider":"codex","models":{"codex":MODEL},"context":false,"max_agent_steps":steps,
-            "effort":"xhigh","fast_mode":true,"max_tool_result_bytes":65536,"auto_upgrade":false,"session_titles":false,
+            "provider":selection.provider,"models":{(selection.provider.clone()):selection.model},"context":false,"max_agent_steps":steps,
+            "effort":selection.effort,"fast_mode":true,"max_tool_result_bytes":65536,"auto_upgrade":false,"session_titles":false,
             "permission_mode":"ask","permission":{"*":"deny","capability_search":"allow","mcp_select_tool":"allow","mcp_hyperthymesia_*":"allow"},
             "prompt_history":{"enabled":false},"notifications":{"turn_end":false,"attention_required":false}
         }))?,
@@ -270,8 +357,8 @@ async fn run_limited(
         cmd.env_clear()
             .env("HOME", dir.path())
             .env("PATH", "/usr/bin:/bin")
-            .env("FX_PROVIDER", "codex")
-            .env("FX_MODEL", MODEL)
+            .env("FX_PROVIDER", &selection.provider)
+            .env("FX_MODEL", &selection.model)
             .env("FX_MAX_AGENT_STEPS", steps.to_string())
             .env("FX_PERMISSION_MODE", "ask")
             .env("FX_AUTO_UPGRADE", "0")
@@ -281,6 +368,9 @@ async fn run_limited(
             .env("FX_HERDR", "0")
             .env("HX_MCP_TOKEN", &secret)
             .current_dir(&work);
+        if let Some(key) = &gateway_key {
+            cmd.env("AI_GATEWAY_API_KEY", key);
+        }
         cmd
     };
     let mut version = command();
@@ -296,9 +386,9 @@ async fn run_limited(
         "ask",
         "--json",
         "--model",
-        MODEL,
+        &selection.model,
         "--effort",
-        "xhigh",
+        &selection.effort,
         "--fast",
         "--no-ultrafast",
         "--no-save",
@@ -312,9 +402,14 @@ async fn run_limited(
         _ = broker.cancelled() => return Err(hx_jobs::Deferred::InputChanged.into()),
     };
     broker.check_generation().await?;
-    let value: Value = serde_json::from_slice(&response.stdout).context("invalid fx response")?;
+    let value: Value = serde_json::from_slice(&response.stdout).with_context(|| {
+        format!(
+            "invalid fx response; check the {} login and selected model",
+            selection.provider
+        )
+    })?;
     if response.status.success() && value["exit_code"] == 0 {
-        ensure!(value["model"] == MODEL, "fx model mismatch");
+        ensure!(value["model"] == selection.model, "fx model mismatch");
         ensure!(
             value["steps"].as_u64().is_some_and(|n| n < steps),
             "fx turn budget exhausted"
@@ -350,7 +445,11 @@ async fn run_limited(
     {
         return Err(hx_jobs::Deferred::RateLimited.into());
     }
-    anyhow::bail!("fx provider failed")
+    anyhow::bail!(
+        "fx {} provider failed; check the selected model and {} login",
+        selection.provider,
+        selection.provider
+    )
 }
 
 pub async fn interpret_window(
@@ -380,9 +479,10 @@ pub(crate) async fn interpret_window_with_settle(
     if require_settled {
         crate::processing::ensure_settled(store, window, generation).await?;
     }
+    let selection = Selection::from_env()?;
     let policy = DisclosurePolicy::from_env()?;
     let sensitive = SensitiveEgress::from_env();
-    let identity = json!({"input_generation":generation,"provider":"fx","model":MODEL,
+    let identity = json!({"input_generation":generation,"provider":selection.manifest_provider(),"model":selection.model,"effort":selection.effort,"fx_version":FX_VERSION,
         "prompt_version":PROMPT_VERSION,"sensitive_egress":sensitive,
         "disclosure_policy":{"digest":policy.digest()}});
     if crate::processing::revision_exists(store, window, generation, &identity).await? {
@@ -419,7 +519,7 @@ pub(crate) async fn interpret_window_with_settle(
             .context("fx turn budget exhausted")?;
         let result = match tokio::time::timeout(
             remaining.timeout,
-            run_limited(&remaining, &broker, &instruction, steps),
+            run_limited(&remaining, &selection, &broker, &instruction, steps),
         )
         .await
         {
@@ -520,7 +620,7 @@ pub(crate) async fn interpret_window_with_settle(
         packet.input_digest = hx_store::hash(&serde_json::to_vec(
             &json!({"window":window,"generation":generation,"calls":broker.audit.lock().await.calls,"policy":policy.digest()}),
         )?);
-        match hx_interpret::parse_output(&packet, &text, MODEL, PROMPT_VERSION) {
+        match hx_interpret::parse_output(&packet, &text, &selection.model, PROMPT_VERSION) {
             Ok(mut value) => {
                 if let Some((original, rejected)) = &first {
                     // A repair returns only replacements; everything else stays as first written.
@@ -605,8 +705,8 @@ pub(crate) async fn interpret_window_with_settle(
     let mut value = serde_json::to_value(interpretation)?;
     let timeline_hash = store.compiled_timeline_hash(window, generation).await?
         .ok_or(hx_jobs::Deferred::InputChanged)?;
-    value["input_manifest"] = json!({"window":window,"timeline_hash":timeline_hash,"input_generation":generation,"provider":"fx","fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
-    value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":MODEL,"effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
+    value["input_manifest"] = selection.input_manifest(window, &timeline_hash, generation, &policy, sensitive, &namespaces);
+    value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":selection.model,"effort":selection.effort,"fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     Ok(store
         .publish_revision_manifest(window, generation, value, output_key, &namespaces)
         .await?
@@ -716,6 +816,14 @@ fn citation_support(
         );
     }
     for o in observations {
+        // Match the broker's EvidenceItem timestamp, including sources with no
+        // declared time. An omitted map entry must not borrow another citation's time.
+        let at = o
+            .envelope
+            .time
+            .source_start
+            .unwrap_or(o.envelope.time.observed_at);
+        add(o.id, Interval { start: at, end: at });
         if let (Some(start), Some(end)) = (o.envelope.time.source_start, o.envelope.time.source_end)
             && start <= end
         {
@@ -728,6 +836,208 @@ fn citation_support(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Re-exec keeps environment selection realistic without mutating Rust's shared env.
+    #[test]
+    #[cfg(unix)]
+    fn configured_fx_is_isolated_and_rejects_bad_logins_before_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(case) = std::env::var("HX_FX_TEST_CASE") {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let config = Config::from_env();
+                if case == "default" {
+                    let window = Interval {
+                        start: "2026-01-01T00:00:00Z".parse().unwrap(),
+                        end: "2026-01-01T04:00:00Z".parse().unwrap(),
+                    };
+                    let policy = DisclosurePolicy::default();
+                    let sensitive = SensitiveEgress::from_env();
+                    let namespaces = vec!["synthetic:".into()];
+                    // Verbatim legacy shape, with literal defaults: serialized bytes are the contract.
+                    let legacy = json!({"window":window,"timeline_hash":"synthetic-hash","input_generation":7,"provider":"fx","fx_version":"0.0.16","model":"gpt-6.1-sol","effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
+                    let manifest = Selection::from_env().unwrap().input_manifest(window, "synthetic-hash", 7, &policy, sensitive, &namespaces);
+                    assert_eq!(serde_json::to_vec(&manifest).unwrap(), serde_json::to_vec(&legacy).unwrap());
+                }
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy("postgres://hx:hx@localhost:55432/hx")
+                    .unwrap();
+                let broker = Broker::new(
+                    Store::new(pool, std::env::var_os("HOME").unwrap()),
+                    DisclosurePolicy::default(),
+                    SensitiveEgress::from_env(),
+                    Interval {
+                        start: "2026-01-01T00:00:00Z".parse().unwrap(),
+                        end: "2026-01-01T04:00:00Z".parse().unwrap(),
+                    },
+                );
+                let result = run(&config, &broker, "synthetic instruction").await;
+                if let Some(reason) = case.strip_prefix("bad-") {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(error.contains(reason.split(':').next().unwrap()), "{case}: {error}");
+                    assert!(!config.binary.with_extension("called").exists());
+                } else {
+                    let result = result.unwrap_or_else(|error| panic!("{error:#}: {}", std::fs::read_to_string(config.binary.with_extension("error")).unwrap_or_default()));
+                    assert_eq!(result["model"], std::env::var("HX_FX_MODEL").unwrap_or_else(|_| MODEL.into()));
+                }
+            });
+            return;
+        }
+        let mut failures = vec![];
+        for case in [
+            "default",
+            "codex",
+            "grok",
+            "gateway",
+            "bad-AI_GATEWAY_API_KEY",
+            "bad-AI_GATEWAY_API_KEY:missing",
+            "bad-credential",
+            "bad-credential:missing",
+            "bad-credential:symlink",
+            "bad-provider",
+            "bad-HX_FX_MODEL",
+            "bad-HX_FX_EFFORT",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let binary = dir.path().join("fake-fx");
+            let script = r#"#!/usr/bin/python3
+import json, os, pathlib, stat, sys, traceback
+sys.excepthook = lambda kind, error, tb: pathlib.Path(__file__).with_suffix('.error').write_text(''.join(traceback.format_exception(kind, error, tb)))
+pathlib.Path(__file__).with_suffix('.called').touch()
+if '--version' in sys.argv:
+ print('0.0.16'); sys.exit(0)
+home = pathlib.Path(os.environ['HOME'])
+assert home != pathlib.Path(__file__).parent
+assert pathlib.Path.cwd().resolve() == (home/'work').resolve()
+assert not {'VERCEL_OIDC_TOKEN','FX_AI_GATEWAY_API_KEY','UNRELATED_SECRET','HX_FX_MODEL'} & os.environ.keys()
+assert os.environ['FX_DISABLE_KEYCHAIN'] == '1'
+provider = os.environ['FX_PROVIDER']; model = os.environ['FX_MODEL']
+assert provider == 'EXPECTED_PROVIDER'
+settings_bytes = (home/'.fx/settings.json').read_bytes()
+settings = json.loads(settings_bytes)
+assert settings['provider'] == provider and settings['models'] == {provider: model}
+assert sys.argv[sys.argv.index('--model')+1] == model
+assert sys.argv[sys.argv.index('--effort')+1] == settings['effort']
+assert settings['permission']['*'] == 'deny' and settings['context'] is False
+if model == 'gpt-6.1-sol':
+ legacy = {"provider":"codex","models":{"codex":"gpt-6.1-sol"},"context":False,"max_agent_steps":120,"effort":"xhigh","fast_mode":True,"max_tool_result_bytes":65536,"auto_upgrade":False,"session_titles":False,"permission_mode":"ask","permission":{"*":"deny","capability_search":"allow","mcp_select_tool":"allow","mcp_hyperthymesia_*":"allow"},"prompt_history":{"enabled":False},"notifications":{"turn_end":False,"attention_required":False}}
+ assert settings_bytes == json.dumps(legacy, sort_keys=True, separators=(',', ':')).encode()
+else:
+ assert settings['effort'] == 'low'
+if provider == 'gateway':
+ assert os.environ['AI_GATEWAY_API_KEY'] == 'synthetic-key'
+ assert not list((home/'.fx').glob('*auth.json'))
+else:
+ assert 'AI_GATEWAY_API_KEY' not in os.environ
+ name = 'grok-auth.json' if provider == 'grok' else 'chatgpt-auth.json'
+ login = home/'.fx'/name
+ assert stat.S_IMODE(login.stat().st_mode) == 0o600 and login.stat().st_nlink == 1
+ assert json.loads(login.read_text()) == {}
+ login.write_text('{"synthetic_refreshed":true}')
+print(json.dumps({'exit_code':0,'model':model,'steps':2,'final_output':'synthetic answer','tool_calls':[]}))
+"#;
+            let provider = if case.contains("gateway") || case.contains("AI_GATEWAY") {
+                "gateway"
+            } else if case == "grok" {
+                "grok"
+            } else {
+                "codex"
+            };
+            std::fs::write(&binary, script.replace("EXPECTED_PROVIDER", provider)).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let profile = dir.path().join(".fx");
+            std::fs::create_dir(&profile).unwrap();
+            let name = if provider == "grok" {
+                "grok-auth.json"
+            } else {
+                "chatgpt-auth.json"
+            };
+            let credential = profile.join(name);
+            std::fs::write(
+                &credential,
+                if case == "bad-credential" {
+                    "not json"
+                } else {
+                    "{}"
+                },
+            )
+            .unwrap();
+            if case == "bad-credential:missing" {
+                std::fs::remove_file(&credential).unwrap();
+            } else if case == "bad-credential:symlink" {
+                let target = profile.join("synthetic-target.json");
+                std::fs::rename(&credential, &target).unwrap();
+                std::os::unix::fs::symlink(target, &credential).unwrap();
+            }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "fx::tests::configured_fx_is_isolated_and_rejects_bad_logins_before_launch",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", dir.path())
+                .env("HX_FX_TEST_CASE", case)
+                .env("HX_FX_BINARY", &binary)
+                .env("UNRELATED_SECRET", "synthetic-canary")
+                .env("VERCEL_OIDC_TOKEN", "synthetic-canary")
+                .env("FX_AI_GATEWAY_API_KEY", "synthetic-canary")
+                .env(
+                    "AI_GATEWAY_API_KEY",
+                    if case == "bad-AI_GATEWAY_API_KEY" {
+                        " "
+                    } else {
+                        "synthetic-key"
+                    },
+                );
+            if case == "bad-AI_GATEWAY_API_KEY:missing" {
+                command.env_remove("AI_GATEWAY_API_KEY");
+            }
+            if case != "default" {
+                command
+                    .env(
+                        "HX_FX_PROVIDER",
+                        if case == "bad-provider" {
+                            "unknown"
+                        } else {
+                            provider
+                        },
+                    )
+                    .env(
+                        "HX_FX_MODEL",
+                        if case == "bad-HX_FX_MODEL" {
+                            " "
+                        } else {
+                            "synthetic-model"
+                        },
+                    )
+                    .env(
+                        "HX_FX_EFFORT",
+                        if case == "bad-HX_FX_EFFORT" {
+                            " "
+                        } else {
+                            "low"
+                        },
+                    );
+            }
+            let output = command.output().unwrap();
+            if !output.status.success() {
+                failures.push(format!(
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+                continue;
+            }
+            if matches!(case, "default" | "codex" | "grok") {
+                assert_eq!(
+                    std::fs::read_to_string(credential).unwrap(),
+                    "{\"synthetic_refreshed\":true}"
+                );
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
     #[test]
     fn repair_excerpt_keeps_the_header_and_nearby_lines_only() {
         let window = Interval {
@@ -799,12 +1109,31 @@ mod tests {
         };
         assert!(support[&7].contains(&declared), "{:?}", support[&7]);
         assert!(support[&7].iter().all(|s| s.start >= window.start));
+
+        // With no declared time and no compiled span, keep the broker's
+        // observed_at point. This must not acquire a duration or use received_at.
+        let mut untimed = observations[0].clone();
+        untimed.id = 8;
+        untimed.envelope.time.source_start = None;
+        untimed.envelope.time.source_end = None;
+        untimed.envelope.time.mono_start = None;
+        untimed.envelope.time.mono_end = None;
+        let support = citation_support(&timeline, std::slice::from_ref(&untimed), window);
+        assert_eq!(
+            support[&8],
+            vec![Interval {
+                start: untimed.envelope.time.observed_at,
+                end: untimed.envelope.time.observed_at,
+            }]
+        );
+        untimed.envelope.time.observed_at = window.start - chrono::Duration::seconds(1);
+        assert!(!citation_support(&timeline, &[untimed], window).contains_key(&8));
     }
     #[test]
     fn isolated_credential_refresh_survives_cleanup_and_serializes_jobs() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("synthetic-auth.json");
-        std::fs::write(&source, b"synthetic-original").unwrap();
+        std::fs::write(&source, b"{}").unwrap();
         let isolated = dir.path().join("synthetic-isolated.json");
         let lease = CredentialLease::acquire(&source, isolated.clone()).unwrap();
         let busy = CredentialLease::acquire(&source, dir.path().join("other.json"))
@@ -814,9 +1143,9 @@ mod tests {
             busy.downcast_ref::<hx_jobs::Deferred>(),
             Some(hx_jobs::Deferred::ProviderBusy)
         ));
-        std::fs::write(&isolated, b"synthetic-rotated").unwrap();
+        std::fs::write(&isolated, b"{\"synthetic\":true}").unwrap();
         drop(lease);
-        assert_eq!(std::fs::read(&source).unwrap(), b"synthetic-rotated");
+        assert_eq!(std::fs::read(&source).unwrap(), b"{\"synthetic\":true}");
         let _next = CredentialLease::acquire(&source, isolated).unwrap();
     }
 }

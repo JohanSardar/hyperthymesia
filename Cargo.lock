@@ -1208,10 +1208,16 @@ dependencies = [
 name = "hx-sources"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
+ "chrono",
+ "futures-util",
+ "hx-schema",
  "libc",
  "nix",
  "regex",
+ "reqwest",
+ "serde",
  "serde_json",
  "shell-words",
  "tempfile",
