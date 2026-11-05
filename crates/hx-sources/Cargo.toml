@@ -1,0 +1,17 @@
+[package]
+name = "hx-sources"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22"
+libc = "0.2"
+regex = "1"
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
