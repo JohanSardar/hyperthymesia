@@ -9,6 +9,17 @@ env:
   HX_TEST_DATABASE_URL: postgres://hx:hx@localhost:55432/hx
 
 jobs:
+  installer:
+    name: Installer core (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline installer contracts (scratch HOME, stubbed services)
+        run: sh scripts/install.test.sh
+
   rust-linux:
     name: Rust (Linux, server side)
     runs-on: ubuntu-latest
