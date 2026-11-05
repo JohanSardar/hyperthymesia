@@ -493,7 +493,7 @@ pub async fn request_window_job(
     window: Interval,
     generation: i64,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO jobs(output_key,kind,payload) VALUES($1,$2,$3) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,request_version=jobs.request_version+1,state=CASE WHEN jobs.state='running' THEN 'running' ELSE 'ready' END,attempts=CASE WHEN jobs.state='running' THEN jobs.attempts ELSE 0 END,available_at=now(),last_error=NULL WHERE (jobs.payload->>'generation')::bigint < (EXCLUDED.payload->>'generation')::bigint OR (jobs.kind='compile' AND jobs.state='failed' AND jobs.available_at<=now())")
+    sqlx::query("INSERT INTO jobs(output_key,kind,payload) VALUES($1,$2,$3) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,revivals=0,request_version=jobs.request_version+1,state=CASE WHEN jobs.state='running' THEN 'running' ELSE 'ready' END,attempts=CASE WHEN jobs.state='running' THEN jobs.attempts ELSE 0 END,available_at=now(),last_error=NULL WHERE (jobs.payload->>'generation')::bigint < (EXCLUDED.payload->>'generation')::bigint")
         .bind(format!("{kind}:{}",window.start)).bind(kind).bind(json!({"window":window,"generation":generation})).execute(&mut **tx).await?;
     Ok(())
 }
@@ -511,7 +511,7 @@ pub async fn request_interpret_job(
     } else {
         "interpret"
     };
-    sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue,available_at) VALUES($1,'interpret',$2,$3,$4) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,request_version=jobs.request_version+1,state=CASE WHEN jobs.state='running' THEN 'running' ELSE 'ready' END,attempts=CASE WHEN jobs.state='running' THEN jobs.attempts ELSE 0 END,available_at=EXCLUDED.available_at,last_error=NULL WHERE coalesce((jobs.payload->>'generation')::bigint,0)<(EXCLUDED.payload->>'generation')::bigint")
+    sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue,available_at) VALUES($1,'interpret',$2,$3,$4) ON CONFLICT(output_key) DO UPDATE SET payload=EXCLUDED.payload,revivals=0,request_version=jobs.request_version+1,state=CASE WHEN jobs.state='running' THEN 'running' ELSE 'ready' END,attempts=CASE WHEN jobs.state='running' THEN jobs.attempts ELSE 0 END,available_at=EXCLUDED.available_at,last_error=NULL WHERE coalesce((jobs.payload->>'generation')::bigint,0)<(EXCLUDED.payload->>'generation')::bigint")
         .bind(format!("{slot}:{}", window.start))
         .bind(json!({"window":window,"generation":generation,"revision24":revision24}))
         .bind(if revision24 { "backfill" } else { "interactive" })

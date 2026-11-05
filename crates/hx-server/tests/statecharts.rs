@@ -9,50 +9,93 @@ use serde_json::json;
 fn window() -> Interval {
     hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap())
 }
-#[tokio::test]
-async fn exhausted_compile_is_revived_after_cooldown() {
+async fn exhaust_slot(store: &Store, key: &str) {
+    let mut failures = 0;
+    while failures < 5 {
+        store.make_jobs_due("ready", None).await.unwrap();
+        let j = hx_jobs::claim(&store.pool, 120).await.unwrap().unwrap();
+        let target = store
+            .job_states()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.id == j.id && s.output_key == key);
+        hx_jobs::finish(&store.pool, &j, target.then_some("synthetic failure"))
+            .await
+            .unwrap();
+        if target {
+            failures += 1;
+        }
+    }
+}
+async fn assert_revival_cap(kind: &str) {
     let f = Fixture::new().await;
     let w = window();
     let g = f.store.generation(w).await.unwrap();
-    f.store.request_work("compile", w, g).await.unwrap();
-    for _ in 0..5 {
-        let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
-        assert_eq!(j.kind, "compile");
-        assert!(
-            hx_jobs::finish(&f.store.pool, &j, Some("synthetic transient failure"))
-                .await
-                .unwrap()
+    f.store.request_work(kind, w, g).await.unwrap();
+    let key = format!("{kind}:{}", w.start);
+    for revival in 0..=3 {
+        exhaust_slot(&f.store, &key).await;
+        f.store.make_jobs_due("failed", None).await.unwrap();
+        for _ in 0..3 {
+            hx_server::processing::schedule(&f.store).await.unwrap();
+        }
+        let j = f
+            .store
+            .job_states()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.output_key == key)
+            .unwrap();
+        assert_eq!(
+            j.state,
+            if revival < 3 { "ready" } else { "failed" },
+            "revival {revival}"
         );
+    }
+    // A changed data version resets the revival budget, even in the same slot.
+    f.store.change_input(w).await.unwrap();
+    f.store.request_work(kind, w, g + 1).await.unwrap();
+    for _ in 0..8 {
         f.store.make_jobs_due("ready", None).await.unwrap();
+        let j = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+        if j.kind != kind {
+            hx_jobs::finish(&f.store.pool, &j, None).await.unwrap();
+            continue;
+        }
+        hx_jobs::defer(&f.store.pool, &j, &hx_jobs::Deferred::RateLimited)
+            .await
+            .unwrap();
+        let state = f
+            .store
+            .job_states()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == j.id)
+            .unwrap();
+        assert_eq!(state.attempts, 0);
     }
-    hx_server::processing::schedule(&f.store).await.unwrap();
-    let state = f
-        .store
-        .job_states()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|j| j.state == "failed")
-        .unwrap()
-        .state;
-    assert_eq!(state, "failed");
+    exhaust_slot(&f.store, &key).await;
     f.store.make_jobs_due("failed", None).await.unwrap();
-    for _ in 0..3 {
-        hx_server::processing::schedule(&f.store).await.unwrap();
-    }
-    let r = f
-        .store
-        .job_states()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|j| j.output_key == format!("compile:{}", w.start))
-        .unwrap();
-    assert_eq!(r.state, "ready");
-    assert_eq!(r.attempts, 0);
-    let dirty = f.store.window_state(w).await.unwrap().dirty;
-    assert!(dirty);
+    hx_server::processing::schedule(&f.store).await.unwrap();
+    assert_eq!(
+        f.store
+            .job_states()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.output_key == key)
+            .unwrap()
+            .state,
+        "ready"
+    );
     f.close().await;
+}
+#[tokio::test]
+async fn exhausted_compile_stops_after_three_revivals_per_generation() {
+    assert_revival_cap("compile").await;
 }
 struct Fails;
 impl hx_interpret::Provider for Fails {
@@ -66,81 +109,8 @@ impl hx_interpret::Provider for Fails {
     }
 }
 #[tokio::test]
-async fn exhausted_interpretations_recover_without_new_input() {
-    let f = Fixture::new().await;
-    let w = window();
-    ingest(&f.store, vec![event("synthetic-input", 8)]).await;
-    f.store.normalize_window(w).await.unwrap();
-    // Complete the ingest-created normalization slot before testing other jobs.
-    let n = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
-    hx_jobs::finish(&f.store.pool, &n, None).await.unwrap();
-    let g = f.store.generation(w).await.unwrap();
-    f.store.request_work("compile", w, g).await.unwrap();
-    let runner = hx_server::processing::Runner {
-        store: f.store.clone(),
-        provider: Fails,
-    };
-    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
-    f.store.settle_inputs().await.unwrap();
-    for _ in 0..10 {
-        f.store
-            .make_jobs_due("ready", Some("interpret"))
-            .await
-            .unwrap();
-        assert!(hx_jobs::run_one(&f.store.pool, &runner).await.is_err());
-    }
-    hx_server::processing::schedule(&f.store).await.unwrap();
-    let state = f
-        .store
-        .job_states()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|j| j.state == "failed")
-        .unwrap()
-        .state;
-    assert_eq!(state, "failed");
-    f.store.make_jobs_due("failed", None).await.unwrap();
-    for _ in 0..3 {
-        hx_server::processing::schedule(&f.store).await.unwrap();
-    }
-    let failed = f
-        .store
-        .job_states()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|j| j.kind == "interpret" && j.state == "failed" && j.attempts == 5)
-        .count();
-    assert_eq!(failed, 0);
-    let compile = f
-        .store
-        .job_states()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|j| j.output_key == format!("compile:{}", w.start))
-        .unwrap()
-        .state;
-    assert_eq!(compile, "done");
-    let r = f.store.window_state(w).await.unwrap();
-    assert!(!r.dirty);
-    assert!(r.canonical_revision.is_none());
-    let recovered = hx_server::processing::Runner {
-        store: f.store.clone(),
-        provider: hx_server::processing::StubProvider,
-    };
-    let mut canonical: Option<i64> = None;
-    // The scheduler also creates the previous bucket; allow its compile to run.
-    for _ in 0..4 {
-        assert!(hx_jobs::run_one(&f.store.pool, &recovered).await.unwrap());
-        canonical = f.store.window_state(w).await.unwrap().canonical_revision;
-        if canonical.is_some() {
-            break;
-        }
-    }
-    assert!(canonical.is_some());
-    f.close().await;
+async fn exhausted_interpretations_stop_after_three_revivals_per_generation() {
+    assert_revival_cap("interpret").await;
 }
 #[tokio::test]
 async fn workers_serialize_jobs_for_the_same_window() {
