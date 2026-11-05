@@ -953,8 +953,8 @@ mod tests {
                     let manifest = Selection::from_env().unwrap().input_manifest(window, "synthetic-hash", 7, &policy, sensitive, &namespaces);
                     assert_eq!(serde_json::to_vec(&manifest).unwrap(), serde_json::to_vec(&legacy).unwrap());
                 }
-                let pool = sqlx::postgres::PgPoolOptions::new()
-                    .connect_lazy("postgres://hx:hx@localhost:55432/hx")
+                let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                    .connect_lazy("sqlite:///nonexistent-fx-fixture.sqlite")
                     .unwrap();
                 let broker = Broker::new(
                     Store::new(pool, std::env::var_os("HOME").unwrap()),

@@ -1,9 +1,9 @@
 //! Explicit transactions for callers that must group writes atomically.
 use super::*;
-pub struct StoreTransaction(pub(crate) sqlx::Transaction<'static, sqlx::Postgres>);
+pub struct StoreTransaction(pub(crate) WriteTransaction);
 impl Store {
     pub async fn transaction(&self) -> Result<StoreTransaction> {
-        Ok(StoreTransaction(self.pool.begin().await?))
+        Ok(StoreTransaction(self.begin_write().await?))
     }
 }
 impl StoreTransaction {
@@ -23,8 +23,8 @@ impl StoreTransaction {
         backfill: bool,
         at: DateTime<Utc>,
     ) -> Result<()> {
-        sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue,available_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(output_key) DO NOTHING")
-        .bind(key).bind(kind).bind(payload).bind(if backfill {"backfill"} else {"interactive"}).bind(at).execute(&mut *self.0).await?;
+        sqlx::query("INSERT INTO jobs(output_key,kind,payload,queue,available_at,window_start,generation) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(output_key) DO NOTHING")
+        .bind(key).bind(kind).bind(stored_json(payload.clone())).bind(if backfill {"backfill"} else {"interactive"}).bind(Ts::from(at)).bind(job_window_start(&payload)?).bind(payload["generation"].as_i64()).execute(&mut *self.0).await?;
         Ok(())
     }
 }

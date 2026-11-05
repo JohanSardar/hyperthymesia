@@ -21,7 +21,6 @@ with tempfile.TemporaryDirectory(prefix="hx-synthetic-tests-") as root:
     environment["HX_FIXTURE_KEY_FILE"] = str(key)
     environment["HOME"] = root
     environment.pop("DATABASE_URL", None)
-    database = environment.get("HX_TEST_DATABASE_URL", "")
-    if not database or any(part in database for part in ("hx_e2e", "hx-e2e")):
-        sys.exit("Set HX_TEST_DATABASE_URL to your own synthetic scratch database")
+    environment.pop("HX_TEST_DATABASE_URL", None)
+    environment.pop("HX_STATE_DIR", None)
     sys.exit(subprocess.run(sys.argv[1:], env=environment, check=False).returncode)

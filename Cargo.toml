@@ -33,7 +33,7 @@ ulid = { version = "3", features = ["serde"] }
 schemars = { version = "1", features = ["chrono04"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "json", "chrono", "macros", "migrate"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "json", "macros", "migrate"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 maud = { version = "0.27", features = ["axum"] }
