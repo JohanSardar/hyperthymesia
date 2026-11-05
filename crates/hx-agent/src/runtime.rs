@@ -73,6 +73,14 @@ pub(crate) fn screen_warning(health: Option<&serde_json::Value>, paused: bool) -
         _ => None,
     }
 }
+fn upload_warning(health: &serde_json::Value) -> Option<String> {
+    match health["upload"]["dropped"].as_u64()? {
+        0 => None,
+        n => Some(format!(
+            "The server refused {n} records. They are saved on this Mac."
+        )),
+    }
+}
 fn save_health(
     dir: &std::path::Path,
     latest: &serde_json::Map<String, serde_json::Value>,
@@ -405,6 +413,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     let mut last_permissions = hx_macos_sys::permissions();
     let mut menu_health_check = Instant::now() - Duration::from_secs(1);
     let mut menu_health = None;
+    let mut menu_upload = None;
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed)
             && options
@@ -421,9 +430,15 @@ pub fn run(options: RunOptions) -> Result<()> {
             if let Some(menu) = &mut menu {
                 if menu_health_check.elapsed() >= Duration::from_secs(1) {
                     menu_health = live_media_health.lock().expect("screen health").clone();
+                    menu_upload = std::fs::read(support_dir().join("health.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        .as_ref()
+                        .and_then(upload_warning);
                     menu_health_check = Instant::now();
                 }
-                let warning = screen_warning(menu_health.as_ref(), paused.load(Ordering::Relaxed));
+                let warning = screen_warning(menu_health.as_ref(), paused.load(Ordering::Relaxed))
+                    .or_else(|| menu_upload.clone());
                 menu.update(warning.as_deref());
             }
             let mut changed = ax_observer.as_ref().is_some_and(|o| o.take_changed());
