@@ -362,6 +362,9 @@ pub(crate) async fn interpret_window_with_settle(
     config: &Config,
     primary: bool,
 ) -> Result<bool> {
+    if !crate::processing::admit_visible_window(store, window).await? {
+        return Ok(false);
+    }
     let guard = crate::processing::interpretation_guard(store, window).await?;
     // Roll back explicitly: a dropped transaction releases the advisory lock only
     // when the pool later reuses its connection, so an immediate rerun saw it held.

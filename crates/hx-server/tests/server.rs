@@ -1134,7 +1134,18 @@ async fn synthetic_burst(browser_points: bool) {
         .unwrap();
     assert_eq!(unfinished, 0);
     let canonical: i64 = sqlx::query_scalar("SELECT count(*) FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE r.input_generation=w.generation").fetch_one(&f.store.pool).await.unwrap();
-    assert_eq!(canonical, 7);
+    assert_eq!(
+        canonical, 6,
+        "the context-only seventh window does not buy an interpretation"
+    );
+    hx_server::processing::schedule(&f.store).await.unwrap();
+    while hx_jobs::run_one(&f.store.pool, &runner).await.unwrap() {
+        settle_for_test(&f.store).await;
+    }
+    let tail = hx_store::window_at(event("tail", 0).time.observed_at + Duration::days(1));
+    let state = f.store.window_state(tail).await.unwrap();
+    assert!(state.canonical_revision.is_none());
+    assert!(!state.dirty);
     eprintln!("normalize+compile={normalized_compiled:?}");
     let stale: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM windows WHERE compiled_generation IS DISTINCT FROM generation",
@@ -1220,6 +1231,8 @@ async fn coalesced_work_keeps_leases_and_requeues_new_input() {
 async fn pending_overlap_defers_interpretation_without_spending_attempts() {
     let f = Fixture::new().await;
     let w = hx_store::window_at(event("target", 8).time.observed_at);
+    ingest(&f.store, vec![event("target-visible", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
     let mut e = event("overlap", 7);
     e.time = ObservationTime::point(e.time.observed_at + Duration::minutes(45));
     ingest(&f.store, vec![e]).await;

@@ -99,6 +99,39 @@ pub async fn compile_window(store: &Store, w: Interval) -> Result<(Timeline, i64
     }
     Ok((timeline, generation))
 }
+/// Admission is based on the resolved in-window timeline and the same visible
+/// projection fx uses. Lead-in context and hidden/raw media cannot buy a run.
+pub(crate) async fn admit_visible_window(store: &Store, w: Interval) -> Result<bool> {
+    let (timeline, generation) = compile_window(store, w).await?;
+    let ids: std::collections::HashSet<_> = timeline
+        .lanes
+        .iter()
+        .flat_map(|l| &l.intervals)
+        .flat_map(|i| i.evidence.iter().copied())
+        .chain(timeline.points.iter().map(|p| p.evidence))
+        .chain(
+            timeline
+                .aggregates
+                .iter()
+                .flat_map(|a| a.evidence.iter().copied()),
+        )
+        .collect();
+    let broker = crate::mcp::Broker::new(
+        store.clone(),
+        DisclosurePolicy::from_env()?,
+        SensitiveEgress::from_env(),
+        w,
+    );
+    for o in store.observations(w, true).await? {
+        if ids.contains(&o.id) && !broker.project(o.id, &o.envelope).await?.is_empty() {
+            return Ok(true);
+        }
+    }
+    if !store.finish_empty(w, generation).await? {
+        return Err(Deferred::InputChanged.into());
+    }
+    Ok(false)
+}
 pub async fn interpret_window<P: Provider>(
     store: &Store,
     w: Interval,
@@ -123,6 +156,9 @@ async fn interpret_window_key<P: Provider>(
     primary: bool,
     output_key: &str,
 ) -> Result<bool> {
+    if !admit_visible_window(store, w).await? {
+        return Ok(false);
+    }
     if provider.tool_agent() {
         return crate::fx::interpret_window_with_settle(
             store,
@@ -368,6 +404,9 @@ impl<P: Provider> Handler for Runner<P> {
             }
             "compile" => {
                 let w: Interval = serde_json::from_value(job.payload["window"].clone())?;
+                if !admit_visible_window(&self.store, w).await? {
+                    return Ok(());
+                }
                 let (_, generation) = compile_window(&self.store, w).await?;
                 let mut tx = self.store.pool.begin().await?;
                 let changed: chrono::DateTime<Utc> =
@@ -430,7 +469,7 @@ pub async fn schedule(store: &Store) -> Result<()> {
     hx_jobs::revive_window_jobs(&store.pool).await?;
     let current = hx_store::window_at(Utc::now() - Duration::hours(4));
     store.generation(current).await?;
-    let rows=sqlx::query("SELECT start_at,end_at,generation FROM windows WHERE dirty OR (end_at<=now() AND canonical_revision IS NULL) ORDER BY start_at LIMIT 1000").fetch_all(&store.pool).await?;
+    let rows=sqlx::query("SELECT start_at,end_at,generation FROM windows WHERE dirty OR (end_at<=now() AND canonical_revision IS NULL AND empty_generation IS DISTINCT FROM generation) ORDER BY start_at LIMIT 1000").fetch_all(&store.pool).await?;
     let mut tx = store.pool.begin().await?;
     for r in rows {
         let w = Interval {

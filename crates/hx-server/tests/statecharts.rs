@@ -69,6 +69,11 @@ impl hx_interpret::Provider for Fails {
 async fn exhausted_interpretations_recover_without_new_input() {
     let f = Fixture::new().await;
     let w = window();
+    ingest(&f.store, vec![event("synthetic-input", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
+    // Complete the ingest-created normalization slot before testing other jobs.
+    let n = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    hx_jobs::finish(&f.store.pool, &n, None).await.unwrap();
     let g = f.store.generation(w).await.unwrap();
     f.store.request_work("compile", w, g).await.unwrap();
     let runner = hx_server::processing::Runner {
@@ -141,6 +146,11 @@ async fn exhausted_interpretations_recover_without_new_input() {
 async fn workers_serialize_jobs_for_the_same_window() {
     let f = Fixture::new().await;
     let w = window();
+    ingest(&f.store, vec![event("synthetic-input", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
+    // Complete the ingest-created normalization slot before testing other jobs.
+    let n = hx_jobs::claim(&f.store.pool, 120).await.unwrap().unwrap();
+    hx_jobs::finish(&f.store.pool, &n, None).await.unwrap();
     let g = f.store.generation(w).await.unwrap();
     f.store.request_work("compile", w, g).await.unwrap();
     let runner = hx_server::processing::Runner {
@@ -533,5 +543,64 @@ async fn batch_watermarks_keep_independent_maxima_and_ignore_duplicates() {
     let (through, sequence) = f.store.watermark("test:device").await.unwrap();
     assert_eq!(through, at);
     assert_eq!(sequence, "3");
+    f.close().await;
+}
+
+#[tokio::test]
+async fn empty_windows_finish_without_provider_and_reopen_on_data() {
+    let f = Fixture::new().await;
+    let w = window();
+    let runner = hx_server::processing::Runner {
+        store: f.store.clone(),
+        provider: Fails,
+    };
+    let g = f.store.generation(w).await.unwrap();
+    f.store.request_work("compile", w, g).await.unwrap();
+    assert!(hx_jobs::run_one(&f.store.pool, &runner).await.unwrap());
+    assert!(
+        !hx_server::processing::interpret_window(&f.store, w, &Fails)
+            .await
+            .unwrap()
+    );
+    let invalid_fx = hx_server::fx::Config {
+        binary: "/nonexistent/synthetic-fx".into(),
+        credential: "/nonexistent/synthetic-auth".into(),
+        timeout: std::time::Duration::from_secs(1),
+        max_steps: 2,
+    };
+    assert!(
+        !hx_server::fx::interpret_window(&f.store, w, "empty-fx", &invalid_fx)
+            .await
+            .unwrap()
+    );
+    for _ in 0..3 {
+        hx_server::processing::schedule(&f.store).await.unwrap();
+    }
+    assert!(
+        f.store
+            .job_states()
+            .await
+            .unwrap()
+            .iter()
+            .all(|j| j.kind != "interpret")
+    );
+    assert!(!f.store.window_state(w).await.unwrap().dirty);
+    let mut hidden = event("hidden", 8);
+    hidden.sensitivity = Sensitivity::Restricted;
+    ingest(&f.store, vec![hidden]).await;
+    f.store.normalize_window(w).await.unwrap();
+    assert!(
+        !hx_server::processing::interpret_window(&f.store, w, &Fails)
+            .await
+            .unwrap()
+    );
+    ingest(&f.store, vec![event("arrived", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
+    assert!(f.store.window_state(w).await.unwrap().generation > g);
+    assert!(
+        hx_server::processing::interpret_window(&f.store, w, &hx_server::processing::StubProvider)
+            .await
+            .unwrap()
+    );
     f.close().await;
 }
