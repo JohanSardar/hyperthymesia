@@ -226,3 +226,28 @@ async fn reupload_during_gc_keeps_its_file_and_does_not_wait_for_other_blobs() {
         "same-blob GC and re-upload must serialize"
     );
 }
+
+// A 200 tells the client it may discard its copy, so it has to mean the file is
+// there and will stay for a full retention period.
+#[tokio::test]
+async fn reupload_restores_a_missing_file_and_restarts_retention() {
+    let f = test_support::Fixture::new().await;
+    let bytes = b"synthetic chunk";
+    let sha = hash(bytes);
+    let path = f.store.blob_path(&sha).unwrap();
+    assert!(f.store.upload_blob(&sha, bytes).await.unwrap());
+
+    // What a gc crash between its unlink and its commit leaves behind.
+    std::fs::remove_file(&path).unwrap();
+    f.store.upload_blob(&sha, bytes).await.unwrap();
+    assert!(path.exists(), "upload acknowledged a blob with no file");
+
+    sqlx::query("UPDATE blobs SET created_at=now()-interval '31 days' WHERE sha256=$1")
+        .bind(&sha)
+        .execute(&f.store.pool)
+        .await
+        .unwrap();
+    assert!(!f.store.upload_blob(&sha, bytes).await.unwrap());
+    assert_eq!(f.store.gc().await.unwrap(), 0);
+    assert!(path.exists(), "gc deleted a blob that was just re-uploaded");
+}

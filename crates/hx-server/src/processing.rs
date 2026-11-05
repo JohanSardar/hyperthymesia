@@ -522,8 +522,8 @@ fn interpret_settle_s() -> i64 {
         .unwrap_or(600)
 }
 
-// A transaction-scoped lock serializes manual runs and lease recovery as well as
-// queue workers. Dropping/cancelling the future releases it, including on crashes.
+// A file lock under the data dir serializes manual runs and lease recovery as well
+// as queue workers. Dropping/cancelling the future releases it, including on crashes.
 pub(crate) async fn interpretation_guard(
     store: &Store,
     window: Interval,
