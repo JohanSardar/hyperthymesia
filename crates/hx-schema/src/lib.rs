@@ -202,6 +202,32 @@ pub struct UploadAck {
     pub rejected: Vec<Rejected>,
 }
 
+impl UploadAck {
+    /// Only a complete, unambiguous acknowledgement can release local data.
+    pub fn validate_for(&self, batch: &UploadBatch) -> Result<(), &'static str> {
+        if self.batch_id != batch.batch_id
+            || u64::from(self.accepted) + u64::from(self.duplicates) + self.rejected.len() as u64
+                != batch.envelopes.len() as u64
+        {
+            return Err("incomplete or mismatched upload acknowledgement");
+        }
+        let mut refused = std::collections::HashSet::new();
+        for rejection in &self.rejected {
+            if !refused.insert(rejection.observation_id)
+                || batch
+                    .envelopes
+                    .iter()
+                    .filter(|e| e.observation_id == rejection.observation_id)
+                    .count()
+                    != 1
+            {
+                return Err("unknown or duplicate rejected observation");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Rejected {
     pub observation_id: ObservationId,
