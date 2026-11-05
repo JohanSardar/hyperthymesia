@@ -716,6 +716,14 @@ fn citation_support(
         );
     }
     for o in observations {
+        // Match the broker's EvidenceItem timestamp, including sources with no
+        // declared time. An omitted map entry must not borrow another citation's time.
+        let at = o
+            .envelope
+            .time
+            .source_start
+            .unwrap_or(o.envelope.time.observed_at);
+        add(o.id, Interval { start: at, end: at });
         if let (Some(start), Some(end)) = (o.envelope.time.source_start, o.envelope.time.source_end)
             && start <= end
         {
@@ -799,6 +807,25 @@ mod tests {
         };
         assert!(support[&7].contains(&declared), "{:?}", support[&7]);
         assert!(support[&7].iter().all(|s| s.start >= window.start));
+
+        // With no declared time and no compiled span, keep the broker's
+        // observed_at point. This must not acquire a duration or use received_at.
+        let mut untimed = observations[0].clone();
+        untimed.id = 8;
+        untimed.envelope.time.source_start = None;
+        untimed.envelope.time.source_end = None;
+        untimed.envelope.time.mono_start = None;
+        untimed.envelope.time.mono_end = None;
+        let support = citation_support(&timeline, std::slice::from_ref(&untimed), window);
+        assert_eq!(
+            support[&8],
+            vec![Interval {
+                start: untimed.envelope.time.observed_at,
+                end: untimed.envelope.time.observed_at,
+            }]
+        );
+        untimed.envelope.time.observed_at = window.start - chrono::Duration::seconds(1);
+        assert!(!citation_support(&timeline, &[untimed], window).contains_key(&8));
     }
     #[test]
     fn isolated_credential_refresh_survives_cleanup_and_serializes_jobs() {
