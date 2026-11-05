@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
 
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(180);
-pub const MAX_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1_000;
+pub const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -42,6 +42,7 @@ pub enum McpTransport {
 #[derive(Clone, Copy, Default)]
 pub struct Placeholders<'a> {
     pub key: Option<&'a str>,
+    /// Opaque token, or an absolute next-link URL on the template's literal origin.
     pub cursor: Option<&'a str>,
 }
 
@@ -97,12 +98,12 @@ impl Request {
         }
         let method =
             reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| RequestError::Invalid)?;
-        let url =
-            reqwest::Url::parse(&substitute(url, values)?).map_err(|_| RequestError::Invalid)?;
-        if !matches!(url.scheme(), "http" | "https") {
+        if !matches!(method, reqwest::Method::GET | reqwest::Method::POST) {
             return Err(RequestError::Invalid);
         }
+        let url = substitute_url(url, values)?;
         let client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .timeout(timeout.min(MAX_TIMEOUT))
@@ -110,7 +111,11 @@ impl Request {
             .map_err(|_| RequestError::Invalid)?;
         let mut request = client.request(method, url);
         for (name, value) in headers {
-            request = request.header(name, substitute(value, values)?);
+            let value = substitute(value, values)?;
+            if name.chars().any(char::is_control) || value.chars().any(char::is_control) {
+                return Err(RequestError::Invalid);
+            }
+            request = request.header(name, value);
         }
         if let Some(body) = body {
             request = request.json(&substitute_json(body, values)?);
@@ -142,6 +147,70 @@ impl Request {
         }
         serde_json::from_slice(&bytes).map_err(|_| RequestError::Json)
     }
+}
+
+/// Pin the unexpanded authority before any response or credential is substituted.
+/// An absolute cursor is a next-link URL; ordinary cursor/key values are URL data.
+fn substitute_url(template: &str, values: Placeholders<'_>) -> Result<reqwest::Url, RequestError> {
+    let (_, rest) = template.split_once("://").ok_or(RequestError::Invalid)?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .ok_or(RequestError::Invalid)?;
+    if authority.is_empty()
+        || authority.contains(['{', '}', '@', '\\'])
+        || template
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(RequestError::Invalid);
+    }
+    let pinned = reqwest::Url::parse(template).map_err(|_| RequestError::Invalid)?;
+    if !matches!(pinned.scheme(), "http" | "https") || pinned.host_str().is_none() {
+        return Err(RequestError::Invalid);
+    }
+    let url = if let Some(cursor) = values.cursor.filter(|_| template.contains("{{cursor}}"))
+        && (cursor.contains("://") || cursor.starts_with("//"))
+    {
+        // Reject scheme-relative links too: next links must state their scheme.
+        reqwest::Url::parse(cursor).map_err(|_| RequestError::Invalid)?
+    } else {
+        let key = values.key.map(encode_url_value);
+        let cursor = values.cursor.map(encode_url_value);
+        let expanded = substitute(
+            template,
+            Placeholders {
+                key: key.as_deref(),
+                cursor: cursor.as_deref(),
+            },
+        )?;
+        reqwest::Url::parse(&expanded).map_err(|_| RequestError::Invalid)?
+    };
+    if url.scheme() != pinned.scheme()
+        || url.host_str() != pinned.host_str()
+        || url.port_or_known_default() != pinned.port_or_known_default()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(RequestError::Invalid);
+    }
+    Ok(url)
+}
+
+/// Encode every byte except RFC 3986 unreserved bytes, regardless of URL position.
+fn encode_url_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    out
 }
 
 /// A single pass keeps credential bytes such as `{{cursor}}` literal. Substitute
@@ -236,6 +305,189 @@ mod tests {
             url,
             headers: BTreeMap::new(),
             body: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_cannot_send_credentials_to_a_second_origin() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let other = fixture(Router::new().fallback(any(move || {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Json(json!({}))
+            }
+        })))
+        .await;
+        let next_link = format!("{}/next", other.url);
+        let home = fixture(Router::new().route(
+            "/",
+            any(move || {
+                let next = next_link.clone();
+                async move { Json(json!({"next": next})) }
+            }),
+        ))
+        .await;
+        let response = request(format!("{}/", home.url))
+            .execute_http(Placeholders::default(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let cursor = response["next"].as_str().unwrap();
+        let injected_authority = format!("@{}/next", other.url.strip_prefix("http://").unwrap());
+        let mut results = Vec::new();
+        for (template, cursor) in [
+            ("{{cursor}}".to_owned(), cursor),
+            (
+                format!("{}{{{{cursor}}}}", home.url),
+                injected_authority.as_str(),
+            ),
+            (format!("{}/?cursor={{{{cursor}}}}", home.url), cursor),
+            (format!("{}/{{{{cursor}}}}", home.url), cursor),
+        ] {
+            let mut req = request(template);
+            if let Request::Http { headers, .. } = &mut req {
+                headers.insert("authorization".into(), "Bearer {{key}}".into());
+            }
+            results.push(
+                req.execute_http(
+                    Placeholders {
+                        key: Some("synthetic-key"),
+                        cursor: Some(cursor),
+                    },
+                    Duration::from_secs(2),
+                )
+                .await,
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "credentials must never reach the second server"
+        );
+        assert!(results.iter().all(|r| *r == Err(RequestError::Invalid)));
+
+        for next in [
+            home.url.replacen("http://", "https://", 1),
+            home.url.replacen("127.0.0.1", "localhost", 1),
+        ] {
+            assert_eq!(
+                substitute_url(
+                    &format!("{}/{{{{cursor}}}}", home.url),
+                    Placeholders {
+                        key: None,
+                        cursor: Some(&next)
+                    }
+                ),
+                Err(RequestError::Invalid)
+            );
+        }
+        let echo = fixture(Router::new().route(
+            "/",
+            any(|uri: OriginalUri| async move { Json(json!({"query":uri.query()})) }),
+        ))
+        .await;
+        let result = request(format!(
+            "{}/?cursor={{{{cursor}}}}&key={{{{key}}}}",
+            echo.url
+        ))
+        .execute_http(
+            Placeholders {
+                key: Some("ab#c&d e"),
+                cursor: Some("x&admin=1#frag"),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result["query"],
+            "cursor=x%26admin%3D1%23frag&key=ab%23c%26d%20e"
+        );
+        let result = request(format!("{}/{{{{cursor}}}}", echo.url))
+            .execute_http(
+                Placeholders {
+                    key: None,
+                    cursor: Some(&format!("{}/?safe=yes", echo.url)),
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result["query"], "safe=yes",
+            "same-origin next links remain usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_budget_is_eight_mebibytes_for_fixed_and_streaming_bodies() {
+        let fixed = unfinished_response(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            8 * 1024 * 1024 + 1
+        ))
+        .await;
+        assert_eq!(
+            request(fixed.url.clone())
+                .execute_http(Placeholders::default(), Duration::from_secs(2))
+                .await,
+            Err(RequestError::TooLarge)
+        );
+        let streaming = fixture(Router::new().route(
+            "/",
+            any(|| async {
+                let chunks = futures_util::stream::iter((0..9).map(|_| {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b' '; 1024 * 1024]))
+                }));
+                axum::body::Body::from_stream(chunks)
+            }),
+        ))
+        .await;
+        assert_eq!(
+            request(format!("{}/", streaming.url))
+                .execute_http(Placeholders::default(), Duration::from_secs(2))
+                .await,
+            Err(RequestError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_get_post_and_control_free_headers_are_allowed() {
+        let server = fixture(Router::new().fallback(any(|| async { Json(json!({})) }))).await;
+        for method in [
+            "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+        ] {
+            let mut req = request(format!("{}/", server.url));
+            if let Request::Http { method: m, .. } = &mut req {
+                *m = method.into();
+            }
+            assert_eq!(
+                req.execute_http(Placeholders::default(), Duration::from_secs(2))
+                    .await,
+                Err(RequestError::Invalid),
+                "accepted {method}"
+            );
+        }
+        for control in ['\t', '\r', '\n', '\0', '\u{007f}'] {
+            let mut req = request(format!("{}/", server.url));
+            if let Request::Http { headers, .. } = &mut req {
+                headers.insert("authorization".into(), "Bearer {{key}}".into());
+            }
+            assert_eq!(
+                req.execute_http(
+                    Placeholders {
+                        key: Some(&format!("made-up{control}key")),
+                        cursor: None
+                    },
+                    Duration::from_secs(2)
+                )
+                .await,
+                Err(RequestError::Invalid)
+            );
         }
     }
 

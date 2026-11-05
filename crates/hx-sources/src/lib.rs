@@ -1,4 +1,4 @@
-//! Connected-source keys, scrubbing, requests and pull recipes. No storage or paid calls.
+//! Connected-source keys, scrubbing, requests and pull recipes. No database or paid calls.
 
 pub mod keys;
 pub mod recipe;
