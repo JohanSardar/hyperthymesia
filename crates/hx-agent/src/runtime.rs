@@ -148,6 +148,25 @@ fn socket_listener(
         let _ = std::fs::remove_file(path);
     }))
 }
+/// Apps such as Chrome answer accessibility queries slowly while busy.
+const TITLE_WAIT: Duration = Duration::from_millis(75);
+const TITLE_WAIT_ON_SWITCH: Duration = Duration::from_millis(300);
+
+/// A slow answer keeps the open window's last title instead of recording a
+/// blank one, which would also split one visit into many untitled spans.
+fn resolve_title(
+    answer: Option<Option<String>>,
+    current: &Focus,
+    previous: Option<&Focus>,
+) -> Option<String> {
+    match answer {
+        Some(title) => title,
+        None => previous
+            .filter(|p| p.pid == current.pid && p.bundle_id == current.bundle_id)
+            .and_then(|p| p.title.clone()),
+    }
+}
+
 fn focus_payload(focus: &Focus, allowed: bool) -> CorePayload {
     CorePayload::FocusSpan(FocusSpan {
         app_bundle_id: if allowed {
@@ -363,7 +382,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                     NativeEvent::Activation => {
                         changed = true;
                         if let Some(mut activated) = signal.focus {
-                            activated.title = ax.title(&activated);
+                            activated.title = ax.title(&activated, TITLE_WAIT_ON_SWITCH).flatten();
                             if let Some(span) = focus_span.take() {
                                 emit(
                                     close_span_at(&span, &mut producer, event_time.clone()),
@@ -459,7 +478,7 @@ pub fn run(options: RunOptions) -> Result<()> {
             if tick || changed {
                 let mut current = hx_macos_sys::frontmost();
                 if let Some(f) = current.as_mut() {
-                    f.title = ax.title(f);
+                    f.title = resolve_title(ax.title(f, TITLE_WAIT), f, focus.as_ref());
                 }
                 if current != focus {
                     if current.is_none()
@@ -794,6 +813,37 @@ pub fn run(options: RunOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_slow_title_answer_keeps_the_open_windows_title() {
+        let window = |pid, title: Option<&str>| Focus {
+            bundle_id: "com.example.browser".into(),
+            name: "Synthetic Browser".into(),
+            pid,
+            title: title.map(Into::into),
+            electron: false,
+        };
+        let open = window(7, Some("Synthetic page"));
+        assert_eq!(
+            resolve_title(None, &window(7, None), Some(&open)).as_deref(),
+            Some("Synthetic page")
+        );
+        // A real answer wins, including a window that truly has no title.
+        assert_eq!(
+            resolve_title(Some(None), &window(7, None), Some(&open)),
+            None
+        );
+        assert_eq!(
+            resolve_title(
+                Some(Some("Next page".into())),
+                &window(7, None),
+                Some(&open)
+            )
+            .as_deref(),
+            Some("Next page")
+        );
+        // Another process never inherits the previous title.
+        assert_eq!(resolve_title(None, &window(8, None), Some(&open)), None);
+    }
     #[test]
     fn open_span_revision_closes_in_native_clock_domain() {
         let mut p = Producer::new("test".into()).unwrap();

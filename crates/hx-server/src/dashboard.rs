@@ -15,61 +15,170 @@ fn shell(title: &str, body: Markup) -> Html<String> {
     Html(html!{(DOCTYPE) html {head { meta charset="utf-8"; meta name="viewport" content="width=device-width, initial-scale=1";
         meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'";
         title {(title)}
-        style {"body{font:16px system-ui;background:#10151e;color:#e8edf5;margin:2rem}a{color:#8fd3ff}.lane{margin:1rem 0}.track{height:2.5rem;background:#253143;position:relative;overflow:hidden}.bar{position:absolute;background:#255b87;height:100%;white-space:nowrap;overflow:hidden;font-size:12px;color:white}.axis{display:flex;justify-content:space-between}pre{white-space:pre-wrap;overflow-wrap:anywhere}.zoom:target .track{height:5rem}table{border-spacing:1rem .4rem}input{font:inherit}img{max-width:480px}"}
-    } body {nav {a href="/" {"Today"} " · " a href="#lanes" {"Lanes"} " · " a href="#episodes" {"Episodes"} " · " a href="#tasks" {"Tasks"}}
+        style {"body{font:16px system-ui;background:#10151e;color:#e8edf5;margin:2rem}a{color:#8fd3ff}.lane{margin:1rem 0}.entry{display:flex;gap:1rem;margin:.6rem 0}.when{font-variant-numeric:tabular-nums;color:#9fb0c8;min-width:7.5rem}.desc{margin:.2rem 0;color:#b9c6d8;font-size:14px}.summary{color:#cfd8e6}summary{cursor:pointer;margin:1rem 0}.track{height:2.5rem;background:#253143;position:relative;overflow:hidden}.bar{position:absolute;background:#255b87;height:100%;white-space:nowrap;overflow:hidden;font-size:12px;color:white}.axis{display:flex;justify-content:space-between}pre{white-space:pre-wrap;overflow-wrap:anywhere}.zoom:target .track{height:5rem}table{border-spacing:1rem .4rem}input{font:inherit}img{max-width:480px}"}
+    } body {nav {a href="/" {"Today"} " · " a href="#episodes" {"What you did"} " · " a href="#tasks" {"Tasks"} " · " a href="#lanes" {"Lanes"}}
         (body)
     }}}.into_string())
 }
+/// One episode or task shown in the owner's local time.
+struct Entry<'a> {
+    start: chrono::DateTime<chrono::FixedOffset>,
+    end: chrono::DateTime<chrono::FixedOffset>,
+    title: &'a str,
+    description: &'a str,
+    evidence: Option<i64>,
+}
+
+fn entries<'a>(
+    revisions: &'a [serde_json::Value],
+    level: &str,
+    day: Interval,
+    zone: chrono::FixedOffset,
+) -> Vec<Entry<'a>> {
+    let mut out: Vec<Entry> = revisions
+        .iter()
+        .flat_map(|r| r["interpretation"][level].as_array().into_iter().flatten())
+        .filter_map(|item| {
+            let intervals: Vec<Interval> =
+                serde_json::from_value(item["intervals"].clone()).ok()?;
+            let start = intervals.iter().map(|i| i.start).min()?;
+            let end = intervals.iter().map(|i| i.end).max()?;
+            (start < day.end && end > day.start).then(|| Entry {
+                start: start.with_timezone(&zone),
+                end: end.with_timezone(&zone),
+                title: item["title"].as_str().unwrap_or(""),
+                description: item["description"].as_str().unwrap_or(""),
+                evidence: item["evidence"][0].as_i64(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|e| e.start);
+    out
+}
+
+fn zone_label(zone: chrono::FixedOffset) -> String {
+    let minutes = zone.local_minus_utc() / 60;
+    let sign = if minutes < 0 { '−' } else { '+' };
+    format!(
+        "UTC{sign}{:02}:{:02}",
+        minutes.abs() / 60,
+        minutes.abs() % 60
+    )
+}
+
 pub fn render_day(
     timeline: &Timeline,
     revisions: &[serde_json::Value],
     results: &[serde_json::Value],
+    zone: chrono::FixedOffset,
 ) -> Html<String> {
     let width = timeline.window.len().num_milliseconds().max(1) as f64;
+    let local_start = timeline.window.start.with_timezone(&zone);
+    let episodes = entries(revisions, "episodes", timeline.window, zone);
+    let tasks = entries(revisions, "tasks", timeline.window, zone);
     shell(
         "Hyperthymesia day",
         html! {
-            h1 {"Day " (timeline.window.start.date_naive()) " (UTC)"}
-            p {"Observed lanes retain short switches. Gaps are unknown, not idle."}
+            h1 {(local_start.format("%A, %B %-d, %Y")) " " small {"(" (zone_label(zone)) ")"}}
             form method="get" {input name="q" placeholder="Search captured text"; button type="submit" {"Search"}}
             @for result in results {p {a href=(format!("/evidence/{}",result["id"])) {(result["text"].as_str().unwrap_or(""))}}}
-            section id="lanes" class="zoom" {h2 {"Device and source lanes"}
+            @for revision in revisions {
+                @if let Some(summary) = revision["interpretation"]["summary"].as_str().filter(|s| !s.is_empty()) {
+                    @if let (Ok(start), Ok(end)) = (
+                        serde_json::from_value::<chrono::DateTime<Utc>>(revision["interpretation"]["window"]["start"].clone()),
+                        serde_json::from_value::<chrono::DateTime<Utc>>(revision["interpretation"]["window"]["end"].clone()),
+                    ) {
+                        p class="summary" {b {(start.with_timezone(&zone).format("%H:%M")) "–" (end.with_timezone(&zone).format("%H:%M")) " "} (summary)}
+                    }
+                }
+            }
+            section id="episodes" {h2 {"What you did"}
+                @if episodes.is_empty() {p {"No replica for this day yet."}}
+                @for e in &episodes {
+                    div class="entry" {
+                        span class="when" {(e.start.format("%H:%M")) "–" (e.end.format("%H:%M"))}
+                        div {
+                            @match e.evidence {
+                                Some(id) => a href=(format!("/evidence/{id}")) {(e.title)},
+                                None => b {(e.title)},
+                            }
+                            @if !e.description.is_empty() && e.description != e.title {p class="desc" {(e.description)}}
+                        }
+                    }
+                }
+            }
+            section id="tasks" {h2 {"Tasks"}
+                @for t in &tasks {
+                    div class="entry" {span class="when" {(t.start.format("%H:%M")) "–" (t.end.format("%H:%M"))} div {b {(t.title)}}}
+                }
+            }
+            details id="lanes" {summary {"Device and source lanes (raw capture; gaps are unknown, not idle)"}
                 div class="axis" {@for hour in (0..=24).step_by(2) {span {(format!("{hour:02}:00"))}}}
                 @for lane in &timeline.lanes {
                     div class="lane" {h3 {(&lane.id.key) " / " (&lane.id.kind)}
                         div class="track" {
-                            @for span in &lane.intervals {
+                            @for span in &coalesced(&lane.intervals) {
                                 @let left=((span.interval.start-timeline.window.start).num_milliseconds() as f64/width*100.0).clamp(0.0,100.0);
-                                @let size=(span.interval.len().num_milliseconds() as f64/width*100.0).clamp(0.05,100.0-left);
+                                @let size=(span.interval.len().num_milliseconds() as f64/width*100.0).max(0.05).min(100.0-left);
                                 a class="bar" style=(format!("left:{left}%;width:{size}%")) title=(&span.label)
                                     href=(span.evidence.first().map(|id|format!("/evidence/{id}")).unwrap_or_else(||"#lanes".into())) {(&span.label)}
                             }
                         }
                     }
                 }
-                @for point in &timeline.points {p {(point.at.format("%H:%M:%S")) " " a href=(format!("/evidence/{}",point.evidence)) {(&point.label)}}}
+                h3 {"Points"}
+                // Input buckets and health pings are already drawn as lanes.
+                @for point in timeline.points.iter().filter(|p| !matches!(p.kind.as_str(), "input.bucket" | "collector.health")) {p {(point.at.with_timezone(&zone).format("%H:%M:%S")) " " a href=(format!("/evidence/{}",point.evidence)) {(&point.label)}}}
                 h3 {"Coverage"}
                 @for span in &timeline.coverage {p {(&span.lane_key) " " (format!("{:?}",span.state)) " " (span.reason.as_deref().unwrap_or(""))}}
+                h3 {"Time per observed label"}
+                table {@for (label,duration) in hx_compile::exposure_by_label(timeline,"focus") {tr {td {(label)} td {(duration.num_seconds()) " s"}}}}
             }
-            h2 {"Time per observed label"}
-            table {@for (label,duration) in hx_compile::exposure_by_label(timeline,"focus") {tr {td {(label)} td {(duration.num_seconds()) " s"}}}}
-            @for level in ["episodes","tasks"] {
-                section id=(level) class="zoom" {h2 {(level)}
-                    @for revision in revisions {p {"Revision " (revision["revision_id"])}
-                        @if revision["has_agent_run"] == true {
-                            p {a href=(format!("/revision/{}/run",revision["revision_id"])) {"Agent tool-call log"}}
-                        }
-                        p {"Evidence: "
-                            @for id in crate::mcp::revision_evidence(&revision["interpretation"]) {
-                                a href=(if revision["has_agent_run"] == true {format!("/revision/{}/evidence/{id}",revision["revision_id"])} else {format!("/evidence/{id}")}) {(id)} " "
-                            }
-                        }
-                        pre {(serde_json::to_string_pretty(&revision["interpretation"][level]).unwrap_or_default())}
+            details {summary {"Replica revisions (raw)"}
+                @for revision in revisions {p {"Revision " (revision["revision_id"])}
+                    @if revision["has_agent_run"] == true {
+                        p {a href=(format!("/revision/{}/run",revision["revision_id"])) {"Agent tool-call log"}}
                     }
+                    p {"Evidence: "
+                        @for id in crate::mcp::revision_evidence(&revision["interpretation"]) {
+                            a href=(if revision["has_agent_run"] == true {format!("/revision/{}/evidence/{id}",revision["revision_id"])} else {format!("/evidence/{id}")}) {(id)} " "
+                        }
+                    }
+                    pre {(serde_json::to_string_pretty(&revision["interpretation"]).unwrap_or_default())}
                 }
             }
         },
     )
+}
+
+/// Touching spans with the same label drawn as one bar, linked to the first
+/// span's evidence. Only the picture is merged; lanes keep every span.
+fn coalesced(spans: &[hx_compile::LaneInterval]) -> Vec<hx_compile::LaneInterval> {
+    let mut out: Vec<hx_compile::LaneInterval> = Vec::new();
+    for span in spans {
+        match out.last_mut() {
+            Some(last)
+                if last.label == span.label
+                    && span.interval.start >= last.interval.start
+                    && span.interval.start - last.interval.end <= Duration::seconds(1) =>
+            {
+                last.interval.end = last.interval.end.max(span.interval.end);
+            }
+            _ => out.push(span.clone()),
+        }
+    }
+    out
+}
+
+/// The owner's current UTC offset, from the newest capture that recorded one.
+async fn owner_zone(store: &Store) -> ApiResult<chrono::FixedOffset> {
+    let minutes: Option<i32> = sqlx::query_scalar(
+        "SELECT (envelope->'time'->>'utc_offset_min')::int FROM events WHERE envelope->'time'->>'utc_offset_min' IS NOT NULL ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(&store.pool)
+    .await?;
+    let utc = chrono::FixedOffset::east_opt(0).expect("zero offset");
+    Ok(chrono::FixedOffset::east_opt(minutes.unwrap_or(0) * 60).unwrap_or(utc))
 }
 #[derive(Default, Deserialize)]
 pub struct DayQuery {
@@ -80,10 +189,11 @@ pub async fn today(
     headers: HeaderMap,
     Query(q): Query<DayQuery>,
 ) -> ApiResult<Html<String>> {
+    let zone = owner_zone(&store).await?;
     day(
         State(store),
         headers,
-        Path(Utc::now().date_naive().to_string()),
+        Path(Utc::now().with_timezone(&zone).date_naive().to_string()),
         Query(q),
     )
     .await
@@ -96,10 +206,14 @@ pub async fn day(
 ) -> ApiResult<Html<String>> {
     let token = auth(&store, &headers, "read_raw").await?;
     let date = NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(crate::bad)?;
+    let zone = owner_zone(&store).await?;
     let start = date
         .and_hms_opt(0, 0, 0)
         .ok_or(crate::bad("invalid day"))?
-        .and_utc();
+        .and_local_timezone(zone)
+        .single()
+        .ok_or(crate::bad("invalid day"))?
+        .with_timezone(&Utc);
     let w = Interval {
         start,
         end: start + Duration::days(1),
@@ -121,6 +235,7 @@ pub async fn day(
         &timeline,
         l3["revisions"].as_array().map(Vec::as_slice).unwrap_or(&[]),
         &results,
+        zone,
     ))
 }
 pub async fn evidence_page(
