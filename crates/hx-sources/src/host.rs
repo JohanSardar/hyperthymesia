@@ -68,104 +68,220 @@ impl HostRunner {
     /// We intentionally do not evaluate shell expansions, follow symlinks, or
     /// inspect scripts. The owner-facing UI must disclose this limitation.
     pub fn block_reason(&self, command: &str) -> Option<&'static str> {
-        let compact: String = command.chars().filter(|c| !c.is_whitespace()).collect();
-        if let Some((prefix, body)) = compact.split_once("(){") {
-            let name = prefix.rsplit([';', '&', '|']).next().unwrap_or(prefix);
-            if !name.is_empty() && body.contains(&format!("{name}|{name}&")) {
+        self.block_at(command, &self.work_dir, 0)
+    }
+
+    fn block_at(&self, source: &str, cwd: &Path, depth: usize) -> Option<&'static str> {
+        if depth > 16 {
+            return None;
+        }
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .ok()?;
+        let tree = parser.parse(source, None)?;
+        // Best-effort accident guard: unsupported or unparseable shell must run.
+        // Rejecting it would turn ordinary source commands into source failures.
+        if tree.root_node().has_error() {
+            return None;
+        }
+        self.inspect_node(tree.root_node(), source, &mut cwd.to_path_buf(), depth)
+    }
+
+    fn inspect_node(
+        &self,
+        node: tree_sitter::Node<'_>,
+        source: &str,
+        cwd: &mut PathBuf,
+        depth: usize,
+    ) -> Option<&'static str> {
+        // Heredoc contents are data, including text that looks like commands.
+        if matches!(
+            node.kind(),
+            "heredoc_body" | "heredoc_start" | "heredoc_end" | "comment"
+        ) {
+            return None;
+        }
+        if node.kind() == "function_definition" {
+            let name = node
+                .child_by_field_name("name")?
+                .utf8_text(source.as_bytes())
+                .ok()?;
+            let body = node
+                .child_by_field_name("body")?
+                .utf8_text(source.as_bytes())
+                .ok()?;
+            let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact.contains(&format!("{name}|{name}&")) {
                 return Some("fork bomb");
             }
         }
-        let segments = shell_segments(command);
-        for (index, segment) in segments.iter().enumerate() {
-            let Ok(words) = shell_words::split(segment) else {
-                return Some("unparseable shell command");
-            };
-            // Reject direct references to the state folder, including read and
-            // redirection targets. This is intentionally lexical, not a sandbox.
+        if node.kind() == "file_redirect" {
+            let destination = node.child_by_field_name("destination")?;
+            let path = self.resolve_path_at(&shell_word(destination, source), cwd);
+            if path.starts_with(self.absolute_path(&self.state_dir)) {
+                return Some("Hyperthymesia state folder");
+            }
+            let writes = node
+                .children(&mut node.walk())
+                .any(|child| matches!(child.kind(), ">" | ">>" | "&>" | "&>>" | ">|"));
+            let owner = node.parent().and_then(|parent| {
+                if parent.kind() == "command" {
+                    Some(parent)
+                } else {
+                    parent
+                        .child_by_field_name("body")
+                        .filter(|body| body.kind() == "command")
+                }
+            });
+            let dd_redirect = owner.is_some_and(|owner| {
+                let words = command_words(owner, source);
+                unwrap_command(&words)
+                    .first()
+                    .is_some_and(|name| program_name(name) == "dd")
+            }) && path.starts_with("/dev")
+                && !is_output_device(&path);
+            if writes && (is_disk(&path) || dd_redirect) {
+                return Some("write device");
+            }
+        }
+        if node.kind() == "variable_assignment"
+            && let Some(value) = node.child_by_field_name("value")
+        {
+            let value = shell_word(value, source);
+            if self
+                .resolve_path_at(&value, cwd)
+                .starts_with(self.absolute_path(&self.state_dir))
+            {
+                return Some("Hyperthymesia state folder");
+            }
+        }
+        if node.kind() == "command" {
+            let words = command_words(node, source);
             for word in &words {
-                let value = word.split_once('=').map_or(word.as_str(), |(_, v)| v);
+                let value = word
+                    .split_once('=')
+                    .map_or(word.as_str(), |(_, value)| value);
                 if self
-                    .resolve_path(value)
+                    .resolve_path_at(value, cwd)
                     .starts_with(self.absolute_path(&self.state_dir))
                 {
                     return Some("Hyperthymesia state folder");
                 }
             }
-            let mut args = words.as_slice();
-            while let Some(word) = args.first() {
-                if word.contains('=')
-                    || ["command", "exec", "sudo", "env"].contains(&word.as_str())
-                    || word.starts_with('-')
-                {
-                    args = &args[1..];
+            if let Some(reason) = self.inspect_command(&words, cwd, depth) {
+                return Some(reason);
+            }
+        }
+        // A cwd change in a subshell, pipeline or function must not leak into
+        // subsequent commands in its parent shell.
+        if matches!(
+            node.kind(),
+            "subshell"
+                | "command_substitution"
+                | "process_substitution"
+                | "function_definition"
+                | "pipeline"
+        ) {
+            let mut local = cwd.clone();
+            for child in node.named_children(&mut node.walk()) {
+                let mut child_cwd = local.clone();
+                let target = if node.kind() == "pipeline" {
+                    &mut child_cwd
                 } else {
-                    break;
+                    &mut local
+                };
+                if let Some(reason) = self.inspect_node(child, source, target, depth) {
+                    return Some(reason);
                 }
             }
-            let Some(program) = args
-                .first()
-                .and_then(|s| Path::new(s).file_name())
-                .and_then(|s| s.to_str())
-            else {
-                continue;
-            };
-            let args = &args[1..];
-            if program == "mkfs" || program.starts_with("mkfs.") {
-                return Some("format filesystem");
-            }
-            if ["shutdown", "reboot", "halt", "poweroff"].contains(&program) {
-                return Some("shutdown");
-            }
-            if program == "diskutil" && args.first().is_some_and(|s| s.starts_with("erase")) {
-                return Some("erase disk");
-            }
-            if program == "dd" {
-                let output_arg = args.iter().any(|s| {
-                    s.strip_prefix("of=")
-                        .is_some_and(|p| self.resolve_path(p).starts_with("/dev"))
-                });
-                let redirects = segments[index + 1..]
-                    .split(|s| matches!(*s, ";" | "&" | "|" | "\n"))
-                    .next()
-                    .unwrap_or_default();
-                let output_redirect = redirects.windows(2).any(|pair| {
-                    pair[0] == ">"
-                        && shell_words::split(pair[1])
-                            .ok()
-                            .and_then(|words| words.into_iter().next())
-                            .is_some_and(|p| self.resolve_path(&p).starts_with("/dev"))
-                });
-                if output_arg || output_redirect {
-                    return Some("write device");
-                }
-            }
-            if program == "rm" {
-                let flags = args
-                    .iter()
-                    .take_while(|s| s.as_str() != "--")
-                    .filter(|s| s.starts_with('-'))
-                    .collect::<Vec<_>>();
-                let recursive = flags.iter().any(|s| {
-                    s.as_str() == "--recursive" || (!s.starts_with("--") && s.contains(['r', 'R']))
-                });
-                let force = flags
-                    .iter()
-                    .any(|s| s.as_str() == "--force" || (!s.starts_with("--") && s.contains('f')));
-                if recursive
-                    && force
-                    && args.iter().filter(|s| !s.starts_with('-')).any(|s| {
-                        let path = self.resolve_path(s.trim_end_matches('*'));
-                        path == Path::new("/") || path == self.absolute_path(&self.home)
-                    })
-                {
-                    return Some("recursive removal of root or home");
+        } else {
+            for child in node.named_children(&mut node.walk()) {
+                if let Some(reason) = self.inspect_node(child, source, cwd, depth) {
+                    return Some(reason);
                 }
             }
         }
         None
     }
 
-    fn resolve_path(&self, value: &str) -> PathBuf {
+    fn inspect_command(
+        &self,
+        words: &[String],
+        cwd: &mut PathBuf,
+        depth: usize,
+    ) -> Option<&'static str> {
+        let words = unwrap_command(words);
+        let (program, args) = words.split_first()?;
+        let program = program_name(program);
+        if program == "mkfs" || program.starts_with("mkfs.") || program.starts_with("newfs_") {
+            return Some("format filesystem");
+        }
+        if ["shutdown", "reboot", "halt", "poweroff"].contains(&program) {
+            return Some("shutdown");
+        }
+        if program == "diskutil" {
+            let args = if args.first().is_some_and(|s| s == "quiet") {
+                &args[1..]
+            } else {
+                args
+            };
+            if args.first().is_some_and(|s| {
+                s.starts_with("erase")
+                    || ["secureErase", "reformat", "partitionDisk"].contains(&s.as_str())
+            }) || (args.first().is_some_and(|s| s == "apfs")
+                && args.get(1).is_some_and(|s| s == "deleteContainer"))
+            {
+                return Some("erase disk");
+            }
+        }
+        if program == "dd"
+            && args.iter().any(|s| {
+                s.strip_prefix("of=").is_some_and(|p| {
+                    let path = self.resolve_path_at(p, cwd);
+                    path.starts_with("/dev") && !is_output_device(&path)
+                })
+            })
+        {
+            return Some("write device");
+        }
+        if program == "rm" {
+            let flags: Vec<_> = args
+                .iter()
+                .take_while(|s| s.as_str() != "--")
+                .filter(|s| s.starts_with('-'))
+                .collect();
+            let recursive = flags.iter().any(|s| {
+                s.as_str() == "--recursive" || (!s.starts_with("--") && s.contains(['r', 'R']))
+            });
+            let force = flags
+                .iter()
+                .any(|s| s.as_str() == "--force" || (!s.starts_with("--") && s.contains('f')));
+            if recursive
+                && force
+                && args.iter().filter(|s| !s.starts_with('-')).any(|s| {
+                    let path = self.resolve_path_at(s.trim_end_matches('*'), cwd);
+                    path == Path::new("/") || path == self.absolute_path(&self.home)
+                })
+            {
+                return Some("recursive removal of root or home");
+            }
+        }
+        if ["bash", "sh"].contains(&program) && args.first().is_some_and(|s| s == "-c") {
+            return args
+                .get(1)
+                .and_then(|script| self.block_at(script, cwd, depth + 1));
+        }
+        if program == "cd" {
+            *cwd = args
+                .first()
+                .map(|s| self.resolve_path_at(s, cwd))
+                .unwrap_or_else(|| self.home.clone());
+        }
+        None
+    }
+
+    fn resolve_path_at(&self, value: &str, cwd: &Path) -> PathBuf {
         let value = ["${HOME}", "$HOME", "~"]
             .iter()
             .find_map(|prefix| {
@@ -175,7 +291,7 @@ impl HostRunner {
                     .map(|rest| self.home.join(rest.trim_start_matches('/')))
             })
             .unwrap_or_else(|| PathBuf::from(value));
-        self.absolute_path(&value)
+        self.absolute_path(&cwd.join(value))
     }
 
     fn absolute_path(&self, value: &Path) -> PathBuf {
@@ -198,7 +314,10 @@ impl HostRunner {
     }
 
     fn extended_path(&self) -> Result<OsString, HostError> {
-        let mut paths = vec![self.home.join(".local/bin"), self.home.join(".cargo/bin")];
+        let mut paths = Vec::new();
+        if self.home.is_absolute() {
+            paths.extend([self.home.join(".local/bin"), self.home.join(".cargo/bin")]);
+        }
         paths.extend(
             [
                 "/opt/homebrew/bin",
@@ -210,7 +329,7 @@ impl HostRunner {
             ]
             .map(PathBuf::from),
         );
-        for path in std::env::split_paths(&self.path).filter(|p| !p.as_os_str().is_empty()) {
+        for path in std::env::split_paths(&self.path).filter(|p| p.is_absolute()) {
             if !paths.contains(&path) {
                 paths.push(path);
             }
@@ -222,6 +341,8 @@ impl HostRunner {
     /// Run one source's bash command. A nonzero exit is returned normally.
     /// Timeout, output overflow, I/O failure and cancellation all kill the group.
     /// A killed server process itself cannot run Drop; this is not an OS sandbox.
+    /// A double-forked `setsid` process can outlive the deadline; there is no
+    /// simple fix on macOS. The work folder must sit outside the state folder.
     pub async fn run(
         &self,
         command: &str,
@@ -231,7 +352,7 @@ impl HostRunner {
         if let Some(reason) = self.block_reason(command) {
             return Err(HostError::Blocked(reason));
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + timeout.min(Duration::from_secs(180));
         let mut command_builder = Command::new("/bin/bash");
         command_builder
             .args(["--noprofile", "--norc", "-c", command])
@@ -258,20 +379,32 @@ impl HostRunner {
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let budget = AtomicUsize::new(0);
+        let pipes_done = tokio::sync::Notify::new();
         let result = tokio::try_join!(
             async {
-                timeout_at(deadline, child.wait())
+                let status = timeout_at(deadline, child.wait())
                     .await
-                    .map_err(|_| HostError::Deadline)?
-                    .map_err(HostError::Io)
+                    .map_err(|_| HostError::Deadline)??;
+                // Background children can inherit the pipes after bash exits.
+                // Allow a brief drain, then kill the group so readers see EOF
+                // and retain useful output rather than reporting a deadline.
+                tokio::select! {
+                    _ = pipes_done.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => group.kill(),
+                }
+                Ok::<_, HostError>(status)
             },
-            read_pipe(stdout, deadline, &budget),
-            read_pipe(stderr, deadline, &budget),
+            async {
+                let output = tokio::try_join!(
+                    read_pipe(stdout, deadline, &budget),
+                    read_pipe(stderr, deadline, &budget),
+                );
+                pipes_done.notify_one();
+                output
+            },
         );
-        // Even successful shells must not leave background work behind. Each
-        // pipe has its own deadline: shell exit is not evidence of pipe EOF.
         drop(group);
-        let (status, stdout, stderr) = result?;
+        let (status, (stdout, stderr)) = result?;
         Ok(Output {
             status,
             stdout,
@@ -281,10 +414,15 @@ impl HostRunner {
 }
 
 struct ProcessGroup(Pid);
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
+impl ProcessGroup {
+    fn kill(&self) {
         // ESRCH is normal when all members have already exited.
         let _ = killpg(self.0, Signal::SIGKILL);
+    }
+}
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -311,32 +449,89 @@ async fn read_pipe(
     .map_err(|_| HostError::Deadline)?
 }
 
-/// Split shell operators only outside quotes. Word quoting is then handled by
-/// shell-words. This recognizes common direct commands without evaluating bash.
-fn shell_segments(command: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, c) in command.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' && quote != Some('\'') {
-            escaped = true;
-        } else if quote == Some(c) {
-            quote = None;
-        } else if quote.is_none() {
-            if c == '\'' || c == '"' {
-                quote = Some(c);
-            } else if matches!(c, ';' | '&' | '|' | '\n' | '<' | '>') {
-                parts.push(&command[start..index]);
-                parts.push(&command[index..index + c.len_utf8()]);
-                start = index + c.len_utf8();
+/// Unquote a single syntax-tree word without evaluating shell expansions.
+fn shell_word(node: tree_sitter::Node<'_>, source: &str) -> String {
+    let text = &source[node.byte_range()];
+    shell_words::split(text)
+        .ok()
+        .filter(|words| words.len() == 1)
+        .and_then(|mut words| words.pop())
+        .unwrap_or_else(|| text.to_owned())
+}
+
+fn command_words(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    node.children(&mut node.walk())
+        .enumerate()
+        .filter(|(index, _)| {
+            matches!(
+                node.field_name_for_child(*index as u32),
+                Some("name" | "argument")
+            )
+        })
+        .map(|(_, child)| shell_word(child, source))
+        .collect()
+}
+
+fn program_name(word: &str) -> &str {
+    // Relative executables such as ./halt are ordinary user programs.
+    if Path::new(word).is_absolute() {
+        Path::new(word)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(word)
+    } else {
+        word
+    }
+}
+
+fn unwrap_command(mut words: &[String]) -> &[String] {
+    while let Some(word) = words.first() {
+        let program = program_name(word);
+        if !["command", "exec", "sudo", "env", "time", "xargs"].contains(&program) {
+            break;
+        }
+        words = &words[1..];
+        while let Some(option) = words.first() {
+            if program == "command" && ["-v", "-V"].contains(&option.as_str()) {
+                return &[]; // Lookup only: its arguments are not executed.
+            }
+            if option == "--" {
+                words = &words[1..];
+                break;
+            }
+            let takes_value = match program {
+                "sudo" => [
+                    "-u", "-g", "-h", "-p", "-C", "-T", "-R", "-D", "--user", "--group",
+                ]
+                .contains(&option.as_str()),
+                "env" => ["-u", "--unset", "-C", "--chdir"].contains(&option.as_str()),
+                "xargs" => ["-I", "-n", "-P", "-s", "-d", "-E", "-L"].contains(&option.as_str()),
+                _ => false,
+            };
+            if takes_value {
+                words = words.get(2..).unwrap_or_default();
+            } else if option.starts_with('-') || (program == "env" && option.contains('=')) {
+                words = &words[1..];
+            } else {
+                break;
             }
         }
     }
-    parts.push(&command[start..]);
-    parts
+    words
+}
+
+fn is_disk(path: &Path) -> bool {
+    path.strip_prefix("/dev").ok().is_some_and(|rest| {
+        rest.to_str()
+            .is_some_and(|name| name.starts_with("disk") || name.starts_with("rdisk"))
+    })
+}
+
+fn is_output_device(path: &Path) -> bool {
+    ["/dev/null", "/dev/stdout", "/dev/stderr"]
+        .iter()
+        .any(|device| path == Path::new(device))
+        || path.starts_with("/dev/fd")
 }
 
 #[cfg(test)]
@@ -419,19 +614,19 @@ mod tests {
 
     #[tokio::test]
     async fn grandchild_holding_stdout_dies_within_deadline_plus_two_seconds() {
-        for command in [
-            "sleep 4 & echo $! > grandchild.pid; wait",
-            "sleep 4 & echo $! > grandchild.pid; exit 0",
-        ] {
-            let (_dir, runner) = fixture();
-            let deadline = Duration::from_millis(300);
-            let start = Instant::now();
-            let outcome = runner.run(command, &BTreeMap::new(), deadline).await;
-            assert!(matches!(outcome, Err(HostError::Deadline)), "{outcome:?}");
-            let pid = read_pid(&runner, "grandchild.pid");
-            assert_process_exits(pid).await;
-            assert!(start.elapsed() <= deadline + Duration::from_secs(2));
-        }
+        let (_dir, runner) = fixture();
+        let deadline = Duration::from_millis(300);
+        let start = Instant::now();
+        let outcome = runner
+            .run(
+                "sleep 4 & echo $! > grandchild.pid; wait",
+                &BTreeMap::new(),
+                deadline,
+            )
+            .await;
+        assert!(matches!(outcome, Err(HostError::Deadline)), "{outcome:?}");
+        assert_process_exits(read_pid(&runner, "grandchild.pid")).await;
+        assert!(start.elapsed() <= deadline + Duration::from_secs(2));
     }
 
     #[tokio::test]
@@ -507,6 +702,116 @@ mod tests {
         assert_eq!(output.status.code(), Some(7));
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[test]
+    fn ordinary_shell_commands_are_allowed() {
+        let (_dir, runner) = fixture();
+        // Decision tests only; never execute candidate commands.
+        let failures: Vec<_> = [
+            "dd if=a of=b 2>/dev/null",
+            "dd if=a of=/dev/null",
+            "dd if=a of=/dev/stdout",
+            "dd if=a of=/dev/stderr",
+            "dd if=a of=/dev/fd/1",
+            "dd if=a >/dev/null",
+            "dd if=a >/dev/stdout",
+            "dd if=a >/dev/stderr",
+            "dd if=a >/dev/fd/1",
+            "cat <<EOF\nit's a note\nEOF",
+            "cat <<EOF\nshutdown\nEOF",
+            "cat <<'EOF'\n:(){ :|:& };:\nEOF",
+            "cat <<-EOF\n\tshutdown\n\tEOF",
+            "echo \"$(printf \"it's\")\"",
+            "echo hi > reboot",
+            "sort < halt",
+            "echo x > mkfs.log",
+            "command -v shutdown",
+            "command -V shutdown",
+            "./halt",
+            "echo 'unterminated",
+        ]
+        .into_iter()
+        .filter_map(|command| runner.block_reason(command).map(|reason| (command, reason)))
+        .collect();
+        assert!(
+            failures.is_empty(),
+            "ordinary commands blocked: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn common_accidents_are_blocked() {
+        let (_dir, runner) = fixture();
+        // Decision tests only; never execute candidate commands.
+        let misses: Vec<_> = [
+            "(rm -rf /)",
+            "if true; then rm -rf /; fi",
+            "bash -c 'rm -rf /'",
+            "sudo -u root rm -rf /",
+            "time rm -rf /",
+            "xargs rm -rf /",
+            "cd ~ && rm -rf .",
+            "newfs_apfs /dev/disk99",
+            "newfs_hfs /dev/disk99",
+            "diskutil secureErase 0 /dev/disk99",
+            "diskutil reformat /dev/disk99",
+            "diskutil partitionDisk /dev/disk99 GPT APFS Empty 100%",
+            "diskutil apfs deleteContainer /dev/disk99",
+            "diskutil quiet secureErase 0 /dev/disk99",
+            "diskutil quiet reformat /dev/disk99",
+            "diskutil quiet partitionDisk /dev/disk99 GPT APFS Empty 100%",
+            "diskutil quiet apfs deleteContainer /dev/disk99",
+            "echo x >/dev/disk99",
+            "echo x 2>>/dev/disk99",
+            "echo x >/dev/rdisk99",
+        ]
+        .into_iter()
+        .filter(|command| runner.block_reason(command).is_none())
+        .collect();
+        assert!(misses.is_empty(), "common accidents allowed: {misses:?}");
+    }
+
+    #[tokio::test]
+    async fn exited_shell_preserves_output_and_cleans_up_background_child() {
+        let (_dir, runner) = fixture();
+        let start = Instant::now();
+        let output = runner
+            .run(
+                "echo useful; sleep 30 & echo $! > grandchild.pid",
+                &BTreeMap::new(),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"useful\n");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_process_exits(read_pid(&runner, "grandchild.pid")).await;
+    }
+
+    #[tokio::test]
+    async fn path_is_absolute_without_home_and_extreme_timeout_is_safe() {
+        let (_dir, mut runner) = fixture();
+        runner.home = PathBuf::new(); // Same value as from_env with HOME unset.
+        runner.path = ":.:relative/bin:/absolute/bin:/usr/bin".into();
+        let path = runner.extended_path().unwrap();
+        let relative: Vec<_> = std::env::split_paths(&path)
+            .filter(|path| !path.is_absolute())
+            .collect();
+        let result = tokio::spawn(async move {
+            runner
+                .run("printf safe", &BTreeMap::new(), Duration::MAX)
+                .await
+        })
+        .await;
+        assert!(
+            relative.is_empty() && result.is_ok(),
+            "relative PATH entries: {relative:?}; extreme timeout: {result:?}"
+        );
+        let output = result.unwrap().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"safe");
     }
 
     #[test]
