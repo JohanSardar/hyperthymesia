@@ -343,3 +343,18 @@ async fn reopen_preserves_schema_ids_and_paid_run_state() -> Result<()> {
     tx.commit().await?;
     Ok(())
 }
+
+// `create` refuses an existing core and `open` refuses an unfinished one, so a
+// failed create must leave neither behind or the owner could never retry.
+#[tokio::test]
+async fn a_failed_create_can_be_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let in_the_way = dir.path().join("blobs");
+    std::fs::write(&in_the_way, b"not a directory").unwrap();
+    assert!(Store::create(dir.path()).await.is_err());
+    assert!(Store::open(dir.path()).await.is_err());
+    std::fs::remove_file(&in_the_way).unwrap();
+    Store::create(dir.path()).await.unwrap();
+    Store::open(dir.path()).await.unwrap();
+    assert!(Store::create(dir.path()).await.is_err());
+}
