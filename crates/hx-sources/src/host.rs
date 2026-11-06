@@ -310,7 +310,7 @@ impl HostRunner {
         result
     }
 
-    fn extended_path(&self) -> Result<OsString, HostError> {
+    pub(crate) fn extended_path(&self) -> Result<OsString, HostError> {
         let mut paths = Vec::new();
         if self.home.is_absolute() {
             paths.extend([self.home.join(".local/bin"), self.home.join(".cargo/bin")]);

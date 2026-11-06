@@ -28,6 +28,10 @@ pub struct Credential {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: DateTime<Utc>,
+    /// An interrupted rotation has an uncertain provider-side outcome. Require
+    /// reconnect instead of repeatedly spending the possibly invalid old token.
+    #[serde(default)]
+    pub refresh_in_flight: bool,
 }
 
 fn safe_url(text: &str) -> Result<reqwest::Url, RequestError> {
@@ -90,6 +94,15 @@ impl Credential {
 
 /// No redirects, ambient proxies, provider error bodies, or unbounded retries.
 pub async fn token(config: &Config, fields: &[(&str, &str)]) -> Result<Value, RequestError> {
+    token_guarded(config, fields, &crate::request::Unrestricted, &mut false).await
+}
+
+async fn token_guarded(
+    config: &Config,
+    fields: &[(&str, &str)],
+    gate: &impl crate::request::RequestGate,
+    dispatched: &mut bool,
+) -> Result<Value, RequestError> {
     config.validate()?;
     let mut form =
         reqwest::Url::parse("https://form.invalid").map_err(|_| RequestError::Invalid)?;
@@ -104,13 +117,14 @@ pub async fn token(config: &Config, fields: &[(&str, &str)]) -> Result<Value, Re
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| RequestError::Invalid)?;
-    let mut response = client
+    let request = client
         .post(&config.token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(form.query().unwrap_or("").to_owned())
-        .send()
-        .await
-        .map_err(|_| RequestError::Transport)?;
+        .body(form.query().unwrap_or("").to_owned());
+    gate.check().await?;
+    // No cancellable await between this final check and dispatch.
+    *dispatched = true;
+    let mut response = request.send().await.map_err(|_| RequestError::Transport)?;
     if !response.status().is_success() {
         return Err(if matches!(response.status().as_u16(), 400 | 401 | 403) {
             RequestError::Login
@@ -149,15 +163,39 @@ pub fn expiry(value: &Value) -> Result<DateTime<Utc>, RequestError> {
     Ok(Utc::now() + Duration::seconds(seconds))
 }
 
-// Serialize refresh/rotation across setup, live tools and the pull worker.
-static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-pub async fn access_key(
+// Serialize only this credential's rotation. A slow provider must not block
+// unrelated sources or state folders. Weak entries do not retain idle locks.
+static REFRESH: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+async fn access_key(
     keys: &KeyStore,
     id: &str,
     request: &Request,
     force: bool,
+    gate: &impl crate::request::RequestGate,
 ) -> Result<Option<String>, RequestError> {
-    let _lock = REFRESH.lock().await;
+    let identity = keys.identity(id).map_err(|_| RequestError::MissingKey)?;
+    let lock = {
+        let mut locks = REFRESH.lock().expect("refresh locks");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = locks.entry(identity).or_default();
+        if let Some(lock) = lock.upgrade() {
+            lock
+        } else {
+            let fresh = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            *lock = std::sync::Arc::downgrade(&fresh);
+            fresh
+        }
+    };
+    let _lock = tokio::select! {
+        biased;
+        error = gate.cancelled() => return Err(error),
+        lock = lock.lock() => lock,
+    };
+    gate.check().await?;
     let Some(saved) = keys.read(id).map_err(|_| RequestError::MissingKey)? else {
         return Ok(None);
     };
@@ -165,18 +203,45 @@ pub async fn access_key(
         return Ok(Some(saved));
     };
     credential.authorize(request)?;
+    if credential.refresh_in_flight {
+        return Err(RequestError::Login);
+    }
     if force || credential.expires_at <= Utc::now() + Duration::seconds(30) {
         if credential.refresh_token.len() < 4 {
             return Err(RequestError::Login);
         }
-        let value = token(
+        let save = |credential: &Credential| {
+            keys.write(
+                id,
+                &serde_json::to_string(credential).map_err(|_| RequestError::Invalid)?,
+            )
+            .map_err(|_| RequestError::MissingKey)
+        };
+        credential.refresh_in_flight = true;
+        save(&credential)?;
+        // The containing registered exchange owns this future independently of
+        // its caller. Once dispatched, the bounded response and durable save
+        // complete even if a switch or caller deadline occurs.
+        let mut dispatched = false;
+        let value = match token_guarded(
             &credential.config,
             &[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", &credential.refresh_token),
             ],
+            gate,
+            &mut dispatched,
         )
-        .await?;
+        .await
+        {
+            Ok(value) => value,
+            Err(error) if !dispatched => {
+                credential.refresh_in_flight = false;
+                save(&credential)?;
+                return Err(error);
+            }
+            Err(_) => return Err(RequestError::Login),
+        };
         credential.access_token = value["access_token"]
             .as_str()
             .ok_or(RequestError::Login)?
@@ -188,11 +253,8 @@ pub async fn access_key(
             credential.refresh_token = refresh.to_owned();
         }
         credential.expires_at = expiry(&value)?;
-        keys.write(
-            id,
-            &serde_json::to_string(&credential).map_err(|_| RequestError::Invalid)?,
-        )
-        .map_err(|_| RequestError::MissingKey)?;
+        credential.refresh_in_flight = false;
+        save(&credential)?;
     }
     Ok(Some(credential.access_token))
 }
@@ -253,9 +315,11 @@ pub async fn execute(
         .transpose()?
         .flatten()
         .is_some();
-    let mut key = access_key(keys, id, request, false).await?;
-    let mut response = request
-        .execute_guarded(
+    let mut key = access_key(keys, id, request, false, gate).await?;
+    let mut response = tokio::select! {
+        biased;
+        error = gate.cancelled() => Err(error),
+        response = request.execute_guarded(
             crate::request::Placeholders {
                 key: key.as_deref(),
                 cursor,
@@ -263,13 +327,15 @@ pub async fn execute(
             timeout,
             host,
             gate,
-        )
-        .await;
+        ) => response,
+    };
     if oauth && matches!(response, Err(RequestError::Status(401))) {
         gate.check().await?;
-        key = access_key(keys, id, request, true).await?;
-        response = request
-            .execute_guarded(
+        key = access_key(keys, id, request, true, gate).await?;
+        response = tokio::select! {
+            biased;
+            error = gate.cancelled() => Err(error),
+            response = request.execute_guarded(
                 crate::request::Placeholders {
                     key: key.as_deref(),
                     cursor,
@@ -277,8 +343,8 @@ pub async fn execute(
                 timeout,
                 host,
                 gate,
-            )
-            .await;
+            ) => response,
+        };
     }
     let value = response?;
     let mut secrets = keys

@@ -94,6 +94,8 @@ pub struct Connect {
     probe_json: Option<String>,
     #[serde(default)]
     cli_home: Option<String>,
+    #[serde(default)]
+    cli_executable: Option<String>,
     #[serde(default = "history_default")]
     pub(crate) history_days: u8,
 }
@@ -124,21 +126,51 @@ pub async fn connect(
         request.probe =
             Some(serde_json::from_str(&json).map_err(|_| bad("Invalid connection check"))?);
     }
-    if let Some(home) = request.cli_home.filter(|h| !h.is_empty()) {
+    let work = tempfile::tempdir().map_err(anyhow::Error::from)?;
+    let mut host =
+        hx_sources::host::HostRunner::from_env(store.data_dir.clone(), work.path().to_owned());
+    let cli_home = request.cli_home.filter(|h| !h.is_empty());
+    let has_cli_home = cli_home.is_some();
+    if let Some(home) = cli_home {
         if !std::path::Path::new(&home).is_absolute()
             || home.chars().any(char::is_control)
             || scrubber.contains_secret(&home)
         {
             return Err(bad("CLI HOME must be an absolute non-secret path"));
         }
-        if let Some(hx_sources::request::Request::Cli { env, .. }) = &mut request.probe {
-            env.insert("HOME".into(), home.clone());
-        }
-        request.description.push_str(&format!(
-            " Use HOME {home} for all CLI requests (env HOME in recipes)."
-        ));
+        host.home = home.into();
     }
+    let command = request
+        .cli_executable
+        .filter(|s| !s.is_empty())
+        .or_else(|| match &request.probe {
+            Some(hx_sources::request::Request::Cli { argv, .. }) => argv.first().cloned(),
+            Some(hx_sources::request::Request::Mcp {
+                transport: hx_sources::request::McpTransport::Stdio { argv },
+                ..
+            }) => argv.first().cloned(),
+            _ => None,
+        });
+    if has_cli_home && command.is_none() {
+        return Err(bad("CLI HOME requires a CLI executable"));
+    }
+    let cli = command
+        .map(|command| {
+            if scrubber.contains_secret(&command) {
+                return Err(bad("CLI executable must not contain credentials"));
+            }
+            hx_sources::request::CliIdentity::resolve(&command, &host)
+                .map_err(|_| bad("CLI executable must be installed and CLI HOME must be absolute"))
+        })
+        .transpose()?;
     if let Some(probe) = &request.probe {
+        probe.validate_cli().map_err(|_| {
+            bad("Connection check cannot change CLI identity or manage credentials")
+        })?;
+        if let Some(cli) = &cli {
+            cli.pin(probe)
+                .map_err(|_| bad("Connection check must use the configured CLI"))?;
+        }
         probe
             .authorize(&request.description)
             .map_err(|_| bad("Connection check destination is not authorized"))?;
@@ -149,7 +181,7 @@ pub async fn connect(
         }
     }
     let error = if let Some(probe) = &request.probe {
-        check_connection(&store, probe, request.key.as_deref())
+        check_connection(&store, probe, request.key.as_deref(), cli.as_ref())
             .await
             .err()
             .map(|e| e.to_string())
@@ -162,8 +194,11 @@ pub async fn connect(
             &request.description,
             request.history_days,
             request.key.as_deref(),
-            request.probe.as_ref(),
-            error.as_deref(),
+            hx_store::sources::SourceConnection {
+                probe: request.probe.as_ref(),
+                error: error.as_deref(),
+                cli: cli.as_ref(),
+            },
         )
         .await?;
     Ok((
@@ -177,10 +212,17 @@ async fn check_connection(
     store: &Store,
     request: &hx_sources::request::Request,
     key: Option<&str>,
+    cli: Option<&hx_sources::request::CliIdentity>,
 ) -> Result<(), hx_sources::request::RequestError> {
     let work = tempfile::tempdir().map_err(|_| hx_sources::request::RequestError::HostIo)?;
-    let host =
+    let mut host =
         hx_sources::host::HostRunner::from_env(store.data_dir.clone(), work.path().to_owned());
+    let request = if let Some(cli) = cli {
+        host.home = cli.home.clone();
+        cli.pin(request)?
+    } else {
+        request.clone()
+    };
     request
         .execute(
             hx_sources::request::Placeholders { key, cursor: None },
@@ -203,7 +245,14 @@ pub(crate) async fn reconnect_source(store: &Store, id: &str, key: Option<&str>)
         let saved = keys(store)?
             .read(id)
             .map_err(|_| bad("Source key unavailable"))?;
-        if let Err(error) = check_connection(store, &probe, key.or(saved.as_deref())).await {
+        if let Err(error) = check_connection(
+            store,
+            &probe,
+            key.or(saved.as_deref()),
+            store.source_cli(id).await?.as_ref(),
+        )
+        .await
+        {
             store
                 .record_source_pull(id, chrono::Utc::now(), true, Some(&error.to_string()))
                 .await?;

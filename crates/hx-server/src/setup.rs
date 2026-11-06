@@ -35,11 +35,12 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
     }
     if !s.enabled {
         store
-            .finish_source_setup(
+            .pause_source_setup(
                 source,
                 generation,
-                json!({}),
-                Some("Source is off. Turn it on and use Run setup again when ready."),
+                job.id,
+                &job.owner,
+                "Source is off. Turn it on and reconnect when ready. No model run was started.",
             )
             .await?;
         return Ok(());
@@ -47,26 +48,19 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
     if let Some(probe) = store.source_check(source).await? {
         let work = tempfile::tempdir()?;
         let host = HostRunner::from_env(store.data_dir.clone(), work.path().to_owned());
-        let key = KeyStore::new(&store.data_dir)?.read(source)?;
-        if probe.authorize(&s.description).is_err()
-            || probe
-                .execute(
-                    Placeholders {
-                        key: key.as_deref(),
-                        cursor: None,
-                    },
-                    std::time::Duration::from_secs(30),
-                    &host,
-                )
-                .await
-                .is_err()
-        {
+        let failed = store
+            .live_exchange(source, &probe, Some(generation))?
+            .execute(
+                Placeholders::default(),
+                std::time::Duration::from_secs(30),
+                &host,
+            )
+            .await
+            .is_err();
+        if failed {
             let message = "Login unavailable. Sign in to the CLI using the configured HOME, then reconnect. No model run was started.";
             store
-                .finish_source_setup(source, generation, json!({}), Some(message))
-                .await?;
-            store
-                .record_source_pull(source, Utc::now(), true, Some(message))
+                .pause_source_setup(source, generation, job.id, &job.owner, message)
                 .await?;
             return Ok(());
         }
@@ -118,8 +112,8 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
                     .await?;
                 return Ok(());
             }
-            // Setup never uses Deferred: refunds/revivals could otherwise buy
-            // unbounded setup attempts. Missing login and crashes spend a claim too.
+            // Launched runs never refund their claims. Only a deterministic
+            // preflight failure above can return an unused attempt.
             if job.attempts >= 2 {
                 store.finish_source_setup(source, generation, json!({}), Some("Setup could not finish in two attempts. Review the connection and retry when ready.")).await?;
             }
@@ -153,7 +147,7 @@ impl Broker {
             let recipes = self.store.recipes(Some(source_id)).await?;
             let tables = crate::agent_sql::tables(&self.store, Some(source_id)).await?;
             return Ok(
-                json!({"source":source,"recipes":recipes.iter().map(|r| json!({"id":r.id,"recipe":r.recipe.0,"enabled":r.enabled,"owner_off":r.owner_off})).collect::<Vec<_>>(),"addons":self.store.addons(Some(source_id)).await?,"tables":tables,"table_prefix":format!("s_{source_id}_"),"connection_check":self.store.source_check(source_id).await?,"cadence_hours":4}),
+                json!({"source":source,"recipes":recipes.iter().map(|r| json!({"id":r.id,"recipe":r.recipe.0,"enabled":r.enabled,"owner_off":r.owner_off})).collect::<Vec<_>>(),"addons":self.store.addons(Some(source_id)).await?,"tables":tables,"table_prefix":format!("s_{source_id}_"),"connection_check":self.store.source_check(source_id).await?,"cli_identity":self.store.source_cli(source_id).await?,"cadence_hours":4}),
             );
         }
         if name == "addon_save" {

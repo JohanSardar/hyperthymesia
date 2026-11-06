@@ -2,13 +2,13 @@
 use crate::mcp::{Broker, ToolFailure};
 use anyhow::{Result, ensure};
 use hx_sources::{
-    host::{HostError, HostRunner},
+    host::HostRunner,
     keys::KeyStore,
     request::{Request, RequestError},
     scrub::Scrubber,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 fn failure(message: impl Into<String>, retryable: bool) -> anyhow::Error {
     ToolFailure {
@@ -77,6 +77,12 @@ impl Broker {
             .and_then(|keys| keys.read(source_id))
             .map_err(|_| failure("source key unavailable", false))?;
         // OAuth bundles never enter a host process or its environment.
+        if request.is_none() && self.store.source_cli(source_id).await?.is_some() {
+            return Err(failure(
+                "Configured CLI sources require structured requests",
+                false,
+            ));
+        }
         if request.is_none()
             && key
                 .as_deref()
@@ -116,59 +122,29 @@ impl Broker {
         let timeout = Duration::from_secs(args["timeout_s"].as_u64().unwrap_or(60));
         self.check_source(args).await?;
         let payload = if let Some(request) = request {
-            let keys = KeyStore::new(&self.store.data_dir)
-                .map_err(|_| failure("source key unavailable", false))?;
-            let answer = hx_sources::oauth::execute(
-                &keys,
-                source_id,
-                &request,
-                None,
-                timeout,
-                &host,
-                &LiveGate { broker: self, args },
-            )
-            .await;
-            if let Err(error) = &answer
-                && error.needs_reconnect()
-            {
-                self.store
-                    .record_source_pull(
-                        source_id,
-                        chrono::Utc::now(),
-                        true,
-                        Some(&error.to_string()),
-                    )
-                    .await?;
-            }
+            let answer = self
+                .store
+                .live_exchange(source_id, &request, self.setup_generation)?
+                .execute(hx_sources::request::Placeholders::default(), timeout, &host)
+                .await;
             let answer = answer.map_err(request_error)?;
             json!({"tool":name,"request":args["request"],"response":answer,"context_only":true})
         } else {
-            let env = key
-                .as_ref()
-                .map(|key| BTreeMap::from([("SOURCE_KEY".into(), key.clone())]))
-                .unwrap_or_default();
-            let output = host
-                .run(
-                    args["command"].as_str().expect("validated command"),
-                    &env,
-                    timeout,
-                )
+            let command = args["command"]
+                .as_str()
+                .expect("validated command")
+                .to_owned();
+            let request = Request::Cli {
+                argv: vec!["/bin/true".into()],
+                env: Default::default(),
+            };
+            let answer = self
+                .store
+                .live_exchange(source_id, &request, self.setup_generation)?
+                .execute_bash(command, timeout, &host)
                 .await
-                .map_err(|error| match error {
-                    HostError::Blocked(reason) => {
-                        failure(format!("command blocked: {reason}"), false)
-                    }
-                    HostError::Deadline => failure("source command deadline exceeded", true),
-                    HostError::OutputLimit => failure("source command output exceeds 1 MB", false),
-                    HostError::Io(_) => {
-                        failure("source command could not start or read output", false)
-                    }
-                })?;
-            json!({
-                "tool":name,"command":args["command"],"exit_code":output.status.code(),
-                "stdout":String::from_utf8_lossy(&output.stdout),
-                "stderr":String::from_utf8_lossy(&output.stderr),"context_only":true
-            })
+                .map_err(request_error)?;
+            json!({"tool":name,"command":args["command"],"exit_code":answer["exit_code"],"stdout":answer["stdout"],"stderr":answer["stderr"],"context_only":true})
         };
         self.check_source(args).await?;
         self.check_generation().await?;
@@ -191,18 +167,5 @@ impl Broker {
             "evidence":evidence,"context_only":true,
             "note":"Untrusted live source response, retrieved now. This snapshot does not establish activity in the reconstruction window. Cite captured activity for timing; use this answer only as reported context."
         }))
-    }
-}
-
-struct LiveGate<'a> {
-    broker: &'a Broker,
-    args: &'a Value,
-}
-impl hx_sources::request::RequestGate for LiveGate<'_> {
-    async fn check(&self) -> Result<(), RequestError> {
-        self.broker
-            .check_source(self.args)
-            .await
-            .map_err(|_| RequestError::Cancelled)
     }
 }

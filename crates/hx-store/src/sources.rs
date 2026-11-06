@@ -68,6 +68,13 @@ pub struct SetupRun {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Default)]
+pub struct SourceConnection<'a> {
+    pub probe: Option<&'a Request>,
+    pub error: Option<&'a str>,
+    pub cli: Option<&'a hx_sources::request::CliIdentity>,
+}
+
 impl Store {
     /// Owner-only connect. The source is enabled immediately; setup and its
     /// two-attempt job are committed together. This creates no window work.
@@ -90,8 +97,14 @@ impl Store {
         history_days: u8,
         key: Option<&str>,
     ) -> Result<Source> {
-        self.connect_source_checked(name, description, history_days, key, None, None)
-            .await
+        self.connect_source_checked(
+            name,
+            description,
+            history_days,
+            key,
+            SourceConnection::default(),
+        )
+        .await
     }
 
     /// A deterministic failed preflight publishes a reconnectable source without
@@ -102,9 +115,9 @@ impl Store {
         description: &str,
         history_days: u8,
         key: Option<&str>,
-        probe: Option<&hx_sources::request::Request>,
-        error: Option<&str>,
+        connection: SourceConnection<'_>,
     ) -> Result<Source> {
+        let SourceConnection { probe, error, cli } = connection;
         ensure!(!name.trim().is_empty(), "source name required");
         ensure!(history_days <= 30, "history_days must be in 0..=30");
         let id = new_id();
@@ -113,6 +126,21 @@ impl Store {
         let mut tx = self.begin_write().await?;
         let mut source: Source = sqlx::query_as("INSERT INTO sources(id,connector_instance,name,description,history_days,connected_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING *")
             .bind(&id).bind(connector).bind(name).bind(description).bind(i64::from(history_days)).bind(now).fetch_one(&mut *tx).await?;
+        if let Some(cli) = cli {
+            sqlx::query(
+                "INSERT INTO source_cli(source_id,command,executable,home) VALUES($1,$2,$3,$4)",
+            )
+            .bind(&id)
+            .bind(&cli.command)
+            .bind(&cli.executable)
+            .bind(
+                cli.home
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid CLI HOME"))?,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
         if let Some(probe) = probe {
             sqlx::query("INSERT INTO source_checks(source_id,request) VALUES($1,$2)")
                 .bind(&id)
@@ -136,6 +164,60 @@ impl Store {
         }
         tx.commit().await?;
         Ok(source)
+    }
+
+    pub async fn source_cli(&self, id: &str) -> Result<Option<hx_sources::request::CliIdentity>> {
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("SELECT command,executable,home FROM source_cli WHERE source_id=$1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(
+            |(command, executable, home)| hx_sources::request::CliIdentity {
+                command,
+                executable,
+                home: home.into(),
+            },
+        ))
+    }
+
+    pub async fn prepare_source_request(
+        &self,
+        id: &str,
+        request: &Request,
+        host: &hx_sources::host::HostRunner,
+    ) -> Result<(Request, hx_sources::host::HostRunner)> {
+        request.validate_cli()?;
+        let mut host = host.clone();
+        let request = if let Some(cli) = self.source_cli(id).await? {
+            host.home = cli.home.clone();
+            cli.pin(request)?
+        } else {
+            request.clone()
+        };
+        Ok((request, host))
+    }
+
+    /// Refund exactly one fenced claim that never launched fx, and pause it
+    /// durably. Reconnect reuses this job and the remaining real-launch budget.
+    pub async fn pause_source_setup(
+        &self,
+        source: &str,
+        generation: i64,
+        job: i64,
+        owner: &str,
+        message: &str,
+    ) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let changed = sqlx::query("UPDATE jobs SET state='done',attempts=max(attempts-1,0),lease_owner=NULL,lease_until=NULL,last_error=$5 WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>$6 AND output_key=$3 AND kind='setup' AND EXISTS(SELECT 1 FROM sources WHERE id=$4 AND setup_generation=$7)")
+            .bind(job).bind(owner).bind(format!("setup:{source}:{generation}")).bind(source).bind(message).bind(Ts::now()).bind(generation).execute(&mut *tx).await?.rows_affected();
+        if changed == 1 {
+            sqlx::query("UPDATE sources SET status='needs_reconnect',last_error=$2 WHERE id=$1 AND setup_generation=$3")
+                .bind(source).bind(message).bind(generation).execute(&mut *tx).await?;
+            sqlx::query("UPDATE setup_runs SET last_error=$3 WHERE source_id=$1 AND generation=$2 AND status='pending'")
+                .bind(source).bind(generation).bind(message).execute(&mut *tx).await?;
+        }
+        tx.commit().await
     }
 
     pub async fn source_check(&self, id: &str) -> Result<Option<hx_sources::request::Request>> {
@@ -351,6 +433,15 @@ impl Store {
         generation: Option<i64>,
     ) -> Result<StoredRecipe> {
         recipe.validate()?;
+        let cli = self.source_cli(source).await?;
+        for request in
+            std::iter::once(&recipe.request).chain(recipe.detail.iter().map(|d| &d.request))
+        {
+            request.validate_cli()?;
+            if let Some(cli) = &cli {
+                cli.pin(request)?;
+            }
+        }
         let mut recipe = recipe.clone();
         recipe.source = source.to_owned();
         let mut identity_hash = recipe_identity(&recipe)?;

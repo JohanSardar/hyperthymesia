@@ -121,6 +121,15 @@ impl KeyStore {
         }
     }
 
+    pub(crate) fn identity(&self, id: &str) -> Result<PathBuf, KeyError> {
+        let name = self
+            .path(id)?
+            .file_name()
+            .ok_or(KeyError::InvalidId)?
+            .to_owned();
+        Ok(fs::canonicalize(&self.directory)?.join(name))
+    }
+
     fn path(&self, id: &str) -> Result<PathBuf, KeyError> {
         if id.is_empty()
             || !id

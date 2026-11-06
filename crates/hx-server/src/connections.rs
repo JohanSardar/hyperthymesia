@@ -37,11 +37,11 @@ pub async fn page(
         ),
         Some("gmail-gws") => (
             "Gmail via gws",
-            "My Gmail through `gws`. Use gws gmail users messages list --params JSON with userId me, maxResults 50, q after:{{since_unix}}, pageToken {{cursor}}. List returns only id and threadId; use a detail request with gws gmail users messages get and id {{item}}, format full. Map internalDate as unix_ms and Subject from payload.headers. Use nextPageToken pagination; missing messages means empty. Auth exit code is 2. Use the connection check's HOME for all requests. Do not use --page-all (NDJSON) or export credentials.",
+            "My Gmail through `gws`. Use gws gmail users messages list --params JSON with userId me, maxResults 50, q after:{{since_unix}}, pageToken {{cursor}}. List returns only id and threadId; use a detail request with gws gmail users messages get and id {{item}}, format full. Map internalDate as unix_ms and Subject from payload.headers. Use nextPageToken pagination; missing messages means empty. Auth exit code is 2. The server supplies the owner-configured executable and HOME; keep recipe env empty. Do not use --page-all (NDJSON) or export credentials.",
         ),
         Some("calendar-gws") => (
             "Google Calendar via gws",
-            "My Google Calendar through `gws`. Use gws calendar events list --params JSON with calendarId primary, singleEvents true, timeMin {{since}}, timeMax {{until}}, maxResults 100 and pageToken {{cursor}}. Map id, summary, start.dateTime and end.dateTime. All-day dates are floating, not instants; never invent timestamps for them. Use nextPageToken pagination; missing items means empty. Auth exit code is 2. Use the connection check's HOME for all requests. Do not use --page-all (NDJSON) or export credentials.",
+            "My Google Calendar through `gws`. Use gws calendar events list --params JSON with calendarId primary, singleEvents true, timeMin {{since}}, timeMax {{until}}, maxResults 100 and pageToken {{cursor}}. Map id, summary, start.dateTime and end.dateTime. All-day dates are floating, not instants; never invent timestamps for them. Use nextPageToken pagination; missing items means empty. Auth exit code is 2. The server supplies the owner-configured executable and HOME; keep recipe env empty. Do not use --page-all (NDJSON) or export credentials.",
         ),
         Some("github") => (
             "GitHub",
@@ -141,6 +141,8 @@ pub async fn page(
                         p class="hint" {"Use a read-only, narrowly scoped key where possible. It is never shown back here."}
                         label for="source-history" {"History days (0–30)"}
                         input id="source-history" name="history_days" type="number" min="0" max="30" value="1";
+                        label for="source-cli" {"CLI executable (optional)"}
+                        input id="source-cli" name="cli_executable" placeholder="Command or absolute executable path" value=(match query.template.as_deref() { Some("gmail-gws" | "calendar-gws") => "gws", Some("apple-cli") => "bridge", _ => "" });
                         label for="source-home" {"CLI HOME (optional)"}
                         input id="source-home" name="cli_home" placeholder="Absolute HOME of the signed-in CLI on this server";
                         details {
