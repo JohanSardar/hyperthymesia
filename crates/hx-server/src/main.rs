@@ -544,10 +544,11 @@ fn retained_copies(state: &std::path::Path) -> Vec<serde_json::Value> {
     // Written by the installer, so custom state paths also find their backups.
     if let Ok(prefix) = std::fs::read_to_string(state.join(".install-prefix")) {
         let prefix = PathBuf::from(prefix.trim_end());
-        if prefix.is_absolute() && prefix.join(".installed").is_file() {
-            if let Ok(entries) = std::fs::read_dir(prefix.join("backups")) {
-                paths.extend(entries.flatten().map(|e| e.path()));
-            }
+        if prefix.is_absolute()
+            && prefix.join(".installed").is_file()
+            && let Ok(entries) = std::fs::read_dir(prefix.join("backups"))
+        {
+            paths.extend(entries.flatten().map(|e| e.path()));
         }
     }
     paths.sort();
