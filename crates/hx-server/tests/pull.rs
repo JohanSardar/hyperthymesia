@@ -469,6 +469,7 @@ async fn cli_dispatch_and_reconnect_codes_and_mcp_transport_are_honest() {
             json!({"items":[item(1)]}).to_string(),
         ],
         env: Default::default(),
+        text: None,
     };
     let stored = f.store.save_recipe(&f.source, &recipe).await.unwrap();
     f.store.set_recipe_enabled(&stored.id, true).await.unwrap();
@@ -480,6 +481,7 @@ async fn cli_dispatch_and_reconnect_codes_and_mcp_transport_are_honest() {
     recipe.request = Request::Cli {
         argv: vec!["/bin/sh".into(), "-c".into(), "exit 2".into()],
         env: Default::default(),
+        text: None,
     };
     recipe.reconnect_exit_codes = vec![2];
     let stored = f.store.save_recipe(&f.source, &recipe).await.unwrap();

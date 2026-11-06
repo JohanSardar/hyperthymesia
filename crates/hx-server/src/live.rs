@@ -137,6 +137,7 @@ impl Broker {
             let request = Request::Cli {
                 argv: vec!["/bin/true".into()],
                 env: Default::default(),
+                text: None,
             };
             let answer = self
                 .store

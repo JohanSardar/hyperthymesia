@@ -376,7 +376,9 @@ impl SourceExchange {
     async fn finish(&self, result: Result<Value, RequestError>) -> Result<Value, RequestError> {
         if let Err(error) = &result
             && self.pull_id.is_none()
-            && (error.needs_reconnect()
+            // One refused or key-less exploratory call says nothing about the
+            // source's login. Saved pulls and connection checks still pause it.
+            && (matches!(error, RequestError::Login)
                 || matches!(error, RequestError::Exit(code) if self.recipe.reconnect_exit_codes.contains(code)))
         {
             self.store
