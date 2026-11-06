@@ -200,7 +200,7 @@ pub async fn setup(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Filter {
-    source: Option<String>,
+    pub(crate) source: Option<String>,
 }
 async fn filter(store: &Store, filter: &Filter) -> ApiResult<()> {
     if let Some(value) = &filter.source {
@@ -271,40 +271,13 @@ pub async fn agent_tables(
     headers: HeaderMap,
     Query(query): Query<Filter>,
 ) -> ApiResult<Json<Value>> {
-    use sqlx::Connection;
     owner(&store, &headers).await?;
     filter(&store, &query).await?;
-    let sources = store.sources().await?;
-    let prefixes: Vec<_> = sources
-        .iter()
-        .filter(|s| query.source.as_ref().is_none_or(|id| id == &s.id))
-        .map(|s| format!("s_{}_", s.id))
-        .collect();
-    let mut conn = sqlx::SqliteConnection::connect_with(
-        &sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(store.data_dir.join("agent.sqlite"))
-            .read_only(true),
+    safe(
+        &store,
+        crate::agent_sql::tables(&store, query.source.as_deref()).await?,
     )
-    .await?;
-    let names: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
-            .fetch_all(&mut conn)
-            .await?;
-    let mut tables = vec![];
-    for name in names
-        .into_iter()
-        .filter(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
-    {
-        // Quote a database identifier, never interpolate it as SQL syntax.
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT count(*) FROM \"{}\"",
-            name.replace('"', "\"\"")
-        )))
-        .fetch_one(&mut conn)
-        .await?;
-        tables.push(json!({"name":name,"row_count":count}));
-    }
-    safe(&store, json!(tables)).await
+    .await
 }
 
 pub(crate) fn router() -> axum::Router<Store> {

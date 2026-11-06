@@ -214,7 +214,7 @@ impl Store {
     ) -> Result<bool> {
         let result = stored_json(result);
         let mut tx = self.begin_write().await?;
-        let updated = sqlx::query("UPDATE setup_runs SET status=$3,result=$4,last_error=$5,finished_at=$6 WHERE source_id=$1 AND generation=$2 AND status='pending' AND EXISTS(SELECT 1 FROM sources WHERE id=$1 AND setup_generation=$2 AND enabled)")
+        let updated = sqlx::query("UPDATE setup_runs SET status=$3,result=$4,last_error=$5,finished_at=$6 WHERE source_id=$1 AND generation=$2 AND status='pending' AND EXISTS(SELECT 1 FROM sources WHERE id=$1 AND setup_generation=$2 AND (enabled OR $5 IS NOT NULL))")
             .bind(source).bind(generation).bind(if error.is_some() { "failed" } else { "succeeded" }).bind(result).bind(error).bind(Ts::now()).execute(&mut *tx).await?;
         if updated.rows_affected() == 0 {
             tx.rollback().await?;
@@ -254,6 +254,14 @@ impl Store {
     /// pull. This is an identity boundary, not a detector for equivalent APIs.
     /// A re-save never writes enabled or owner_off, or resets the pull cursor.
     pub async fn save_recipe(&self, source: &str, recipe: &Recipe) -> Result<StoredRecipe> {
+        self.save_recipe_for_setup(source, recipe, None).await
+    }
+    pub async fn save_recipe_for_setup(
+        &self,
+        source: &str,
+        recipe: &Recipe,
+        generation: Option<i64>,
+    ) -> Result<StoredRecipe> {
         recipe.validate()?;
         let mut recipe = recipe.clone();
         recipe.source = source.to_owned();
@@ -262,6 +270,7 @@ impl Store {
         let id = new_id();
         let mut tx = self.begin_write().await?;
         ensure_source_on(&mut tx, source).await?;
+        ensure_setup_generation(&mut tx, source, generation).await?;
         let row: StoredRecipe = sqlx::query_as("INSERT INTO recipes(id,source_id,name,identity_hash,recipe) VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_id,identity_hash) DO UPDATE SET name=EXCLUDED.name,recipe=EXCLUDED.recipe RETURNING *")
             .bind(id).bind(source).bind(&recipe.name).bind(identity_hash).bind(value).fetch_one(&mut *tx).await?;
         sqlx::query(
@@ -363,6 +372,15 @@ impl Store {
     /// A genuinely different name is a separate add-on; we do not detect prose
     /// equivalence. Surrounding whitespace in the name is not significant.
     pub async fn save_addon(&self, source: &str, name: &str, text: &str) -> Result<Addon> {
+        self.save_addon_for_setup(source, name, text, None).await
+    }
+    pub async fn save_addon_for_setup(
+        &self,
+        source: &str,
+        name: &str,
+        text: &str,
+        generation: Option<i64>,
+    ) -> Result<Addon> {
         let name = name.trim();
         ensure!(!name.is_empty(), "add-on name required");
         ensure!(
@@ -372,6 +390,7 @@ impl Store {
         let id = new_id();
         let mut tx = self.begin_write().await?;
         ensure_source_on(&mut tx, source).await?;
+        ensure_setup_generation(&mut tx, source, generation).await?;
         let existing: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM addons WHERE source_id=$1 AND name=$2)",
         )
@@ -671,7 +690,7 @@ fn normalized_path(address: &str) -> Result<String> {
     })
 }
 
-fn recipe_identity(recipe: &Recipe) -> Result<String> {
+pub fn recipe_identity(recipe: &Recipe) -> Result<String> {
     let executable = |argv: &[String]| -> Result<String> {
         Ok(argv
             .first()
@@ -709,3 +728,16 @@ impl std::fmt::Display for SourceAccessChanged {
     }
 }
 impl std::error::Error for SourceAccessChanged {}
+
+async fn ensure_setup_generation(
+    tx: &mut WriteTransaction,
+    source: &str,
+    generation: Option<i64>,
+) -> Result<()> {
+    if let Some(generation) = generation {
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources s JOIN setup_runs r ON r.source_id=s.id AND r.generation=s.setup_generation WHERE s.id=$1 AND s.setup_generation=$2 AND r.status='pending')")
+            .bind(source).bind(generation).fetch_one(&mut **tx).await?;
+        ensure!(valid, "setup superseded or finished");
+    }
+    Ok(())
+}

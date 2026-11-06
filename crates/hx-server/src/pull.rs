@@ -103,6 +103,18 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
         return Ok(report);
     }
     let recipe = &stored.recipe.0;
+    if recipe.request.authorize(&source.description).is_err() {
+        return failed(
+            store,
+            &source.id,
+            &mut state,
+            now,
+            report,
+            "recipe destination is not authorized",
+            false,
+        )
+        .await;
+    }
     let mut checkpoint = match Checkpoint::load(state.cursor.clone(), recipe) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
@@ -197,6 +209,18 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
                 .await;
             }
         };
+        if scrubber.scrub_json(&serde_json::to_value(recipe)?) != serde_json::to_value(recipe)? {
+            return failed(
+                store,
+                &source.id,
+                &mut state,
+                now,
+                report,
+                "recipe contains credentials or invalid control text",
+                false,
+            )
+            .await;
+        }
         let cursor = match cursor_text(
             checkpoint
                 .page_cursor
