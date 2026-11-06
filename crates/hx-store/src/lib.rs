@@ -34,7 +34,11 @@ impl Token {
         self.scopes.iter().any(|s| s == scope)
     }
     pub fn allows(&self, connector: &str) -> bool {
-        self.prefixes.iter().any(|p| connector.starts_with(p))
+        self.prefixes.iter().any(|prefix| {
+            connector.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.is_empty() || prefix.ends_with(':') || suffix.starts_with(':')
+            })
+        })
     }
 }
 
@@ -47,6 +51,12 @@ pub fn valid_hash(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn random_secret() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(hex::encode(bytes))
 }
 pub fn window_at(t: DateTime<Utc>) -> Interval {
     let start = DateTime::from_timestamp(t.timestamp().div_euclid(14400) * 14400, 0)
@@ -72,10 +82,7 @@ impl Store {
         {
             bail!("unknown scope");
         }
-        let mut bytes = [0_u8; 32];
-        use std::io::Read;
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        let secret = hex::encode(bytes);
+        let secret = random_secret()?;
         sqlx::query("INSERT INTO device_tokens(hash,name,prefixes,scopes) VALUES($1,$2,$3,$4)")
             .bind(hash(secret.as_bytes()))
             .bind(name)
@@ -798,6 +805,9 @@ pub mod sources;
 
 mod reads;
 pub use reads::*;
+
+mod pairing;
+pub use pairing::{PairCodeInfo, TokenInfo};
 
 mod processing;
 pub use processing::*;
