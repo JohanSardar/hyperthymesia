@@ -12,12 +12,12 @@ use hx_store::Store;
 use maud::{DOCTYPE, Markup, html};
 use serde::Deserialize;
 
-fn shell(title: &str, body: Markup) -> Html<String> {
+pub(crate) fn shell(title: &str, body: Markup) -> Html<String> {
     Html(html!{(DOCTYPE) html {head { meta charset="utf-8"; meta name="viewport" content="width=device-width, initial-scale=1";
         meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'";
         title {(title)}
         style {"body{font:16px system-ui;background:#10151e;color:#e8edf5;margin:2rem}a{color:#8fd3ff}.lane{margin:1rem 0}.entry{display:flex;gap:1rem;margin:.6rem 0}.when{font-variant-numeric:tabular-nums;color:#9fb0c8;min-width:7.5rem}.desc{margin:.2rem 0;color:#b9c6d8;font-size:14px}.summary{color:#cfd8e6}summary{cursor:pointer;margin:1rem 0}.track{height:2.5rem;background:#253143;position:relative;overflow:hidden}.bar{position:absolute;background:#255b87;height:100%;white-space:nowrap;overflow:hidden;font-size:12px;color:white}.axis{display:flex;justify-content:space-between}pre{white-space:pre-wrap;overflow-wrap:anywhere}.zoom:target .track{height:5rem}table{border-spacing:1rem .4rem}input{font:inherit}img{max-width:480px}"}
-    } body {nav {a href="/" {"Today"} " · " a href="#episodes" {"What you did"} " · " a href="#tasks" {"Tasks"} " · " a href="#lanes" {"Lanes"}}
+    } body {nav {a href="/" {"Today"} " · " a href="#episodes" {"What you did"} " · " a href="#tasks" {"Tasks"} " · " a href="#lanes" {"Lanes"} " · " a href="/connect" {"Connect sources"}}
         (body)
     }}}.into_string())
 }
@@ -27,7 +27,7 @@ struct Entry<'a> {
     end: chrono::DateTime<chrono::FixedOffset>,
     title: &'a str,
     description: &'a str,
-    evidence: Option<i64>,
+    evidence: Vec<i64>,
 }
 
 fn entries<'a>(
@@ -49,7 +49,12 @@ fn entries<'a>(
                 end: end.with_timezone(&zone),
                 title: item["title"].as_str().unwrap_or(""),
                 description: item["description"].as_str().unwrap_or(""),
-                evidence: item["evidence"][0].as_i64(),
+                evidence: item["evidence"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_i64)
+                    .collect(),
             })
         })
         .collect();
@@ -99,11 +104,12 @@ pub fn render_day(
                     div class="entry" {
                         span class="when" {(e.start.format("%H:%M")) "–" (e.end.format("%H:%M"))}
                         div {
-                            @match e.evidence {
+                            @match e.evidence.first() {
                                 Some(id) => a href=(format!("/evidence/{id}")) {(e.title)},
                                 None => b {(e.title)},
                             }
                             @if !e.description.is_empty() && e.description != e.title {p class="desc" {(e.description)}}
+                            p class="desc" {"Sources: " @for id in &e.evidence {a href=(format!("/evidence/{id}")) {"Evidence " (id)} " "}}
                         }
                     }
                 }

@@ -82,6 +82,27 @@ impl Scrubber {
             .as_ref()
             .is_some_and(|pattern| pattern.is_match(text))
     }
+
+    /// Normalize before filtering, as storage removes NULs too. Keep hostile
+    /// object keys and scalar credentials out of every serialized copy.
+    pub fn scrub_json(&self, value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(self.scrub(&text.replace('\0', ""))),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|item| self.scrub_json(item)).collect())
+            }
+            Value::Object(items) => Value::Object(
+                items
+                    .iter()
+                    .map(|(key, value)| {
+                        (self.scrub(&key.replace('\0', "")), self.scrub_json(value))
+                    })
+                    .collect(),
+            ),
+            _ if self.contains_secret(&value.to_string()) => Value::String(REDACTED.into()),
+            _ => value.clone(),
+        }
+    }
 }
 
 pub(crate) fn validate_key(key: &str) -> Result<(), ScrubError> {
