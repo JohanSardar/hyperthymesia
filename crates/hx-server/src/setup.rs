@@ -10,7 +10,7 @@ use hx_sources::{
     host::HostRunner,
     keys::KeyStore,
     recipe::{MapContext, PullMapper, Recipe},
-    request::{MAX_TIMEOUT, Placeholders, RequestGate},
+    request::{MAX_TIMEOUT, Placeholders, RequestError, RequestGate},
 };
 use hx_store::Store;
 use serde_json::{Value, json};
@@ -41,6 +41,7 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
                 job.id,
                 &job.owner,
                 "Source is off. Turn it on and reconnect when ready. No model run was started.",
+                true,
             )
             .await?;
         return Ok(());
@@ -60,7 +61,7 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
         if failed {
             let message = "Login unavailable. Sign in to the CLI using the configured HOME, then reconnect. No model run was started.";
             store
-                .pause_source_setup(source, generation, job.id, &job.owner, message)
+                .pause_source_setup(source, generation, job.id, &job.owner, message, true)
                 .await?;
             return Ok(());
         }
@@ -85,6 +86,7 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
         let has_pull = !recipes.is_empty();
         let no_pull = result["no_pull"].as_str().is_some_and(|reason| !reason.trim().is_empty());
         ensure!(has_pull || no_pull, "setup saved no recipe and gave no no_pull reason");
+        ensure!(has_pull || !broker.audit.lock().await.key_refused, "source refused its key");
         ensure!(!broker.audit.lock().await.exhausted, "setup exhausted tool budget");
         ensure!(store.source(source).await?.is_some_and(|s| s.status != "needs_reconnect"), "source needs reconnect");
         // Store only a small, scrubbed owner-facing result, never arbitrary provider output.
@@ -92,23 +94,30 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
             "summary":crate::mcp::bounded(result["summary"].as_str().unwrap_or("Setup completed"), 2000),
             "no_pull":result["no_pull"].as_str().map(|reason| crate::mcp::bounded(reason,2000)), "recipes":recipes.iter().map(|r| &r.id).collect::<Vec<_>>()
         }));
-        store.finish_source_setup(source, generation, result, None).await?;
+        // An off switch can land while the model finishes. Stay off, and don't leave setup pending.
+        if !store.finish_source_setup(source, generation, result, None).await?
+            && store.source(source).await?.is_some_and(|s| !s.enabled)
+        {
+            store.pause_source_setup(source, generation, job.id, &job.owner, "Source is off. Turn it on and reconnect when ready.", false).await?;
+        }
         Ok::<_,anyhow::Error>(())
     }.await;
     match result {
         Ok(()) => Ok(()),
         Err(_) => {
-            if store
-                .source(source)
-                .await?
-                .is_some_and(|s| s.status == "needs_reconnect")
+            // A refused key with nothing saved won't improve on a second paid attempt.
+            let key_dead = broker.audit.lock().await.key_refused
+                && store.recipes(Some(source)).await?.is_empty();
+            if key_dead
+                || store
+                    .source(source)
+                    .await?
+                    .is_some_and(|s| s.status == "needs_reconnect")
             {
+                // Atomic and fenced by generation. A launched run keeps its spent attempt.
                 let message = "Login expired or missing. Reconnect this source on Connect sources.";
                 store
-                    .finish_source_setup(source, generation, json!({}), Some(message))
-                    .await?;
-                store
-                    .record_source_pull(source, Utc::now(), true, Some(message))
+                    .pause_source_setup(source, generation, job.id, &job.owner, message, false)
                     .await?;
                 return Ok(());
             }
@@ -200,7 +209,11 @@ impl Broker {
                 MAX_TIMEOUT,
                 &host,
             )
-            .await?;
+            .await;
+        if key.is_some() && matches!(response, Err(RequestError::Status(401))) {
+            self.audit.lock().await.key_refused = true;
+        }
+        let response = response?;
         self.check_source(args).await?;
         let response = self
             .secret_filter()

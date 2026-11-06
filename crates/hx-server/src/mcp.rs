@@ -110,6 +110,8 @@ pub struct Audit {
     pub attention: Vec<hx_compile::Lane>,
     pub input_namespaces: std::collections::BTreeSet<String>,
     pub exhausted: bool,
+    /// A keyed source answered 401 during setup, so its key may be dead.
+    pub key_refused: bool,
     pub source_addons: BTreeMap<String, Vec<hx_store::sources::Addon>>,
     /// Reserved before execution, including requests cancelled before completion.
     pub total_calls: usize,

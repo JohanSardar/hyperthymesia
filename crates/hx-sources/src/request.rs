@@ -22,6 +22,9 @@ pub enum Request {
         argv: Vec<String>,
         #[serde(default)]
         env: BTreeMap<String, String>,
+        /// Absent: stdout must be JSON. Present: stdout is text lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<TextLines>,
     },
     Mcp {
         #[serde(flatten)]
@@ -38,6 +41,16 @@ pub enum McpTransport {
     Http { url: String },
     Stdio { argv: Vec<String> },
 }
+
+/// Data, not a parser: CLI stdout becomes `{"lines":[{"line","fields"}]}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextLines {
+    pub separator: String,
+}
+
+/// Separators that can't cut a credential into pieces the scrubber would miss.
+const TEXT_SEPARATORS: [&str; 6] = ["\t", ",", ";", "|", " ", "\u{1f}"];
 
 /// Owner configuration, never supplied by a recipe or a source response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,11 +213,39 @@ impl RequestGate for Unrestricted {
 }
 
 impl Request {
+    /// Split scrubbed CLI text into `{"lines":[{"line","fields"}]}`.
+    pub(crate) fn split_text(&self, value: Value) -> Value {
+        let (
+            Self::Cli {
+                text: Some(text), ..
+            },
+            Value::String(stdout),
+        ) = (self, &value)
+        else {
+            return value;
+        };
+        let lines: Vec<Value> = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let fields: Vec<&str> = line.split(text.separator.as_str()).collect();
+                serde_json::json!({"line": line, "fields": fields})
+            })
+            .collect();
+        serde_json::json!({"lines": lines})
+    }
+
     /// A recipe may supply credential values, but cannot select a different
     /// login, executable search path, runtime loader or credential directory.
     pub fn validate_cli(&self) -> Result<(), RequestError> {
         let argv = match self {
-            Self::Cli { argv, env } => {
+            Self::Cli { argv, env, text } => {
+                if text
+                    .as_ref()
+                    .is_some_and(|t| !TEXT_SEPARATORS.contains(&t.separator.as_str()))
+                {
+                    return Err(RequestError::CliInvalid);
+                }
                 // Only explicit key/token variables are useful request input.
                 // All directory, runtime and lookup variables are owner context.
                 if env.iter().any(|(name, value)| {
@@ -392,7 +433,7 @@ impl Request {
                 tool,
                 arguments,
             } => crate::mcp::execute(transport, tool, arguments, values, timeout, host, gate).await,
-            Self::Cli { argv, env } => {
+            Self::Cli { argv, env, text } => {
                 if timeout.is_zero() || argv.first().is_none_or(String::is_empty) {
                     return Err(RequestError::CliInvalid);
                 }
@@ -429,6 +470,12 @@ impl Request {
                         Some(code) => RequestError::Exit(code),
                         None => RequestError::Signal,
                     });
+                }
+                // Text stays whole here so secrets are scrubbed before it's split.
+                if text.is_some() {
+                    return String::from_utf8(output.stdout)
+                        .map(Value::String)
+                        .map_err(|_| RequestError::CliJson);
                 }
                 serde_json::from_slice(&output.stdout).map_err(|_| RequestError::CliJson)
             }
@@ -471,6 +518,7 @@ impl Request {
         }
         let url = substitute_url(url, values)?;
         let client = reqwest::Client::builder()
+            .user_agent("Hyperthymesia")
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
@@ -1100,6 +1148,7 @@ mod tests {
         let cli = Request::Cli {
             argv: vec!["must-not-execute".into()],
             env: BTreeMap::new(),
+            text: None,
         };
         assert_eq!(
             cli.execute_http(Placeholders::default(), Duration::from_secs(1))
