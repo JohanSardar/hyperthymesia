@@ -286,19 +286,21 @@ impl Drop for Server {
 /// Start the watcher and fx in the same new group; no spawn/notify-PID race.
 const FX_GUARD: &str = r#"
 input=$1
-shift
+status=$2
+shift 2
 # POSIX shells may replace background stdin with /dev/null. Save the pipe
 # before backgrounding, and do not let fx inherit the watcher's descriptor.
 exec 3<&0
 ( IFS= read -r _ <&3 || :; /bin/kill -KILL -- "-$$" ) &
-watcher=$!
 "$@" < "$input" 3<&- &
 child=$!
 result=0
 wait "$child" || result=$?
-kill "$watcher" 2>/dev/null || :
-wait "$watcher" 2>/dev/null || :
-exit "$result"
+# Preserve the direct child's shell exit status before killing our whole group,
+# including descendants that closed stdio or ignore TERM. Keep the life watcher
+# armed until that cleanup; cancellation must still reach those descendants.
+printf '%s\n' "$result" > "$status"
+/bin/kill -KILL -- "-$$"
 "#;
 
 /// Captures bounded streams while waiting. Cancellation closes the life pipe.
@@ -309,6 +311,7 @@ async fn output(
 ) -> Result<std::process::Output> {
     use std::io::Write;
     let mut prompt = tempfile::NamedTempFile::new()?;
+    let exit_status = tempfile::NamedTempFile::new()?;
     prompt.write_all(input.as_bytes())?;
     prompt.flush()?;
     let original = command.as_std();
@@ -322,6 +325,7 @@ async fn output(
         )
         .args(["-c", FX_GUARD, "hx-fx-guard"])
         .arg(prompt.path())
+        .arg(exit_status.path())
         .arg(original.get_program())
         .args(original.get_args())
         .process_group(0)
@@ -374,8 +378,19 @@ async fn output(
             }
         };
         let (stdout, stderr) = tokio::try_join!(read(Box::new(stdout)), watch)?;
+        let guard_status = child.wait().await?;
+        let saved = std::fs::read_to_string(exit_status.path())?;
+        let status = if saved.is_empty() {
+            // The lifetime watcher killed the group before fx completed.
+            guard_status
+        } else {
+            use std::os::unix::process::ExitStatusExt;
+            let code: u8 = saved.trim().parse().context("fx child exit status")?;
+            // POSIX shell wait/exit semantics, including 128+signal, as before.
+            std::process::ExitStatus::from_raw(i32::from(code) << 8)
+        };
         Ok::<_, anyhow::Error>(std::process::Output {
-            status: child.wait().await?,
+            status,
             stdout,
             stderr,
         })

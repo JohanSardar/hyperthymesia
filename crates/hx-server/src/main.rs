@@ -203,8 +203,9 @@ async fn main() -> Result<()> {
                     .await?;
                 anyhow::ensure!(status.success(), "interrupted upgrade recovery failed");
             }
-            // An active installer is verifying this very service. Let it start;
-            // the normal worker/request gate still holds the exclusive lock.
+            // Health must start while the installer verifies the candidate.
+            // Admission also checks the durable pending record, not just this
+            // lock: losing the installer must not admit rollback-bound writes.
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(error) => return Err(error.into()),
         }
@@ -445,7 +446,13 @@ async fn main() -> Result<()> {
                 };
                 loop {
                     match lock.try_lock_shared() {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            if !upgrade_pending(&ocr_dir).unwrap_or(true) {
+                                break;
+                            }
+                            let _ = lock.unlock();
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
                         Err(std::fs::TryLockError::WouldBlock) => {
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await
                         }
@@ -464,6 +471,7 @@ async fn main() -> Result<()> {
                 }
             });
             let worker_lock = worker_lock(&dir)?;
+            let worker_dir = dir.clone();
             let worker = tokio::spawn(async move {
                 let mut next_schedule = tokio::time::Instant::now();
                 loop {
@@ -481,6 +489,11 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     };
+                    if upgrade_pending(&worker_dir).unwrap_or(true) {
+                        let _ = guard.unlock();
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
                     if tokio::time::Instant::now() >= next_schedule {
                         next_schedule =
                             tokio::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -508,9 +521,13 @@ async fn main() -> Result<()> {
                     dir.clone(),
                     maintenance_gate,
                 ));
+            let interrupted_upgrade = wait_for_interrupted_upgrade(dir.clone());
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
-                    shutdown.await;
+                    tokio::select! {
+                        _ = shutdown => {},
+                        _ = interrupted_upgrade => {},
+                    }
                     // Cancel provider work before waiting for HTTP connections
                     // to drain. Dropping fx's output future kills its child.
                     stop_worker.abort();
@@ -564,8 +581,60 @@ fn worker_lock(dir: &std::path::Path) -> Result<std::fs::File> {
         .open(dir.join("locks/upgrade.lock"))?)
 }
 
+/// A dropped advisory lock is not a commit. A pending record fences admission
+/// until the installer removes it, even if the complete installer tree dies.
+/// Treat unreadable/malformed managed metadata as blocked at every caller.
+fn upgrade_pending(dir: &std::path::Path) -> Result<bool> {
+    let prefix = match std::fs::read_to_string(dir.join(".install-prefix")) {
+        Ok(prefix) => PathBuf::from(prefix.trim_end_matches('\n')),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(prefix.is_absolute(), "invalid installer prefix");
+    anyhow::ensure!(
+        prefix.join(".installed").metadata()?.is_file(),
+        "installer marker missing"
+    );
+    match std::fs::symlink_metadata(prefix.join("pending-upgrade")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Recovery must not rename a live SQLite pool. Once an uncommitted installer
+/// disappears, shut down the candidate so its manager runs the recovery wrapper
+/// before reopening state. Until then all requests/workers remain fenced.
+async fn wait_for_interrupted_upgrade(dir: PathBuf) {
+    let Ok(lock) = worker_lock(&dir) else {
+        return;
+    };
+    loop {
+        if upgrade_pending(&dir).unwrap_or(true) {
+            match lock.try_lock_shared() {
+                Ok(()) => {
+                    // The installer may have committed between the first check
+                    // and lock acquisition. Recheck under the admission lock.
+                    let pending = upgrade_pending(&dir).unwrap_or(true);
+                    let _ = lock.unlock();
+                    if pending {
+                        tracing::error!(
+                            "upgrade admission blocked without an installer; restarting for recovery"
+                        );
+                        return;
+                    }
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(_) => return,
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// Keep uploads retryable during an installer rollback window. The shared lock
-/// also fences in-flight requests before an upgrade can take its exclusive lock.
+/// fences in-flight requests before an upgrade can take its exclusive lock;
+/// the durable pending record keeps them fenced after a killed installer.
 async fn maintenance_gate(
     axum::extract::State(dir): axum::extract::State<PathBuf>,
     request: axum::extract::Request,
@@ -578,7 +647,7 @@ async fn maintenance_gate(
     let Ok(lock) = worker_lock(&dir) else {
         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    if lock.try_lock_shared().is_err() {
+    if lock.try_lock_shared().is_err() || upgrade_pending(&dir).unwrap_or(true) {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "upgrade in progress; retry later",
