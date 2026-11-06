@@ -210,10 +210,12 @@ default suite; to measure it separately:
 
     cargo test --release -p hx-server synthetic_browser_point_stress -- --nocapture
 
-## Server OCR
+## OCR
 
-On macOS, `serve` starts an independent OCR worker using `hx-visual`'s Apple Vision
-helper (`swiftc` must be installed). It discovers published `media.still` blobs on
+`GET /v1/device` requires ingest scope and advertises `ocr:"server"` when the
+server can resolve the Apple Vision helper, otherwise `ocr:"device"`. In server
+mode, `serve` starts an independent OCR worker using `hx-visual`'s bundled helper
+(or a development `swiftc` fallback). It discovers published `media.still` blobs on
 startup and while serving, including old stills and either event/blob upload
 ordering. The core stores results per exact blob hash and engine identity
 (helper source/configuration plus macOS build). One OS file lock in
@@ -222,8 +224,21 @@ sharing that directory. Decoding and OCR run on a blocking
 thread, independently of the interpretation queue. PNG, JPEG and TIFF stills are
 supported by the sampling decoder; decode/engine failures retry five times with a
 30-second delay, then remain visibly `failed` in `ocr_jobs`. An operator can reset
-attempts/status after fixing the cause. Non-macOS servers retain stills for later
-backfill; no empty result is recorded as successful OCR.
+attempts/status after fixing the cause.
+
+In device mode, the Mac app runs the same Vision helper and sends
+`PUT /v1/ocr/{sha}` with ingest scope. Bodies are limited to 1 MiB, require a
+`vision:` engine identity, normalized confidence and bounding boxes, and `partial`
+coverage. Unknown fields (including disclosure classes) are rejected. The hash
+must belong to a `media.still` in the token's prefixes. Server mode rejects PUTs
+with 409; device mode acknowledges the first complete or sampled result per hash
+and ignores later results with 200, even across engine upgrades. A failed result
+can be replaced by a successful retry. Lineage is published in bounded batches
+every second, so late duplicate stills link without another OCR call. Storage
+failures return retryable statuses, including when a sampled reference is not yet
+stored. Unprocessed stills moved from a Mac server remain stored without text;
+there is no portable engine or backfill on a device-mode server. Connector-only
+installations need no OCR.
 
 An 8×8 luminance hash skips frames within three bits of a recognized frame on the
 same connector/device/display/application within thirty seconds. Skips are recorded
