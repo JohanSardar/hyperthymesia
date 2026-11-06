@@ -80,11 +80,8 @@ impl HostRunner {
             .set_language(&tree_sitter_bash::LANGUAGE.into())
             .ok()?;
         let tree = parser.parse(source, None)?;
-        // Best-effort accident guard: unsupported or unparseable shell must run.
-        // Rejecting it would turn ordinary source commands into source failures.
-        if tree.root_node().has_error() {
-            return None;
-        }
+        // Bash may execute complete commands before a later syntax error.
+        // Inspect the recovered tree without rejecting syntax errors themselves.
         self.inspect_node(tree.root_node(), source, &mut cwd.to_path_buf(), depth)
     }
 
