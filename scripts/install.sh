@@ -401,7 +401,7 @@ fi
 # status and the guard are read-only with respect to the databases. The guard
 # prevents the service worker from claiming work until this lifecycle returns.
 if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
-    /bin/sh -n "$state/server.env" || die 'invalid server.env syntax; old service left running'
+    /bin/sh -n "$state/server.env" >/dev/null 2>&1 || die 'invalid server.env syntax; old service left running'
     "$work/payload/hx-server" --state-dir "$state" doctor --state-only --allow-older-schema || die 'upgrade state preflight failed; old service left running'
     "$work/payload/hx-server" --state-dir "$state" status --require-idle || die 'upgrade refused; old service left running'
 fi
