@@ -6,7 +6,10 @@ use anyhow::ensure;
 use hx_schema::{
     ConnectorInstance, Kind, ObservationId, ObservationTime, Operation, Revision, SourceKey,
 };
-use hx_sources::recipe::Recipe;
+use hx_sources::{
+    recipe::Recipe,
+    request::{MAX_HTTP_RESPONSE_BYTES, McpTransport, Request},
+};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,7 +32,7 @@ pub struct StoredRecipe {
     pub id: String,
     pub source_id: String,
     pub name: String,
-    pub request_hash: String,
+    pub identity_hash: String,
     pub recipe: sqlx::types::Json<Recipe>,
     pub enabled: bool,
     pub owner_off: bool,
@@ -48,6 +51,7 @@ pub struct RecipeState {
 pub struct Addon {
     pub id: String,
     pub source_id: String,
+    pub name: String,
     pub text: String,
     pub enabled: bool,
     pub owner_off: bool,
@@ -147,7 +151,8 @@ impl Store {
     }
 
     /// The setup worker decides whether a result counts as success (at least
-    /// one recipe, or an explicit no_pull). Old generations cannot activate.
+    /// one recipe, or an explicit no_pull). Old generations and off sources
+    /// cannot activate configuration or become ready; their completion returns false.
     pub async fn finish_source_setup(
         &self,
         source: &str,
@@ -157,7 +162,7 @@ impl Store {
     ) -> Result<bool> {
         let result = stored_json(result);
         let mut tx = self.begin_write().await?;
-        let updated = sqlx::query("UPDATE setup_runs SET status=$3,result=$4,last_error=$5,finished_at=$6 WHERE source_id=$1 AND generation=$2 AND status='pending' AND EXISTS(SELECT 1 FROM sources WHERE id=$1 AND setup_generation=$2)")
+        let updated = sqlx::query("UPDATE setup_runs SET status=$3,result=$4,last_error=$5,finished_at=$6 WHERE source_id=$1 AND generation=$2 AND status='pending' AND EXISTS(SELECT 1 FROM sources WHERE id=$1 AND setup_generation=$2 AND enabled)")
             .bind(source).bind(generation).bind(if error.is_some() { "failed" } else { "succeeded" }).bind(result).bind(error).bind(Ts::now()).execute(&mut *tx).await?;
         if updated.rows_affected() == 0 {
             tx.rollback().await?;
@@ -187,21 +192,22 @@ impl Store {
         Ok(true)
     }
 
-    /// Setup-only save. Identity is the request, not the agent's chosen name.
+    /// Setup-only save. HTTP identity is source + method + normalized URL path;
+    /// query, headers, body and display name do not create a new owner switch.
+    /// A genuinely different path (or CLI name / MCP tool) is a different
+    /// pull. This is an identity boundary, not a detector for equivalent APIs.
     /// A re-save never writes enabled or owner_off, or resets the pull cursor.
     pub async fn save_recipe(&self, source: &str, recipe: &Recipe) -> Result<StoredRecipe> {
         recipe.validate()?;
         let mut recipe = recipe.clone();
         recipe.source = source.to_owned();
-        let request_hash = hash(&serde_json::to_vec(&serde_json::to_value(
-            &recipe.request,
-        )?)?);
+        let identity_hash = recipe_identity(&recipe)?;
         let value = stored_json(serde_json::to_value(&recipe)?);
         let id = new_id();
         let mut tx = self.begin_write().await?;
         ensure_source_on(&mut tx, source).await?;
-        let row: StoredRecipe = sqlx::query_as("INSERT INTO recipes(id,source_id,name,request_hash,recipe) VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_id,request_hash) DO UPDATE SET name=EXCLUDED.name,recipe=EXCLUDED.recipe RETURNING *")
-            .bind(id).bind(source).bind(&recipe.name).bind(request_hash).bind(value).fetch_one(&mut *tx).await?;
+        let row: StoredRecipe = sqlx::query_as("INSERT INTO recipes(id,source_id,name,identity_hash,recipe) VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_id,identity_hash) DO UPDATE SET name=EXCLUDED.name,recipe=EXCLUDED.recipe RETURNING *")
+            .bind(id).bind(source).bind(&recipe.name).bind(identity_hash).bind(value).fetch_one(&mut *tx).await?;
         sqlx::query(
             "INSERT INTO recipe_state(recipe_id,next_run_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
         )
@@ -260,40 +266,35 @@ impl Store {
         tx.commit().await
     }
 
-    /// Setup-only save. Re-saving identical notes preserves their owner switch.
-    pub async fn save_addon(&self, source: &str, text: &str) -> Result<Addon> {
+    /// Setup-only save. A stable name owns the switch, even when notes change.
+    /// A genuinely different name is a separate add-on; we do not detect prose
+    /// equivalence. Surrounding whitespace in the name is not significant.
+    pub async fn save_addon(&self, source: &str, name: &str, text: &str) -> Result<Addon> {
+        let name = name.trim();
+        ensure!(!name.is_empty(), "add-on name required");
         ensure!(
             !text.trim().is_empty() && text.len() <= 1000,
             "add-on must contain 1..=1000 bytes"
         );
-        let text_hash = hash(text.as_bytes());
         let id = new_id();
         let mut tx = self.begin_write().await?;
         ensure_source_on(&mut tx, source).await?;
-        let existing: Option<Addon> =
-            sqlx::query_as("SELECT * FROM addons WHERE source_id=$1 AND text_hash=$2")
-                .bind(source)
-                .bind(&text_hash)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some(row) = existing {
-            tx.commit().await?;
-            return Ok(row);
-        }
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM addons WHERE source_id=$1")
-            .bind(source)
-            .fetch_one(&mut *tx)
-            .await?;
-        ensure!(count < 3, "at most three add-ons per source");
-        let row = sqlx::query_as(
-            "INSERT INTO addons(id,source_id,text_hash,text) VALUES($1,$2,$3,$4) RETURNING *",
+        let existing: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM addons WHERE source_id=$1 AND name=$2)",
         )
-        .bind(id)
         .bind(source)
-        .bind(text_hash)
-        .bind(text)
+        .bind(name)
         .fetch_one(&mut *tx)
         .await?;
+        if !existing {
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM addons WHERE source_id=$1")
+                .bind(source)
+                .fetch_one(&mut *tx)
+                .await?;
+            ensure!(count < 3, "at most three add-ons per source");
+        }
+        let row = sqlx::query_as("INSERT INTO addons(id,source_id,name,text) VALUES($1,$2,$3,$4) ON CONFLICT(source_id,name) DO UPDATE SET text=EXCLUDED.text RETURNING *")
+            .bind(id).bind(source).bind(name).bind(text).fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -338,7 +339,12 @@ impl Store {
         source: &str,
         payload: Value,
     ) -> Result<i64> {
-        let revision = Revision::digest(&serde_json::to_vec(&payload)?);
+        let bytes = serde_json::to_vec(&payload)?;
+        ensure!(
+            bytes.len() <= MAX_HTTP_RESPONSE_BYTES,
+            "live payload exceeds 8 MiB"
+        );
+        let revision = Revision::digest(&bytes);
         let now = Utc::now();
         let envelope = Envelope {
             envelope_version: hx_schema::ENVELOPE_VERSION,
@@ -532,4 +538,66 @@ pub(crate) fn search_text(payload: &Value) -> String {
         visit(&mut out, payload);
     }
     out
+}
+
+// HTTP URL parsing resolves dot segments, supplies '/' for an empty path and
+// excludes queries/fragments. Decode only unreserved ASCII and canonicalize
+// other percent escapes; encoded path separators remain significant.
+fn normalized_path(address: &str) -> Result<String> {
+    let url = url::Url::parse(address).map_err(|_| anyhow::anyhow!("invalid recipe URL"))?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "HTTP recipe URL required"
+    );
+    let bytes = url.path().as_bytes();
+    let mut out = String::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%'
+            && at + 2 < bytes.len()
+            && let Ok(value) = u8::from_str_radix(&url.path()[at + 1..at + 3], 16)
+        {
+            if value.is_ascii_alphanumeric() || b"-._~".contains(&value) {
+                out.push(char::from(value));
+            } else {
+                use std::fmt::Write;
+                write!(out, "%{value:02X}")?;
+            }
+            at += 3;
+        } else {
+            out.push(char::from(bytes[at]));
+            at += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn recipe_identity(recipe: &Recipe) -> Result<String> {
+    let executable = |argv: &[String]| -> Result<String> {
+        Ok(argv
+            .first()
+            .filter(|s| !s.is_empty())
+            .context("recipe executable required")?
+            .clone())
+    };
+    let identity = match &recipe.request {
+        Request::Http { method, url, .. } => {
+            ensure!(!method.trim().is_empty(), "recipe method required");
+            json!([
+                "http",
+                method.trim().to_ascii_uppercase(),
+                normalized_path(url)?
+            ])
+        }
+        // CLI has no HTTP method/path. Its stable recipe name distinguishes
+        // pulls from the same executable; flags/env changes preserve the switch.
+        Request::Cli { argv, .. } => json!(["cli", executable(argv)?, recipe.name.trim()]),
+        Request::Mcp {
+            transport, tool, ..
+        } => match transport {
+            McpTransport::Http { url } => json!(["mcp_http", normalized_path(url)?, tool]),
+            McpTransport::Stdio { argv } => json!(["mcp_stdio", executable(argv)?, tool]),
+        },
+    };
+    Ok(hash(&serde_json::to_vec(&identity)?))
 }
