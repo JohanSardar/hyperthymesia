@@ -414,6 +414,8 @@ esac
             if (stubs / command).exists(): (stubs / command).unlink()
         assert result.returncode != 0
         assert log.read_text().count('enable --now hyperthymesia.service') == 2, result.stderr
+        if fault == 'switch':
+            assert os.readlink(prefix / 'current') == str(prefix / '0.1.0'), 'restart must target the old version even if atomic switch fails'
         assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
     print('ok: recovery IO failures still attempt old-service restart and report damage')
 PY
