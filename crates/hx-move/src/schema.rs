@@ -142,6 +142,48 @@ pub fn tables() -> Vec<Table> {
             true,
         ),
         Table::new(
+            "sources",
+            "id:s connector_instance:s name:s description:s enabled:b status:s history_days:i connected_at:t setup_generation:i last_pull_at:t last_error:s",
+            "id",
+            false,
+        ),
+        Table::new(
+            "recipes",
+            "id:s source_id:s name:s identity_hash:s recipe:j enabled:b owner_off:b",
+            "id",
+            false,
+        ),
+        Table::new(
+            "recipe_state",
+            "recipe_id:s cursor:j next_run_at:t last_ok_at:t last_error:s",
+            "recipe_id",
+            false,
+        ),
+        Table::new(
+            "addons",
+            "id:s source_id:s name:s text:s enabled:b owner_off:b",
+            "id",
+            false,
+        ),
+        Table::new(
+            "switch_log",
+            "id:i target_kind:s target_id:s enabled:b changed_at:t",
+            "id",
+            false,
+        ),
+        Table::new(
+            "setup_runs",
+            "source_id:s generation:i status:s result:j last_error:s created_at:t finished_at:t",
+            "source_id,generation",
+            false,
+        ),
+        Table::new(
+            "live_snapshots",
+            "id:i run_token:s connector_instance:s revision:s envelope:j sensitivity:s created_at:t",
+            "id",
+            false,
+        ),
+        Table::new(
             "pair_codes",
             "hash:s name:s expires_at:t used_at:t revoked:b token_hash:s",
             "hash",

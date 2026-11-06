@@ -264,10 +264,21 @@ async fn exercise(url: &str) -> Result<()> {
     );
     let store = Store::open(&target).await?;
     hx_move::core::verify(&store, &report.tables).await?;
-    ensure!(
-        report.tables["pair_codes"].rows == 0,
-        "legacy Postgres has no pair codes"
-    );
+    for table in [
+        "pair_codes",
+        "sources",
+        "recipes",
+        "recipe_state",
+        "addons",
+        "switch_log",
+        "setup_runs",
+        "live_snapshots",
+    ] {
+        ensure!(
+            report.tables[table].rows == 0,
+            "SQLite-only table {table} must start empty"
+        );
+    }
     let token = store
         .authenticate("synthetic-token-secret")
         .await?

@@ -167,7 +167,13 @@ impl Snapshot {
         store: &Store,
         projection: fn(&Table) -> String,
     ) -> Result<Inventory> {
-        let mut expected = Inventory::new();
+        // SQLite-only tables start empty. Derived state below overwrites its
+        // entries; the rest (pairing/configuration/live evidence) stays empty.
+        let mut expected: Inventory = tables()
+            .into_iter()
+            .filter(|table| !table.legacy)
+            .map(|table| (table.name.to_owned(), RowHasher::default().finish()))
+            .collect();
         let mut dependencies_hash = RowHasher::default();
         let mut tx = store.begin_write().await?;
         sqlx::query("PRAGMA defer_foreign_keys=ON")
@@ -219,7 +225,6 @@ impl Snapshot {
             expected.insert(table.name.to_owned(), hash.finish());
         }
         expected.insert("revision_dependencies".into(), dependencies_hash.finish());
-        expected.insert("pair_codes".into(), RowHasher::default().finish());
         // Read sequence state, never nextval/setval. PostgreSQL sequences are
         // not MVCC: the owner must stop writers; a second read fences movement.
         let sequences = self.initial_sequences.clone();

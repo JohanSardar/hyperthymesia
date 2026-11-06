@@ -204,6 +204,9 @@ and `revision24_finished` are copied exactly. Replaying repairs at move time
 would change the paid-work budget. The synthetic CI contract checks that
 `schedule()` creates or revives zero paid jobs on settled moved history.
 
-`pair_codes` is SQLite-only and starts empty; existing `device_tokens`, including
+`pair_codes`, `sources`, `recipes`, `recipe_state`, `addons`, `switch_log`,
+`setup_runs` and `live_snapshots` are SQLite-only and start empty. Their schema,
+collision/immutability triggers and sequence definitions are created by the
+current store migrations and remain intact. Existing `device_tokens`, including
 revocation, prefixes and scopes, are copied and audited. No device secrets are
 printed. The synthetic rehearsal verifies an existing token still authenticates.
