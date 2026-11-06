@@ -485,3 +485,125 @@ async fn device_capability_requires_ingest_auth() {
     assert_eq!(body, json!({"ocr":expected}));
     f.close().await;
 }
+
+#[tokio::test]
+async fn upgrade_guard_keeps_requests_retryable_and_refuses_live_leases() {
+    use tokio::time::{Duration, sleep, timeout};
+    let f = Fixture::new().await;
+    let home = tempfile::tempdir().unwrap();
+    let address = {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
+    };
+    let mut server = Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .args(["serve", "--listen", &address.to_string()])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("HX_STATE_DIR", &f.store.data_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    async fn request(
+        address: std::net::SocketAddr,
+        path: &str,
+        method: &str,
+    ) -> std::io::Result<u16> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(address).await?;
+        stream.write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").as_bytes()).await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(String::from_utf8_lossy(&response)
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap())
+    }
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if request(address, "/healthz", "GET").await.is_ok() {
+                break;
+            }
+            assert!(server.try_wait().unwrap().is_none());
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let marker = home.path().join("guard-held");
+    let mut guard = timeout(Duration::from_secs(5), async {
+        loop {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_hx-server"))
+                .args(["upgrade-guard", "/bin/sh", "-c", "touch \"$1\"; cat", "sh"])
+                .arg(&marker)
+                .env_clear()
+                .env("HOME", home.path())
+                .env("PATH", "/usr/bin:/bin")
+                .env("HX_STATE_DIR", &f.store.data_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            loop {
+                if marker.exists() {
+                    break;
+                }
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+            if marker.exists() {
+                break child;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("guard must acquire during an idle worker tick");
+    let status = request(address, "/v1/events", "POST").await.unwrap();
+    let health = request(address, "/healthz", "GET").await.unwrap();
+    // Close stdin to finish the guarded lifecycle, preserving its lock to exit.
+    drop(guard.stdin.take());
+    assert!(
+        timeout(Duration::from_secs(5), guard.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let resumed = request(address, "/v1/events", "POST").await.unwrap();
+    let mut tx = f.store.begin_write().await.unwrap();
+    sqlx::query("INSERT INTO jobs(output_key,kind,payload,state,available_at,lease_until,lease_owner) VALUES('guard-test','interpret','{}','running',0,$1,'synthetic')")
+        .bind(hx_store::Ts::from(Utc::now() + chrono::Duration::minutes(5))).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .args(["upgrade-guard", "/usr/bin/touch"])
+        .arg(home.path().join("must-not-run"))
+        .env_clear()
+        .env("HOME", home.path())
+        .env("HX_STATE_DIR", &f.store.data_dir)
+        .output()
+        .await
+        .unwrap();
+    Command::new("/bin/kill")
+        .args(["-TERM", &server.id().unwrap().to_string()])
+        .status()
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), server.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    f.close().await;
+    assert_eq!(status, 503);
+    assert_eq!(health, 200);
+    assert_ne!(resumed, 503);
+    assert!(!refused.status.success());
+    assert!(!home.path().join("must-not-run").exists());
+}

@@ -28,8 +28,23 @@ enum Command {
         #[arg(long)]
         from: PathBuf,
     },
-    /// Check provider readiness without connecting to the database or calling a model.
-    Doctor,
+    /// Check state privacy/schema and provider readiness without calling a model.
+    Doctor {
+        /// Check only state/schema/privacy; provider login may still be missing.
+        #[arg(long)]
+        state_only: bool,
+    },
+    /// Read schema compatibility and the number of live interpret leases.
+    Status {
+        #[arg(long)]
+        require_idle: bool,
+    },
+    /// Hold the service worker idle throughout an installer lifecycle.
+    #[command(hide = true)]
+    UpgradeGuard {
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<std::ffi::OsString>,
+    },
     Serve {
         #[arg(long, default_value = "127.0.0.1:7377")]
         listen: SocketAddr,
@@ -69,7 +84,16 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Doctor) {
+    if let Command::Doctor { state_only } = &cli.command {
+        if let Some(dir) = &cli.state_dir {
+            Store::check_state(dir).await?;
+            println!("ok: private state, current schema and SQLite integrity");
+        } else if *state_only {
+            bail!("--state-dir or HX_STATE_DIR is required for --state-only");
+        }
+        if *state_only {
+            return Ok(());
+        }
         if matches!(ProviderConfig::from_env(), ProviderConfig::Stub) {
             bail!("HX_PROVIDER selects the stub; set HX_PROVIDER=fx for real interpretation");
         }
@@ -81,8 +105,43 @@ async fn main() -> Result<()> {
         .state_dir
         .context("--state-dir or HX_STATE_DIR is required")?;
     if matches!(cli.command, Command::Migrate) {
-        let store = Store::create(&dir).await?;
+        let store = Store::migrate(&dir).await?;
         store.pool.close().await;
+        return Ok(());
+    }
+    if let Command::Status { require_idle } = &cli.command {
+        let leases = Store::status(&dir).await?;
+        println!("{}", serde_json::json!({"running_interpret_leases":leases}));
+        if *require_idle && leases != 0 {
+            bail!("upgrade refused: running interpret lease");
+        }
+        return Ok(());
+    }
+    if let Command::UpgradeGuard { command } = &cli.command {
+        let lock = worker_lock(&dir)?;
+        lock.try_lock()
+            .context("upgrade refused: worker is active; retry when idle")?;
+        if Store::status(&dir).await? != 0 {
+            bail!("upgrade refused: running interpret lease");
+        }
+        let shutdown = shutdown_signal()?;
+        let mut child = tokio::process::Command::new(&command[0])
+            .args(&command[1..])
+            .spawn()?;
+        let status = tokio::select! {
+            status = child.wait() => status?,
+            _ = shutdown => {
+                if let Some(pid) = child.id() {
+                    tokio::process::Command::new("/bin/kill").args(["-TERM", &pid.to_string()]).status().await?;
+                }
+                child.wait().await?
+            }
+        };
+        // Keep the advisory lock until the lifecycle (including rollback) exits.
+        drop(lock);
+        if !status.success() {
+            bail!("installer lifecycle failed: {status}");
+        }
         return Ok(());
     }
     // Neither command opens a writable source pool. Restore must work before
@@ -94,8 +153,10 @@ async fn main() -> Result<()> {
     }
     let store = Store::open(&dir).await?;
     match cli.command {
-        Command::Doctor => unreachable!("doctor runs without a database"),
-        Command::Migrate => unreachable!("migrate creates a new state"),
+        Command::Doctor { .. } | Command::Status { .. } | Command::UpgradeGuard { .. } => {
+            unreachable!("readiness commands run before opening the store")
+        }
+        Command::Migrate => unreachable!("migrate runs before opening the store"),
         Command::Backup { .. } | Command::Restore { .. } => {
             unreachable!("backup and restore run without opening the store")
         }
@@ -147,7 +208,26 @@ async fn main() -> Result<()> {
             };
             let ocr_worker = if cfg!(target_os = "macos") {
                 let store = store.clone();
+                let dir = dir.clone();
                 Some(tokio::spawn(async move {
+                    // A newly started service must not publish derived state
+                    // during the installer's verification/rollback window.
+                    let Ok(lock) = worker_lock(&dir) else {
+                        return;
+                    };
+                    loop {
+                        match lock.try_lock_shared() {
+                            Ok(()) => break,
+                            Err(std::fs::TryLockError::WouldBlock) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await
+                            }
+                            Err(e) => {
+                                tracing::error!("OCR startup lock failed: {e}");
+                                return;
+                            }
+                        }
+                    }
+                    drop(lock);
                     if hx_server::ocr::worker(store).await.is_err() {
                         tracing::error!("OCR worker unavailable");
                     }
@@ -158,9 +238,24 @@ async fn main() -> Result<()> {
                 );
                 None
             };
+            let worker_lock = worker_lock(&dir)?;
             let worker = tokio::spawn(async move {
                 let mut next_schedule = tokio::time::Instant::now();
                 loop {
+                    // Shared across the scheduler/claim/provider future. An
+                    // upgrade's exclusive lock prevents a check/stop claim race.
+                    let guard = match worker_lock.try_lock_shared() {
+                        Ok(()) => Some(&worker_lock),
+                        Err(std::fs::TryLockError::WouldBlock) => None,
+                        Err(e) => {
+                            tracing::error!("worker lock failed: {e}");
+                            return;
+                        }
+                    };
+                    let Some(guard) = guard else {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    };
                     if tokio::time::Instant::now() >= next_schedule {
                         next_schedule =
                             tokio::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -169,16 +264,23 @@ async fn main() -> Result<()> {
                         }
                     }
                     match hx_jobs::run_one(&runner.store, &runner).await {
-                        Ok(true) => continue,
+                        Ok(true) => {
+                            let _ = guard.unlock();
+                            continue;
+                        }
                         Err(e) => tracing::error!("processing failed: {e:#}"),
                         Ok(false) => {}
                     }
+                    let _ = guard.unlock();
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             });
             let stop_worker = worker.abort_handle();
             let stop_ocr = ocr_worker.as_ref().map(|worker| worker.abort_handle());
-            let result = axum::serve(listener, hx_server::router(store, policy))
+            let router = hx_server::router(store, policy).layer(
+                axum::middleware::from_fn_with_state(dir.clone(), maintenance_gate),
+            );
+            let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     shutdown.await;
                     // Cancel provider work before waiting for HTTP connections
@@ -225,4 +327,41 @@ fn windows(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Interval>> {
         w = hx_store::window_at(w.end);
     }
     Ok(result)
+}
+
+fn worker_lock(dir: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(dir.join("locks/upgrade.lock"))?)
+}
+
+/// Keep uploads retryable during an installer rollback window. The shared lock
+/// also fences in-flight requests before an upgrade can take its exclusive lock.
+async fn maintenance_gate(
+    axum::extract::State(dir): axum::extract::State<PathBuf>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if request.uri().path() == "/healthz" {
+        return next.run(request).await;
+    }
+    let Ok(lock) = worker_lock(&dir) else {
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if lock.try_lock_shared().is_err() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "upgrade in progress; retry later",
+        )
+            .into_response();
+    }
+    let response = next.run(request).await;
+    drop(lock);
+    response
 }
