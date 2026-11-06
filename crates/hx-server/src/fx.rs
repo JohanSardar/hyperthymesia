@@ -10,7 +10,7 @@ use hx_schema::Interval;
 use hx_store::Store;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::PathBuf, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 pub const PROMPT_VERSION: &str = "hx-replica/v9";
 pub const PROMPT: &str = include_str!("../prompts/replica-v9.txt");
@@ -280,27 +280,65 @@ impl Drop for Server {
     }
 }
 
-/// Captures bounded streams while waiting. Dropping on timeout kills the child.
+/// A pipe, rather than a Rust destructor, owns the whole fx process group.
+/// SIGKILL closes the server's write end too. A separate watcher then kills fx
+/// and its descendants on both Linux and macOS, even if fx ignores stdin/TERM.
+/// Start the watcher and fx in the same new group; no spawn/notify-PID race.
+const FX_GUARD: &str = r#"
+input=$1
+shift
+# POSIX shells may replace background stdin with /dev/null. Save the pipe
+# before backgrounding, and do not let fx inherit the watcher's descriptor.
+exec 3<&0
+( IFS= read -r _ <&3 || :; /bin/kill -KILL -- "-$$" ) &
+watcher=$!
+"$@" < "$input" 3<&- &
+child=$!
+result=0
+wait "$child" || result=$?
+kill "$watcher" 2>/dev/null || :
+wait "$watcher" 2>/dev/null || :
+exit "$result"
+"#;
+
+/// Captures bounded streams while waiting. Cancellation closes the life pipe.
 async fn output(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     input: &str,
     timeout: Duration,
 ) -> Result<std::process::Output> {
-    command
+    use std::io::Write;
+    let mut prompt = tempfile::NamedTempFile::new()?;
+    prompt.write_all(input.as_bytes())?;
+    prompt.flush()?;
+    let original = command.as_std();
+    let mut guard = tokio::process::Command::new("/bin/sh");
+    guard
+        .env_clear()
+        .envs(
+            original
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .args(["-c", FX_GUARD, "hx-fx-guard"])
+        .arg(prompt.path())
+        .arg(original.get_program())
+        .args(original.get_args())
+        .process_group(0)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command.spawn().context("start fx")?;
-    let mut stdin = child.stdin.take().context("fx stdin")?;
+    if let Some(dir) = original.get_current_dir() {
+        guard.current_dir(dir);
+    }
+    let mut child = guard.spawn().context("start fx")?;
+    // Keep this open until the future finishes or is dropped. Never pass it to
+    // fx: its stdin is the private prompt file, not the watcher's life pipe.
+    let _liveness = child.stdin.take().context("fx life pipe")?;
     let stdout = child.stdout.take().context("fx stdout")?;
     let stderr = child.stderr.take().context("fx stderr")?;
     tokio::time::timeout(timeout, async {
-        let send = async move {
-            stdin.write_all(input.as_bytes()).await?;
-            drop(stdin);
-            Ok::<_, std::io::Error>(())
-        };
         let read = |stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>| async move {
             let mut bytes = vec![];
             stream
@@ -335,11 +373,7 @@ async fn output(
                 }
             }
         };
-        let (_, stdout, stderr) = tokio::try_join!(
-            async { send.await.map_err(anyhow::Error::from) },
-            read(Box::new(stdout)),
-            watch
-        )?;
+        let (stdout, stderr) = tokio::try_join!(read(Box::new(stdout)), watch)?;
         Ok::<_, anyhow::Error>(std::process::Output {
             status: child.wait().await?,
             stdout,
