@@ -16,6 +16,16 @@ pub struct TokenInfo {
     pub revoked: bool,
 }
 
+/// Safe to display: only code hashes and metadata, with UTC microsecond times.
+#[derive(Serialize, sqlx::FromRow)]
+pub struct PairCodeInfo {
+    pub id: String,
+    pub name: String,
+    pub expires_at: i64,
+    pub used_at: Option<i64>,
+    pub revoked: bool,
+}
+
 impl Store {
     pub async fn create_pair_code(&self, name: &str) -> Result<String> {
         ensure!(!name.trim().is_empty(), "a device name is required");
@@ -31,23 +41,31 @@ impl Store {
         Ok(code)
     }
 
-    /// Acquire the writer BEFORE checking validity or expiry. Both consumption
-    /// and token creation commit together; a lost response still burns the code.
+    /// Reject malformed and obviously unavailable codes without taking a writer.
+    /// The unlocked lookup is only a hint: recheck under the writer before
+    /// consuming the code or issuing a token. A lost response burns the code.
     pub async fn redeem_pair_code(&self, code: &str, device_id: &str) -> Result<Option<String>> {
-        let mut tx = self.begin_write().await?;
         if code.len() != 64
             || !code.bytes().all(|c| c.is_ascii_hexdigit())
             || device_id.is_empty()
             || device_id.len() > 255
-            || device_id.trim() != device_id
-            || device_id.chars().any(char::is_control)
+            || matches!(device_id, "." | "..")
+            || !device_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         {
             return Ok(None);
         }
         let code_hash = hash(code.to_ascii_lowercase().as_bytes());
+        let available: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pair_codes WHERE hash=$1 AND used_at IS NULL AND NOT revoked AND expires_at>$2)")
+            .bind(&code_hash).bind(Ts::now()).fetch_one(&self.pool).await?;
+        if !available {
+            return Ok(None);
+        }
+        let mut tx = self.begin_write().await?;
         let now = Ts::now();
         let name: Option<String> = sqlx::query_scalar(
-            "SELECT name FROM pair_codes WHERE hash=$1 AND used_at IS NULL AND expires_at>$2",
+            "SELECT name FROM pair_codes WHERE hash=$1 AND used_at IS NULL AND NOT revoked AND expires_at>$2",
         )
         .bind(&code_hash)
         .bind(now)
@@ -64,6 +82,13 @@ impl Store {
         .into_iter()
         .map(|namespace| format!("{namespace}:{device_id}"))
         .collect();
+        // Exact prefix membership, not starts_with: a legacy namespace-wide
+        // token doesn't reserve a device. Any live exact prefix does.
+        let claimed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM device_tokens t,json_each(t.prefixes) p WHERE NOT t.revoked AND p.value IN (SELECT value FROM json_each($1)))")
+            .bind(sqlx::types::Json(&prefixes)).fetch_one(&mut *tx).await?;
+        if claimed {
+            return Ok(None);
+        }
         let secret = random_secret()?;
         let token_hash = hash(secret.as_bytes());
         sqlx::query(
@@ -82,6 +107,24 @@ impl Store {
             .await?;
         tx.commit().await?;
         Ok(Some(secret))
+    }
+
+    pub async fn list_pair_codes(&self) -> Result<Vec<PairCodeInfo>> {
+        Ok(sqlx::query_as("SELECT hash AS id,name,expires_at,used_at,revoked FROM pair_codes ORDER BY expires_at,hash")
+            .fetch_all(&self.pool).await?)
+    }
+
+    pub async fn revoke_pair_code(&self, id: &str) -> Result<bool> {
+        ensure!(valid_hash(id), "use the full code ID from pair list");
+        let mut tx = self.begin_write().await?;
+        let changed = sqlx::query("UPDATE pair_codes SET revoked=1 WHERE hash=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     pub async fn list_tokens(&self) -> Result<Vec<TokenInfo>> {

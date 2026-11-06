@@ -33,7 +33,11 @@ impl Token {
         self.scopes.iter().any(|s| s == scope)
     }
     pub fn allows(&self, connector: &str) -> bool {
-        self.prefixes.iter().any(|p| connector.starts_with(p))
+        self.prefixes.iter().any(|prefix| {
+            connector.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.is_empty() || prefix.ends_with(':') || suffix.starts_with(':')
+            })
+        })
     }
 }
 
@@ -786,7 +790,7 @@ mod reads;
 pub use reads::*;
 
 mod pairing;
-pub use pairing::TokenInfo;
+pub use pairing::{PairCodeInfo, TokenInfo};
 
 mod processing;
 pub use processing::*;
