@@ -79,7 +79,8 @@ async fn broker_cannot_read_or_cite_another_runs_live_snapshot() -> Result<()> {
     let generation = store.generation(original.window).await?;
     let (revision, published) = store.publish_revision_manifest(
         original.window, generation,
-        json!({"episodes":[{"evidence":[id]}],"tasks":[],"summary":"Synthetic historical result"}),
+        json!({"episodes":[{"evidence":[id]}],"tasks":[],"summary":"Synthetic historical result",
+            "input_manifest":{"disclosure_policy":{"digest":policy.digest()},"sensitive_egress":"full","input_namespaces":[source.connector_instance]}}),
         "synthetic-run", std::slice::from_ref(&source.connector_instance),
     ).await?;
     assert!(published);

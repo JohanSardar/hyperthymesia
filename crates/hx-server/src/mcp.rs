@@ -521,15 +521,16 @@ impl Broker {
         let mut revisions = vec![];
         for row in rows {
             let value: Value = row.interpretation;
-            // Prose cannot be selectively redacted. Fail closed for legacy/changed policies.
-            if value["input_manifest"]["disclosure_policy"]["digest"] != self.policy.digest()
-                || value["input_manifest"]["sensitive_egress"] != json!(self.sensitive)
+            if crate::disclosure::revision_disclosable(
+                &self.store,
+                &value,
+                &self.policy,
+                self.sensitive,
+            )
+            .await?
             {
-                continue;
-            }
-            let ids = revision_evidence(&value);
-            if self.allowed_ids(&ids).await? {
-                revisions.push(json!({"revision_id":row.id,"episodes":value["episodes"],"tasks":value["tasks"],"summary":value["summary"],"evidence":ids,"self_generated":true}));
+                let ids = revision_evidence(&value);
+                revisions.push(json!({"revision_id":row.id,"episodes":value["episodes"],"tasks":value["tasks"],"summary":value["summary"],"evidence":ids,"input_namespaces":value["input_manifest"]["input_namespaces"],"self_generated":true}));
             }
         }
         Ok(json!({"entities":entities,"revisions":revisions}))
@@ -544,8 +545,15 @@ impl Broker {
         // Validate untrusted arguments before they can choose a namespace. Every
         // admitted request still spends its budget even when validation fails.
         let mut validated = validate_arguments(&self.mode, name, &args);
+        // Keep this run's base policy, but never reuse its original source grants.
+        // Clones share reservations/audit; a refresh failure still spends a call.
+        let mut current = self.clone();
+        match self.store.source_grants().await {
+            Ok(grants) => current.policy.source_grants = grants,
+            Err(error) => validated = Err(error.context("refresh source disclosure grants")),
+        }
         if validated.as_ref().is_ok_and(Option::is_some)
-            && let Err(error) = self.check_source(&args).await
+            && let Err(error) = current.check_source(&args).await
         {
             // A rejected source read saw no source data. Do not taint the
             // manifest and turn this failed live call into a deferred window.
@@ -602,7 +610,7 @@ impl Broker {
         // No tool execution, database work or generation check holds the audit
         // lock. Clones share the counters; cancellation never refunds a call.
         let result = match &validated {
-            Ok(_) => self.execute(name, &args).await,
+            Ok(_) => current.execute(name, &args).await,
             Err(error) => Err(anyhow::anyhow!(error.to_string())),
         };
         self.check_generation().await?;
@@ -632,6 +640,18 @@ impl Broker {
         let metadata: Result<_> = async {
             let mut namespaces = std::collections::BTreeSet::new();
             if !failed {
+                if name == "prior_context" {
+                    for revision in result["revisions"].as_array().into_iter().flatten() {
+                        namespaces.extend(
+                            revision["input_namespaces"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned),
+                        );
+                    }
+                }
                 let mut ids = std::collections::BTreeSet::new();
                 collect_provenance(&result, &mut ids);
                 for id in ids {
@@ -643,6 +663,22 @@ impl Broker {
                         namespaces.insert(namespace);
                     }
                 }
+            }
+            if !failed {
+                // Results may have been read while the owner switched a source
+                // off. Check every stored tool's provenance, including uncited
+                // prior-context dependencies, before auditing or returning prose.
+                let grants = self
+                    .store
+                    .source_grants()
+                    .await
+                    .map_err(|error| error.context("recheck source disclosure grants"))?;
+                ensure!(
+                    namespaces.iter().all(|namespace| {
+                        !namespace.starts_with("source:") || grants.contains(namespace)
+                    }) && source.is_none_or(|source| grants.contains(&format!("source:{source}"))),
+                    "source disclosure changed; result withheld"
+                );
             }
             let attention: Vec<hx_compile::Lane> = result
                 .get("attention")
@@ -1135,7 +1171,8 @@ pub(crate) async fn owner_allowed_ids(
 }
 
 fn visible(policy: &DisclosurePolicy, sensitive: SensitiveEgress, e: &Envelope) -> bool {
-    policy.effective_class(e) != Sensitivity::Restricted
+    !(sensitive == SensitiveEgress::Redact && e.connector_instance.as_str().starts_with("source:"))
+        && policy.effective_class(e) != Sensitivity::Restricted
         && !(sensitive == SensitiveEgress::Redact
             && policy.effective_class(e) == Sensitivity::Sensitive)
         && !matches!(e.kind.as_str(), "policy.gap" | "media.chunk")
@@ -1169,6 +1206,112 @@ mod broker_tests {
     }
     fn live_args(source: &str) -> Value {
         json!({"source":source,"request":{"kind":"http","method":"GET","url":"https://example.invalid"},"timeout_s":180})
+    }
+
+    #[tokio::test]
+    async fn broker_rechecks_source_grants_after_stored_tools() {
+        // The execution seam models revocation after the initial policy check,
+        // before a stored tool has finished reading. No timing race or sleep.
+        let mut leaked = Vec::new();
+        for name in [
+            "prior_context",
+            "read_evidence",
+            "search",
+            "timeline",
+            "window_overview",
+            "screen_at",
+            "list_sources",
+        ] {
+            let (_dir, mut broker, source) = fixture().await;
+            broker.test_execute = Some(Arc::new({
+                let store = broker.store.clone();
+                let source = source.clone();
+                let run_token = broker.run_token();
+                move |name, _| {
+                    let store = store.clone();
+                    let source = source.clone();
+                    Box::pin(async move {
+                        let id = store
+                            .save_live_snapshot(
+                                run_token,
+                                &source.id,
+                                json!({"synthetic":"secret"}),
+                            )
+                            .await?;
+                        store.set_source_enabled(&source.id, false).await?;
+                        if name == "prior_context" {
+                            Ok(json!({"revisions":[{"summary":"revoked in flight",
+                                "input_namespaces":[source.connector_instance]}]}))
+                        } else {
+                            Ok(json!({"evidence":[EvidenceItem {
+                                effective_class: Sensitivity::Sensitive,
+                                id,
+                                at: Utc::now(),
+                                kind: "sensitive:live.snapshot".into(),
+                                text: "revoked in flight".into(),
+                                self_generated: false,
+                            }]}))
+                        }
+                    })
+                }
+            }));
+            let args = match name {
+                "read_evidence" => json!({"id":1}),
+                "search" => json!({"query":"synthetic"}),
+                "screen_at" => json!({"time":broker.window.start}),
+                _ => json!({}),
+            };
+            let result = broker.call(name, args).await.unwrap();
+            if result.to_string().contains("revoked in flight") {
+                leaked.push(name);
+            }
+            assert!(
+                !broker
+                    .store
+                    .source(&source.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .enabled,
+                "{name} must execute before revocation is checked"
+            );
+            let audit = broker.audit.lock().await;
+            assert!(audit.evidence.is_empty());
+            assert!(audit.input_namespaces.is_empty());
+        }
+        assert!(
+            leaked.is_empty(),
+            "in-flight revocation leaked through {leaked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_source_grant_refresh_failure_withholds_results() {
+        for fail_before in [true, false] {
+            let (_dir, mut broker, _source) = fixture().await;
+            let executions = Arc::new(AtomicUsize::new(0));
+            broker.test_execute = Some(Arc::new({
+                let store = broker.store.clone();
+                let executions = executions.clone();
+                move |_, _| {
+                    let store = store.clone();
+                    let executions = executions.clone();
+                    Box::pin(async move {
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        store.pool.close().await;
+                        Ok(json!({"secret":"must be withheld"}))
+                    })
+                }
+            }));
+            if fail_before {
+                broker.store.pool.close().await;
+            }
+            let result = broker.call("list_sources", json!({})).await.unwrap();
+            assert!(!result.to_string().contains("must be withheld"));
+            assert!(result.get("error").is_some());
+            assert_eq!(executions.load(Ordering::SeqCst), usize::from(!fail_before));
+            assert_eq!(broker.audit.lock().await.lookups, 1);
+        }
     }
 
     #[tokio::test]
