@@ -335,6 +335,15 @@ esac
     assert snapshot(h) == before, 'held lease changed installation'
     print('ok: held lease refuses upgrade without writes')
 
+    # Refusable state checks happen before any stop or destination write.
+    log = root / 'commands'
+    log.write_text('')
+    os.environ['TEST_FAIL_STEP'] = 'doctor'
+    fails_unchanged(h, 1)
+    os.environ.pop('TEST_FAIL_STEP')
+    assert '--user stop' not in log.read_text()
+    print('ok: state preflight refusal leaves old service and files untouched')
+
     # An upgraded payload must survive rollback with its old evidence/env intact.
     state = h / '.local/state/hyperthymesia'
     (state / 'core.sqlite').write_text('synthetic seeded evidence')
