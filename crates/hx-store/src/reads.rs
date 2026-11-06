@@ -7,6 +7,8 @@ pub struct CanonicalRevision {
     pub input_generation: i64,
     pub interpretation: Value,
     pub has_agent_run: bool,
+    #[sqlx(json)]
+    pub input_namespaces: Vec<String>,
     #[sqlx(try_from = "Ts")]
     pub end_at: DateTime<Utc>,
 }
@@ -158,7 +160,7 @@ impl Store {
         end: DateTime<Utc>,
         prefixes: &[String],
     ) -> Result<Vec<CanonicalRevision>> {
-        sqlx::query_as("SELECT r.id,r.input_generation,r.interpretation,r.agent_run IS NOT NULL AS has_agent_run,w.end_at FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at<$2 AND w.end_at>$1 AND NOT EXISTS(SELECT 1 FROM json_each(r.input_namespaces) n WHERE NOT EXISTS(SELECT 1 FROM json_each($3) p WHERE substr(n.value,1,length(p.value))=p.value)) ORDER BY w.start_at").bind(Ts::from(start)).bind(Ts::from(end)).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await
+        sqlx::query_as("SELECT r.id,r.input_generation,r.interpretation,r.input_namespaces,r.agent_run IS NOT NULL AS has_agent_run,w.end_at FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at<$2 AND w.end_at>$1 AND NOT EXISTS(SELECT 1 FROM json_each(r.input_namespaces) n WHERE NOT EXISTS(SELECT 1 FROM json_each($3) p WHERE substr(n.value,1,length(p.value))=p.value)) ORDER BY w.start_at").bind(Ts::from(start)).bind(Ts::from(end)).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await
     }
     pub async fn visible_entities(&self, raw: bool, prefixes: &[String]) -> Result<Vec<Value>> {
         sqlx::query_scalar("SELECT json_object('id',a.id,'entity',a.entity,'assertion',json(a.assertion),'evidence',json(a.evidence)) FROM entity_assertions a WHERE ($1 OR sensitivity='normal') AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id IN (SELECT value FROM json_each(a.evidence)) AND NOT EXISTS(SELECT 1 FROM json_each($2) p WHERE substr(e.connector_instance,1,length(p.value))=p.value))").bind(raw).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await

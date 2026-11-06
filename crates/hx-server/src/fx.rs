@@ -102,7 +102,11 @@ impl Selection {
         sensitive: SensitiveEgress,
         namespaces: &[String],
     ) -> Value {
-        json!({"window":window,"timeline_hash":timeline_hash,"input_generation":generation,"provider":self.manifest_provider(),"fx_version":FX_VERSION,"model":self.model,"effort":self.effort,"fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces})
+        let mut manifest = json!({"window":window,"timeline_hash":timeline_hash,"input_generation":generation,"provider":self.manifest_provider(),"fx_version":FX_VERSION,"model":self.model,"effort":self.effort,"fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
+        if !policy.source_grants.is_empty() {
+            manifest["source_grants"] = json!(policy.source_grants);
+        }
+        manifest
     }
 }
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -562,7 +566,7 @@ pub(crate) async fn interpret_window_with_settle(
         crate::processing::ensure_settled(store, window, generation).await?;
     }
     let selection = Selection::from_env()?;
-    let policy = DisclosurePolicy::from_env()?;
+    let policy = crate::disclosure::current(store).await?;
     let sensitive = SensitiveEgress::from_env();
     let identity = json!({"input_generation":generation,"provider":selection.manifest_provider(),"model":selection.model,"effort":selection.effort,"fx_version":FX_VERSION,
         "prompt_version":PROMPT_VERSION,"sensitive_egress":sensitive,
@@ -778,7 +782,7 @@ pub(crate) async fn interpret_window_with_settle(
     hx_store::retry_busy("check generation", |_| broker.check_generation()).await?;
     let interpretation = best.context("invalid fx interpretation")?;
     ensure!(
-        DisclosurePolicy::from_env()?.digest() == policy.digest()
+        crate::disclosure::current(store).await?.digest() == policy.digest()
             && SensitiveEgress::from_env() == sensitive,
         "disclosure policy changed during run"
     );
@@ -794,8 +798,8 @@ pub(crate) async fn interpret_window_with_settle(
     value["input_manifest"] = selection.input_manifest(window, &timeline_hash, generation, &policy, sensitive, &namespaces);
     value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":selection.model,"effort":selection.effort,"fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     Ok(store
-        .publish_revision_manifest(window, generation, value, output_key, &namespaces)
-        .await?
+        .publish_disclosed_revision_manifest(window, generation, value, output_key, &namespaces)
+        .await.map_err(crate::disclosure::publish_error)?
         .1)
     }
     .await;
