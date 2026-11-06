@@ -349,6 +349,7 @@ async fn complete(store: &Store, state: &str, code: &str) -> ApiResult<Response>
     })?;
     let credential = Credential {
         hx_oauth_v1: true,
+        refresh_in_flight: false,
         config: pending.config,
         access_token: value["access_token"].as_str().unwrap_or("").to_owned(),
         refresh_token: value["refresh_token"]

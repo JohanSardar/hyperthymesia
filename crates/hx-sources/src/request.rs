@@ -39,6 +39,71 @@ pub enum McpTransport {
     Stdio { argv: Vec<String> },
 }
 
+/// Owner configuration, never supplied by a recipe or a source response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliIdentity {
+    pub command: String,
+    pub executable: String,
+    pub home: std::path::PathBuf,
+}
+
+impl CliIdentity {
+    pub fn resolve(command: &str, host: &crate::host::HostRunner) -> Result<Self, RequestError> {
+        use std::os::unix::fs::PermissionsExt;
+        if command.is_empty()
+            || command.contains("{{")
+            || command.chars().any(char::is_control)
+            || !host.home.is_absolute()
+        {
+            return Err(RequestError::CliInvalid);
+        }
+        let executable = if std::path::Path::new(command).is_absolute() {
+            std::path::PathBuf::from(command)
+        } else {
+            if command.contains('/') {
+                return Err(RequestError::CliInvalid);
+            }
+            std::env::split_paths(&host.extended_path().map_err(|_| RequestError::HostIo)?)
+                .map(|path| path.join(command))
+                .find(|path| {
+                    std::fs::metadata(path)
+                        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                })
+                .ok_or(RequestError::HostIo)?
+        };
+        let executable = std::fs::canonicalize(executable).map_err(|_| RequestError::HostIo)?;
+        if !std::fs::metadata(&executable)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        {
+            return Err(RequestError::HostIo);
+        }
+        Ok(Self {
+            command: command.into(),
+            executable: executable.to_str().ok_or(RequestError::CliInvalid)?.into(),
+            home: host.home.clone(),
+        })
+    }
+
+    pub fn pin(&self, request: &Request) -> Result<Request, RequestError> {
+        request.validate_cli()?;
+        let mut request = request.clone();
+        let argv = match &mut request {
+            Request::Cli { argv, .. }
+            | Request::Mcp {
+                transport: McpTransport::Stdio { argv },
+                ..
+            } => argv,
+            _ => return Err(RequestError::Destination),
+        };
+        let command = argv.first_mut().ok_or(RequestError::CliInvalid)?;
+        if *command != self.command && *command != self.executable {
+            return Err(RequestError::Destination);
+        }
+        *command = self.executable.clone();
+        Ok(request)
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct Placeholders<'a> {
     pub key: Option<&'a str>,
@@ -112,9 +177,22 @@ impl RequestError {
 /// Callers also cancel the enclosing future while a response is in flight.
 pub trait RequestGate: Sync {
     fn check(&self) -> impl std::future::Future<Output = Result<(), RequestError>> + Send;
+
+    /// Cancel resource I/O and lock waits, never an already-dispatched token
+    /// rotation. Polling also observes switches committed by another process.
+    fn cancelled(&self) -> impl std::future::Future<Output = RequestError> + Send {
+        async {
+            loop {
+                if let Err(error) = self.check().await {
+                    return error;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }
 
-struct Unrestricted;
+pub(crate) struct Unrestricted;
 impl RequestGate for Unrestricted {
     async fn check(&self) -> Result<(), RequestError> {
         Ok(())
@@ -122,9 +200,68 @@ impl RequestGate for Unrestricted {
 }
 
 impl Request {
+    /// A recipe may supply credential values, but cannot select a different
+    /// login, executable search path, runtime loader or credential directory.
+    pub fn validate_cli(&self) -> Result<(), RequestError> {
+        let argv = match self {
+            Self::Cli { argv, env } => {
+                // Only explicit key/token variables are useful request input.
+                // All directory, runtime and lookup variables are owner context.
+                if env.iter().any(|(name, value)| {
+                    !(name.ends_with("_KEY") || name.ends_with("_TOKEN"))
+                        || ["XDG_", "HX_", "FX_", "LD_", "DYLD_"]
+                            .iter()
+                            .any(|prefix| name.starts_with(prefix))
+                        || value != "{{key}}"
+                }) {
+                    return Err(RequestError::CliInvalid);
+                }
+                argv
+            }
+            Self::Mcp {
+                transport: McpTransport::Stdio { argv },
+                ..
+            } => argv,
+            _ => return Ok(()),
+        };
+        if argv
+            .first()
+            .is_none_or(|s| s.is_empty() || s.contains("{{"))
+            || argv.iter().skip(1).any(|arg| {
+                let name = arg.split('=').next().unwrap_or(arg).to_ascii_lowercase();
+                matches!(
+                    name.as_str(),
+                    "auth"
+                        | "login"
+                        | "logout"
+                        | "credentials"
+                        | "credential"
+                        | "config"
+                        | "configure"
+                ) || (name.starts_with('-')
+                    && [
+                        "config",
+                        "credential",
+                        "token",
+                        "profile",
+                        "account",
+                        "home",
+                        "directory",
+                        "exec",
+                    ]
+                    .iter()
+                    .any(|word| name.contains(word)))
+            })
+        {
+            return Err(RequestError::CliInvalid);
+        }
+        Ok(())
+    }
+
     /// Only owner-authored configuration can bind a credential destination.
     /// Response URLs and model-chosen source IDs are not credential authority.
     pub fn authorize(&self, description: &str) -> Result<(), RequestError> {
+        self.validate_cli()?;
         let permitted = match self {
             Self::Http { url, .. }
             | Self::Mcp {
@@ -247,6 +384,7 @@ impl Request {
         host: &crate::host::HostRunner,
         gate: &impl RequestGate,
     ) -> Result<Value, RequestError> {
+        self.validate_cli()?;
         match self {
             Self::Http { .. } => self.execute_http_guarded(values, timeout, gate).await,
             Self::Mcp {
@@ -268,14 +406,6 @@ impl Request {
                     .collect::<Result<BTreeMap<_, _>, RequestError>>()?;
                 if let Some(key) = values.key {
                     env.insert("SOURCE_KEY".into(), key.into());
-                }
-                let mut host = host.clone();
-                if let Some(home) = env.remove("HOME") {
-                    let home = std::path::PathBuf::from(home);
-                    if !home.is_absolute() {
-                        return Err(RequestError::CliInvalid);
-                    }
-                    host.home = home;
                 }
                 let command = argv
                     .iter()
