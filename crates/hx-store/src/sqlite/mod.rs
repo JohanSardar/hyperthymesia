@@ -118,6 +118,8 @@ impl Store {
         .fetch_all(&mut validation)
         .await
         .context("core.sqlite has not been initialized")?;
+        // Compare the actual version/checksum set, not MAX(version): reserved
+        // migration numbers may leave gaps (for example 0001 followed by 0003).
         ensure!(
             applied.len() == MIGRATOR.iter().len(),
             "core.sqlite schema version mismatch"
