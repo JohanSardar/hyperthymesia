@@ -18,6 +18,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    /// Snapshot both databases and published blobs while the server stays online.
+    Backup {
+        #[arg(long)]
+        to: PathBuf,
+    },
+    /// Verify a backup and restore it into an absent or empty state directory.
+    Restore {
+        #[arg(long)]
+        from: PathBuf,
+    },
     /// Check provider readiness without connecting to the database or calling a model.
     Doctor,
     Serve {
@@ -96,10 +106,20 @@ async fn main() -> Result<()> {
         store.pool.close().await;
         return Ok(());
     }
+    // Neither command opens a writable source pool. Restore must work before
+    // core.sqlite exists; backup reads WAL snapshots without taking the writer.
+    match &cli.command {
+        Command::Backup { to } => return hx_store::backup::backup(&dir, to).await,
+        Command::Restore { from } => return hx_store::backup::restore(from, &dir).await,
+        _ => {}
+    }
     let store = Store::open(&dir).await?;
     match cli.command {
         Command::Doctor => unreachable!("doctor runs without a database"),
         Command::Migrate => unreachable!("migrate creates a new state"),
+        Command::Backup { .. } | Command::Restore { .. } => {
+            unreachable!("backup and restore run without opening the store")
+        }
         Command::Token {
             command:
                 TokenCommand::Create {
