@@ -58,13 +58,19 @@ impl Config {
     }
     pub fn load_at(dir: &Path) -> anyhow::Result<Self> {
         let path = dir.join("agent.json");
-        match std::fs::read(path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e.into()),
+        let mut config: Self = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e.into()),
+        };
+        // New unpaired producers and pairing must use the same sanitized ID.
+        // Legacy token-only configs keep their original hostname fallback.
+        if config.token.is_empty() {
+            config.device_id = pairing_device_id(&config.device_id);
         }
+        Ok(config)
     }
-    /// Merge only pairing credentials, preserving policy and unknown future fields.
+    /// Merge pairing credentials and their device identity, preserving other fields.
     pub fn save(&self) -> anyhow::Result<()> {
         self.save_at(&support_dir())
     }
@@ -82,6 +88,7 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("agent.json must be an object"))?;
         object.insert("server_url".into(), self.server_url.clone().into());
         object.insert("token".into(), self.token.clone().into());
+        object.insert("device_id".into(), self.device_id.clone().into());
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         tmp.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -90,6 +97,27 @@ impl Config {
         tmp.persist(&path)?;
         std::fs::File::open(dir)?.sync_all()?;
         Ok(())
+    }
+}
+
+/// gethostname can return arbitrary bytes (decoded lossily by hx-macos-sys).
+/// Normalize only for new pairing; never rewrite a legacy token's identity.
+pub(crate) fn pairing_device_id(hostname: &str) -> String {
+    let id: String = hostname
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(255)
+        .collect();
+    if id.is_empty() || matches!(id.as_str(), "." | "..") {
+        "mac-unknown".into()
+    } else {
+        id
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
