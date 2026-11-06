@@ -4,6 +4,7 @@
 //! only the envelope and the payloads in [`kinds`]; everything else is opaque.
 
 pub mod ids;
+pub mod json;
 pub mod kinds;
 pub mod protocol;
 pub mod time;

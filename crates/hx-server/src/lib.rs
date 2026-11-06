@@ -1,7 +1,9 @@
 //! Authenticated ingest, evidence API, and a local, escaped day view.
+mod connections;
 pub mod dashboard;
 pub mod disclosure;
 pub mod fx;
+mod live;
 pub mod mcp;
 pub mod ocr;
 pub mod processing;
@@ -82,6 +84,16 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/v1/pair", post(pair).layer(DefaultBodyLimit::max(4096)))
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
+        .route(
+            "/connect",
+            get(connections::page)
+                .post(connections::connect)
+                .layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/connect/{id}",
+            post(connections::switch).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .merge(sources::router())
         .route("/v1/events", post(events))
         .route("/v1/device", get(device))

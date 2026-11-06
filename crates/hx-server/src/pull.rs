@@ -364,25 +364,5 @@ fn cursor_text(value: Option<&Value>) -> Result<Option<String>, &'static str> {
 }
 
 fn scrub_json(value: &Value, scrubber: &Scrubber) -> Value {
-    match value {
-        // Normalize before scrubbing: a NUL embedded inside a secret must not
-        // reconstruct that secret when the mapper normalizes the item later.
-        Value::String(s) => Value::String(scrubber.scrub(&s.replace('\0', ""))),
-        Value::Array(a) => Value::Array(a.iter().map(|v| scrub_json(v, scrubber)).collect()),
-        Value::Object(o) => Value::Object(
-            o.iter()
-                .map(|(k, v)| {
-                    (
-                        scrubber.scrub(&k.replace('\0', "")),
-                        scrub_json(v, scrubber),
-                    )
-                })
-                .collect(),
-        ),
-        // Numeric (or boolean/null) secrets are still secrets on the wire.
-        _ if scrubber.contains_secret(&value.to_string()) => {
-            Value::String(hx_sources::scrub::REDACTED.into())
-        }
-        _ => value.clone(),
-    }
+    scrubber.scrub_json(value)
 }

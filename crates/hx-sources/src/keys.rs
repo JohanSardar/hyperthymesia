@@ -89,6 +89,27 @@ impl KeyStore {
         Ok(Some(key))
     }
 
+    /// Redaction includes all persisted keys, even if SQLite is unavailable or a
+    /// connection did not finish publishing. Source requests must use `read(id)`.
+    pub fn redaction_keys(&self) -> Result<Vec<String>, KeyError> {
+        private_directory(&self.directory)?;
+        let mut keys = Vec::new();
+        for entry in fs::read_dir(&self.directory)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("key") {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or(KeyError::InvalidId)?;
+            if let Some(key) = self.read(id)? {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
+
     fn path(&self, id: &str) -> Result<PathBuf, KeyError> {
         if id.is_empty()
             || !id

@@ -338,14 +338,45 @@ Legacy prior replicas without a matching policy manifest are withheld. Entity
 assertions resolve their evidence against the current policy, regardless of cached
 producer labels.
 
-`live_lookup` currently returns `no live connectors configured`. A future connector
-must snapshot the exact returned content into an immutable server-owned event
-before returning it: use an authenticated connector namespace, source URL and
-retrieval timestamp, preserve the complete response as text/JSON evidence, assign
-an event ID, and project it through the same disclosure broker. A changing remote
-document creates another event/revision; it must never mutate the cited snapshot.
-The generation manifest must include the new snapshot before publication. No live
-connector or remote network operation is reachable through the current stub.
+Sign in to the dashboard and open `/connect` to add an API, CLI or MCP server.
+Paste a key and describe the source, including its API/MCP URL or a literal CLI
+command in backticks. GitHub and Linear templates fill in their API addresses.
+Connecting enables live use immediately, without starting interpretation or
+waiting for a setup agent. `list_sources` includes these connections even before
+they have stored events. Automatic setup and recipe authoring are separate work.
+
+`live_lookup(source, request)` executes bounded HTTP JSON, CLI JSON, or MCP
+(streamable HTTP/JSON/SSE or newline-delimited stdio). Direct requests must match
+an origin or command in the owner's description; redirects are not followed.
+HTTP uses bearer auth by default; `{{key}}` templates support other auth styles.
+CLI and MCP stdio receive only that source's key as `SOURCE_KEY`. MCP `tool:
+"tools/list"` discovers tools. Remote sampling, elicitation and instructions are
+not executed. Deadlines cover the complete exchange, with bounded output and no
+automatic retries.
+
+`source_bash(source, command)` is deliberately unsandboxed host bash, with the
+real HOME, extended PATH, an explicitly constructed environment and `SOURCE_KEY`.
+Its lexical guard blocks common catastrophic commands and literal access to the
+state folder, not scripts, expansion, symlinks or deliberate bypasses. Host
+commands can still read other credentials, change files or send data elsewhere:
+keys are not hidden from the agent. The connect screen states these limits and
+that allowed content and summaries go to the configured cloud model.
+
+Both tools scrub known keys (including other sources' keys and common encodings)
+before saving or returning data. Arguments containing literal credentials are
+rejected, not sent to another source. Keys stay in private files, outside SQLite
+and backups. Each successful answer is an immutable `source.live` snapshot tied
+to the broker's server-issued run token, not an ingested event; it cannot advance
+a window generation or authorize another run's citations. Large answers have a
+bounded model-facing excerpt; the evidence page retains the scrubbed response.
+Live snapshots supply reported context, never historical time support. An
+episode must still cite captured evidence for its activity and timing.
+
+Every call rechecks the owner's durable switch, including before dispatch and
+after I/O. An off source cannot be re-enabled by a broker tool. Historical
+snapshots remain accessible to the authorized owner; prior context uses owner
+disclosure and namespace checks without admitting those snapshots as evidence
+for the new run. Day-page entries link every cited evidence record.
 
 Synthetic tests:
 
