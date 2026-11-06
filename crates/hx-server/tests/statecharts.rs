@@ -2595,6 +2595,83 @@ async fn source_connect_preserves_history_without_interpret_jobs() {
     f.close().await;
 }
 #[tokio::test]
+async fn source_off_revokes_running_broker_stored_tools() {
+    let f = Fixture::new().await;
+    let w = window();
+    let source = f
+        .store
+        .connect_source("synthetic", "fake", 1)
+        .await
+        .unwrap();
+    let evidence = ingest_source(&f.store, &source.connector_instance, w).await;
+    source_revision(
+        &f.store,
+        w,
+        std::slice::from_ref(&source.connector_instance),
+        "revoked prior prose",
+    )
+    .await;
+    let mut policy = hx_server::disclosure::DisclosurePolicy::laptop();
+    policy
+        .source_grants
+        .insert(source.connector_instance.clone());
+    let mut broker = hx_server::mcp::Broker::new(
+        f.store.clone(),
+        policy,
+        hx_server::processing::SensitiveEgress::Full,
+        hx_store::window_at(w.end),
+    );
+    broker.lookup_limit = 20;
+    assert!(
+        broker
+            .call("prior_context", json!({}))
+            .await
+            .unwrap()
+            .to_string()
+            .contains("revoked prior prose")
+    );
+    assert!(
+        broker
+            .call("read_evidence", json!({"id": evidence}))
+            .await
+            .unwrap()
+            .to_string()
+            .contains("Synthetic source title")
+    );
+    assert_eq!(
+        source_api(
+            &f.store,
+            "PATCH",
+            &format!("/v1/sources/{}", source.id),
+            json!({"enabled":false})
+        )
+        .await
+        .0,
+        200
+    );
+    let mut leaked = Vec::new();
+    for (tool, args) in [
+        ("prior_context", json!({})),
+        ("read_evidence", json!({"id":evidence})),
+        (
+            "search",
+            json!({"query":"Synthetic", "from":w.start,"to":w.end}),
+        ),
+        ("timeline", json!({"from":w.start,"to":w.end})),
+        ("window_overview", json!({"from":w.start,"to":w.end})),
+        ("screen_at", json!({"time":w.start})),
+        ("list_sources", json!({})),
+    ] {
+        let result = broker.call(tool, args).await.unwrap().to_string();
+        if result.contains("revoked prior prose") || result.contains("Synthetic source title") {
+            leaked.push(tool);
+        }
+    }
+    assert!(leaked.is_empty(), "revoked content returned by {leaked:?}");
+    f.close().await;
+}
+
+#[tokio::test]
 async fn source_off_hides_uncited_and_inherited_context() {
     let f = Fixture::new().await;
     let w = window();
