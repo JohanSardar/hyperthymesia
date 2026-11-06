@@ -50,7 +50,7 @@ impl Store {
         sqlx::query_as("WITH candidates AS (SELECT connector_instance,source_key FROM events WHERE source_start<$2 AND coalesce(source_end,source_start)>=$1) SELECT e.id,e.received_at,e.envelope FROM events e JOIN (SELECT DISTINCT connector_instance,source_key FROM candidates) c USING (connector_instance,source_key) ORDER BY e.source_start,e.id").bind(Ts::from(start)).bind(Ts::from(end)).fetch_all(&self.pool).await
     }
     pub async fn source_envelope(&self, id: i64) -> Result<Option<Value>> {
-        sqlx::query_scalar("SELECT envelope FROM events WHERE id=$1 UNION ALL SELECT e.envelope FROM ocr_evidence d JOIN events e ON e.id=d.source_event_id WHERE d.id=$1").bind(id).fetch_optional(&self.pool).await
+        sqlx::query_scalar("SELECT envelope FROM events WHERE id=$1 UNION ALL SELECT e.envelope FROM ocr_evidence d JOIN events e ON e.id=d.source_event_id WHERE d.id=$1 UNION ALL SELECT envelope FROM live_snapshots WHERE id=$1").bind(id).fetch_optional(&self.pool).await
     }
     pub async fn attention_records(
         &self,
@@ -91,7 +91,7 @@ impl Store {
         sqlx::query_as("SELECT r.id,r.interpretation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 AND w.end_at>$1-57600000000 ORDER BY w.end_at DESC LIMIT 4").bind(Ts::from(before)).fetch_all(&self.pool).await
     }
     pub async fn source_namespace(&self, id: i64) -> Result<Option<String>> {
-        sqlx::query_scalar("SELECT connector_instance FROM events WHERE id=$1 UNION ALL SELECT e.connector_instance FROM ocr_evidence d JOIN events e ON e.id=d.source_event_id WHERE d.id=$1").bind(id).fetch_optional(&self.pool).await
+        sqlx::query_scalar("SELECT connector_instance FROM events WHERE id=$1 UNION ALL SELECT e.connector_instance FROM ocr_evidence d JOIN events e ON e.id=d.source_event_id WHERE d.id=$1 UNION ALL SELECT connector_instance FROM live_snapshots WHERE id=$1").bind(id).fetch_optional(&self.pool).await
     }
     pub async fn recent_source_records(&self) -> Result<Vec<SourceRecord>> {
         // Seek the next kind within this connector, then the next connector.
