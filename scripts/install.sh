@@ -517,8 +517,20 @@ rollback() {
         fi
         if [ -n "$old" ]; then
             if ! switch_current "$old"; then
-                restored=false
-                printf 'Could not restore current link to %s. Old binary remains there.\n' "$old" >&2
+                printf 'Could not restore current link atomically to %s; trying portable recovery.\n' "$old" >&2
+                # Recovery already has the service stopped. If rename itself
+                # failed, a non-atomic unlink/link is preferable to restarting
+                # the candidate again. Never unlink an unexpected regular path.
+                if [ -L "$prefix/current" ] && [ "$(readlink "$prefix/current")" = "$old" ]; then
+                    : # Rename succeeded but its directory sync may have failed.
+                else
+                    if [ -L "$prefix/current" ]; then rm -f "$prefix/current" || restored=false; fi
+                    if [ ! -e "$prefix/current" ] && [ ! -L "$prefix/current" ]; then
+                        ln -s "$old" "$prefix/current" || restored=false
+                    else
+                        restored=false
+                    fi
+                fi
             fi
             # Always try the old service after link restoration, including after
             # a failed copy/rename. Its exact-schema open refuses unsafe state.

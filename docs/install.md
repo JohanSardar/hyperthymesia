@@ -95,7 +95,7 @@ hx-server --state-dir "$STATE" status
 
 `status` prints JSON with `running_interpret_leases` and `retained` copies
 (path and logical bytes, or a per-copy read error). This includes pre-upgrade
-backups and sibling `server.failed-*` folders; sizes include both databases and
+backups and sibling `<state>.failed-*` folders; sizes include both databases and
 blobs, so repeated failed attempts can use substantial disk space. Nothing is
 automatically pruned. `--require-idle` fails for
 a live lease. It never migrates, revives jobs or calls a provider.
@@ -147,7 +147,12 @@ An upgrade:
    requests return 503 until verification ends; agents retain retryable uploads.
 4. Keeps the previous version and backup. A failed step after stop restores
    both databases and blobs, preserves `server.env`, switches back and restarts.
-   Failed-generation state stays beside the active directory as `server.failed-*`.
+   Failed-generation state stays beside the active directory as `<state>.failed-*`
+   (`server.failed-*` for the default macOS state).
+   Filesystem recovery errors do not skip the old-service restart attempt; the
+   installer reports incomplete recovery and the retained paths. If atomic
+   link replacement fails during recovery, it attempts a portable unlink/link
+   while stopped. A hard interruption there can require a manual restart.
 
 `migrate` applies every missing version, including a lower number arriving later.
 It rejects newer/unknown, dirty or changed checksums before writable access.
@@ -159,7 +164,7 @@ pointing an older binary at a newer schema is insufficient. Backups omit
 
 A registered install whose core disappears refuses before changing anything,
 including when a custom volume is unmounted. Reconnect the volume first. Look
-for the original state in sibling `server.failed-*` folders and verified copies
+for the original state in sibling `<state>.failed-*` folders and verified copies
 in `<prefix>/backups/`; do not ingest into a replacement empty history. Stop the
 user service, move any remaining partial state aside, and use a retained binary:
 
