@@ -41,7 +41,7 @@ Status: **consensus plan** (2026-10-30). Agreed between Claude (author) and Astr
                                    │  Tailscale only
  SERVER                            ▼
    Ingest: authenticate producer namespace → commit raw L0 (+ blobs) → ack
-   Async jobs (Postgres queue: leases, attempts, idempotent outputs, quarantine):
+   Async jobs (SQLite queue: leases, attempts, idempotent outputs, quarantine):
      normalize L0→L1 ─▶ OCR / keyframe processor ─▶ compile L1→L2 interval index
      ─▶ interpret (4 h) ─▶ publish L3 revision ─▶ embed
    Pull connectors (cursor/backfill/checkpoint): T3, Codex, Claude Code, git, Apple Bridge, Oura…
@@ -57,7 +57,9 @@ Status: **consensus plan** (2026-10-30). Agreed between Claude (author) and Astr
 | L2 | **lossless interval index**: per-source lanes on a global time axis, with references to every event inside each interval | deterministic; prompt packets are a *separate projection* |
 | L3 | episodes, tasks (as **interval sets**), optional goal hypotheses, day summaries: structured claims with evidence and provenance | revisions, published atomically; superseded versions kept |
 
-Store: **Postgres** (data, FTS, pgvector, job queue) plus content-addressed blob files. No Kafka, ClickHouse or Timescale until a benchmark justifies one.
+Store: **SQLite** (`core.sqlite` for evidence, FTS5 and the job queue;
+`agent.sqlite` for agent-created tables) plus content-addressed blobs and locks
+inside one explicit local state folder. See the [current quickstart](../README.md).
 
 ---
 
@@ -207,7 +209,7 @@ Every collector has overflow counters, cancellation, restart/re-registration on 
 - **Webhooks:** none on the private server. Outbound polling with cursors is the default. A narrow authenticated relay is allowed later if a connector needs webhooks.
 - **Data classes:** unknown data is `restricted`. Egress rules are enforced on the server before any LLM call or embedding. Restrictions propagate by lineage to blobs, OCR, logs, backups, API/evidence reads, summaries and embeddings.
 - **Retention:** ships **with the first stored blob**. Raw video is kept ~30 days. What survives after that is a defined contract: time-indexed keyframes, decoded text and extraction metadata, event identities, blob manifests, and explicit `evidence_expired` states. GC is reference-safe and pinned by active jobs.
-- **Backups:** a supported Postgres backup method, coordinated with the blob manifests, plus an exercised restore drill.
+- **Backups:** `hx-server backup` snapshots both SQLite databases and published blobs; `restore` verifies a copy into an absent or empty state folder. Source keys and `server.env` are excluded.
 
 ---
 
@@ -231,7 +233,7 @@ crates/
   hx-macos-sys       ONLY unsafe/FFI: AppKit lifecycle, SCK, VideoToolbox, AX, CGEventTap, IOKit
   hx-agent           collectors, policy, sampling, outbox, uploader, companion socket
   hx-agent-app       menu-bar app, onboarding, LaunchAgent
-  hx-store           Postgres, blob store, retention/GC, backup manifests
+  hx-store           SQLite, blob store, retention/GC, backup manifests
   hx-jobs            queue: leases, attempts, idempotent outputs, quarantine
   hx-visual          shared visual processor (decode, thumbnail sampling, Vision OCR interface)
   hx-compile         pure L1 → L2
