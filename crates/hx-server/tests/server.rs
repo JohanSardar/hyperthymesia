@@ -1488,6 +1488,17 @@ async fn ocr_backfill_exact_cache_lineage_packet_and_dashboard() {
     drain_ocr(&f.store, engine.clone(), "fake/v2").await;
     drain_ocr(&f.store, engine.clone(), "fake/v2").await;
     assert_eq!(engine.calls(), 2);
+    // Switching a store with earlier server engine versions to device mode must
+    // preserve existing citations, including a late still linked only by v2.
+    ingest(
+        &f.store,
+        vec![still("ocr-version-late", 120, Sensitivity::Normal, &bytes)],
+    )
+    .await;
+    drain_ocr(&f.store, engine.clone(), "fake/v2").await;
+    let before = f.store.ocr_evidence_count().await.unwrap();
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), before);
     f.close().await;
 }
 
@@ -3270,4 +3281,433 @@ async fn fx_effort_change_calls_provider() {
 #[tokio::test]
 async fn fx_version_change_calls_provider() {
     changed_fx_identity_calls_provider("fx_version").await;
+}
+
+async fn device_ocr_put(
+    store: &Store,
+    secret: &str,
+    sha: &str,
+    body: Vec<u8>,
+    mode: hx_schema::protocol::OcrMode,
+) -> StatusCode {
+    hx_server::router(store.clone(), DisclosurePolicy::default())
+        .layer(axum::Extension(mode))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/ocr/{sha}"))
+                .header("authorization", format!("Bearer {secret}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+fn device_ocr_body(bytes: &[u8]) -> Value {
+    use hx_visual::OcrEngine;
+    json!({"status":"complete", "engine_version":"vision:synthetic", "perceptual_hash":format!("{:016x}", hx_visual::thumbnail_hash(bytes).unwrap()), "sampled_from":null, "result":SyntheticOcr::new(false).ocr(bytes,"image/png").unwrap()})
+}
+// Evidence identities are intentionally allocated independently by each replica.
+fn without_ocr_identity(mut value: Value) -> Value {
+    value["envelope"]
+        .as_object_mut()
+        .unwrap()
+        .remove("observation_id");
+    value
+}
+
+#[tokio::test]
+async fn device_ocr_matches_server_evidence_broker_dashboard_and_disclosure() {
+    use hx_schema::protocol::OcrMode;
+    use hx_server::{mcp::Broker, processing::SensitiveEgress};
+    let server = Fixture::new().await;
+    let device = Fixture::new().await;
+    let bytes = synthetic_png(0);
+    let sha = hx_store::hash(&bytes);
+    let source = still(
+        "device-parity",
+        2 * 3600 + 50 * 60,
+        Sensitivity::Normal,
+        &bytes,
+    );
+    let w = hx_store::window_at(source.time.source_start.unwrap());
+    let next = hx_store::window_at(w.end);
+    for f in [&server, &device] {
+        f.store.upload_blob(&sha, &bytes).await.unwrap();
+        ingest(&f.store, vec![source.clone()]).await;
+        for window in [w, next] {
+            f.store.normalize_window(window).await.unwrap();
+            hx_server::processing::compile_window(&f.store, window)
+                .await
+                .unwrap();
+        }
+    }
+    let auth = secret(&device.store).await;
+    let body = device_ocr_body(&bytes);
+    assert_eq!(
+        device_ocr_put(
+            &device.store,
+            &auth,
+            &sha,
+            serde_json::to_vec(&body).unwrap(),
+            OcrMode::Device
+        )
+        .await,
+        StatusCode::OK
+    );
+    drain_ocr(&server.store, SyntheticOcr::new(false), "vision:synthetic").await;
+    let loop_task = tokio::spawn(hx_server::ocr::worker_in_mode(
+        device.store.clone(),
+        OcrMode::Device,
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while device.store.ocr_evidence_count().await.unwrap() != 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let left = server.store.derived_ocr_records().await.unwrap();
+    let right = device.store.derived_ocr_records().await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(right.len(), 1);
+    let source_id: i64 = left[0].get("source_event_id");
+    let derived_id: i64 = left[0].get("id");
+    let mut evidence = vec![];
+    let mut brokers = vec![];
+    let mut dashboards = vec![];
+    for f in [&server, &device] {
+        assert_eq!(
+            f.store
+                .dirty_window_count(vec![w.start, next.start])
+                .await
+                .unwrap(),
+            2
+        );
+        evidence.push(without_ocr_identity(
+            f.store.evidence(derived_id).await.unwrap().unwrap(),
+        ));
+        let broker = Broker::new(
+            f.store.clone(),
+            DisclosurePolicy::default(),
+            SensitiveEgress::Full,
+            w,
+        );
+        brokers.push(
+            broker
+                .call("read_evidence", json!({"id":derived_id}))
+                .await
+                .unwrap(),
+        );
+        let auth = secret(&f.store).await;
+        let (status, html) = request(
+            &f.store,
+            "GET",
+            &format!("/evidence/{source_id}"),
+            &auth,
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8(html).unwrap();
+        dashboards.push(html[html.find("<section>").unwrap()..].to_owned());
+    }
+    assert_eq!(evidence[0], evidence[1]);
+    assert_eq!(brokers[0], brokers[1]);
+    assert_eq!(dashboards[0], dashboards[1]);
+    assert!(dashboards[0].contains("&lt;script&gt;"));
+    // Late exact duplicates inherit their own source's restriction, never the sender's class.
+    let mut restricted = still("device-restricted", 60, Sensitivity::Restricted, &bytes);
+    restricted.payload["window_title"] = json!("Hyperthymesia synthetic");
+    for f in [&server, &device] {
+        ingest(&f.store, vec![restricted.clone()]).await;
+    }
+    drain_ocr(&server.store, SyntheticOcr::new(false), "vision:synthetic").await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while device.store.ocr_evidence_count().await.unwrap() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    loop_task.abort();
+    let _ = loop_task.await;
+    for f in [&server, &device] {
+        let rows = f.store.derived_ocr_records().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let id: i64 = rows
+            .iter()
+            .find(|r| r.get::<String, _>("sensitivity") == "restricted")
+            .unwrap()
+            .get("id");
+        let reader = Token {
+            prefixes: token().prefixes,
+            scopes: vec!["read_l3".into()],
+        };
+        assert!(
+            hx_server::authorized_evidence(&f.store, &reader, id)
+                .await
+                .is_err()
+        );
+        let broker = Broker::new(
+            f.store.clone(),
+            DisclosurePolicy::default(),
+            SensitiveEgress::Full,
+            w,
+        );
+        assert!(
+            broker
+                .call("read_evidence", json!({"id":id}))
+                .await
+                .unwrap()
+                .get("error")
+                .is_some()
+        );
+    }
+    // Both transport paths must also share policy overrides, redaction, and
+    // self-generated attribution in the model packet.
+    let mut packets = vec![];
+    for f in [&server, &device] {
+        f.store.normalize_window(w).await.unwrap();
+        let mut outputs = vec![];
+        for sensitive in [SensitiveEgress::Full, SensitiveEgress::Redact] {
+            let policy = DisclosurePolicy::from_json(r#"{"rules":[{"connector_prefix":"test:","kind":"media.still","class":"sensitive"}]}"#).unwrap();
+            let input = hx_server::processing::prepare_input_with_policy(
+                &f.store,
+                w,
+                "synthetic",
+                sensitive,
+                &policy,
+            )
+            .await
+            .unwrap();
+            let ocr: Vec<_> = input
+                .packet
+                .evidence
+                .iter()
+                .filter(|e| e.kind.ends_with("ocr.text"))
+                .collect();
+            assert_eq!(ocr.len(), 2);
+            assert!(ocr.iter().any(|e| e.self_generated));
+            assert_eq!(
+                ocr.iter().any(|e| e.text.contains("ORCHID")),
+                sensitive == SensitiveEgress::Full
+            );
+            outputs.push(serde_json::to_value(ocr).unwrap());
+        }
+        packets.push(outputs);
+    }
+    assert_eq!(packets[0], packets[1]);
+    server.close().await;
+    device.close().await;
+}
+
+#[tokio::test]
+async fn device_ocr_validation_and_first_success_survive_retries() {
+    use hx_schema::protocol::OcrMode;
+    let f = Fixture::new().await;
+    let auth = secret(&f.store).await;
+    let bytes = synthetic_png(1);
+    let sha = hx_store::hash(&bytes);
+    let body = device_ocr_body(&bytes);
+    let put = |body: Value| {
+        device_ocr_put(
+            &f.store,
+            &auth,
+            &sha,
+            serde_json::to_vec(&body).unwrap(),
+            OcrMode::Device,
+        )
+    };
+    assert_eq!(put(body.clone()).await, StatusCode::CONFLICT);
+    ingest(
+        &f.store,
+        vec![still("device-validation", 0, Sensitivity::Normal, &bytes)],
+    )
+    .await;
+    // Text can arrive before the image is published; never discard a valid result for that race.
+    let mut forged = body.clone();
+    forged["class"] = json!("normal");
+    assert_eq!(put(forged).await, StatusCode::BAD_REQUEST);
+    for pointer in [
+        "/result/class",
+        "/result/lines/0/class",
+        "/result/lines/0/bbox/class",
+    ] {
+        let mut invalid = body.clone();
+        *invalid
+            .pointer_mut(pointer.rsplit_once('/').unwrap().0)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .entry("class")
+            .or_insert(Value::Null) = json!("normal");
+        assert_eq!(put(invalid).await, StatusCode::BAD_REQUEST);
+    }
+    for (pointer, value) in [
+        ("/engine_version", json!("other:v1")),
+        ("/result/coverage", json!("complete")),
+        ("/result/lines/0/confidence", json!(1.1)),
+        ("/result/lines/0/bbox/x", json!(-0.1)),
+        ("/result/lines/0/bbox/width", json!(2)),
+        ("/perceptual_hash", json!("invalid")),
+        ("/sampled_from", json!(sha)),
+    ] {
+        let mut invalid = body.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        assert_eq!(put(invalid).await, StatusCode::BAD_REQUEST, "{pointer}");
+    }
+    assert_eq!(
+        device_ocr_put(
+            &f.store,
+            &auth,
+            &sha,
+            vec![b' '; 1024 * 1024 + 1],
+            OcrMode::Device
+        )
+        .await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        device_ocr_put(
+            &f.store,
+            &auth,
+            &sha,
+            serde_json::to_vec(&body).unwrap(),
+            OcrMode::Server
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+    let outsider = f
+        .store
+        .create_token("outsider", vec!["other:".into()], vec!["ingest".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        device_ocr_put(
+            &f.store,
+            &outsider,
+            &sha,
+            serde_json::to_vec(&body).unwrap(),
+            OcrMode::Device
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+    let mut failed = body.clone();
+    failed["status"] = json!("failed");
+    failed["result"] = Value::Null;
+    failed["perceptual_hash"] = Value::Null;
+    assert_eq!(put(failed.clone()).await, StatusCode::OK);
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), 0);
+    // A caught-up device pass must not acquire the writer even with unfinished OCR.
+    let writer = f.store.begin_write().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        f.store.publish_device_ocr_lineage(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(writer);
+    let mut boundary = serde_json::to_vec(&body).unwrap();
+    boundary.resize(1024 * 1024, b' ');
+    assert_eq!(
+        device_ocr_put(&f.store, &auth, &sha, boundary, OcrMode::Device).await,
+        StatusCode::OK
+    );
+    let mut replacement = body.clone();
+    replacement["engine_version"] = json!("vision:updated");
+    replacement["result"]["lines"][0]["text"] = json!("replacement");
+    let (a, b) = tokio::join!(put(replacement), put(failed));
+    assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    let rows = f.store.derived_ocr_records().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let envelope: Value = rows[0].get("envelope");
+    assert_eq!(envelope["payload"]["ocr"], body["result"]);
+
+    // A sampled result cannot become text on a retry or engine upgrade. A missing
+    // reference is a retryable ordering/storage failure, never a permanent refusal.
+    let sampled_bytes = synthetic_png(2);
+    let sampled_sha = hx_store::hash(&sampled_bytes);
+    let reference = synthetic_png(3);
+    let reference_sha = hx_store::hash(&reference);
+    ingest(
+        &f.store,
+        vec![still(
+            "device-sampled",
+            1,
+            Sensitivity::Normal,
+            &sampled_bytes,
+        )],
+    )
+    .await;
+    let mut sampled = device_ocr_body(&sampled_bytes);
+    sampled["status"] = json!("sampled");
+    sampled["sampled_from"] = json!(reference_sha);
+    sampled["result"] = Value::Null;
+    let put_sample = |body: Value| {
+        device_ocr_put(
+            &f.store,
+            &auth,
+            &sampled_sha,
+            serde_json::to_vec(&body).unwrap(),
+            OcrMode::Device,
+        )
+    };
+    assert_eq!(
+        put_sample(sampled.clone()).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    ingest(
+        &f.store,
+        vec![still(
+            "sample-reference",
+            0,
+            Sensitivity::Normal,
+            &reference,
+        )],
+    )
+    .await;
+    assert_eq!(put_sample(sampled).await, StatusCode::OK);
+    let mut late_complete = device_ocr_body(&sampled_bytes);
+    late_complete["engine_version"] = json!("vision:updated");
+    assert_eq!(put_sample(late_complete).await, StatusCode::OK);
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    assert_eq!(f.store.sampled_ocr_count().await.unwrap(), 1);
+    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), 1);
+
+    // Different engine versions racing for the first success still publish only
+    // one result and one citation for a hash.
+    let racing_bytes = synthetic_png(4);
+    let racing_sha = hx_store::hash(&racing_bytes);
+    ingest(
+        &f.store,
+        vec![still("device-race", 60, Sensitivity::Normal, &racing_bytes)],
+    )
+    .await;
+    let first = device_ocr_body(&racing_bytes);
+    let mut second = first.clone();
+    second["engine_version"] = json!("vision:second");
+    second["result"]["lines"][0]["text"] = json!("SECOND SYNTHETIC RESULT");
+    let race_put = |value: &Value| {
+        device_ocr_put(
+            &f.store,
+            &auth,
+            &racing_sha,
+            serde_json::to_vec(value).unwrap(),
+            OcrMode::Device,
+        )
+    };
+    let (a, b) = tokio::join!(race_put(&first), race_put(&second));
+    assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    assert_eq!(f.store.complete_ocr_count().await.unwrap(), 2);
+    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), 2);
+    f.close().await;
 }

@@ -15,7 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use disclosure::DisclosurePolicy;
-use hx_schema::{Envelope, Interval};
+use hx_schema::{Envelope, Interval, protocol::OcrMode};
 use hx_store::{Store, Token, UploadBatch};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -81,6 +81,10 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
         .route("/v1/events", post(events))
         .route("/v1/device", get(device))
+        .route(
+            "/v1/ocr/{sha}",
+            put(upload_ocr).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route("/v1/blobs/{sha256}", put(upload_blob).get(download_blob))
         .route("/v1/timeline", get(timeline))
         .route("/v1/search", get(search))
@@ -99,23 +103,51 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .layer(Extension(policy))
         .with_state(store)
 }
+// `serve` freezes the same negotiated mode for its worker and HTTP routes.
+// Without an extension (embedded callers), resolve the normal helper capability.
+async fn ocr_mode(mode: Option<Extension<OcrMode>>) -> ApiResult<OcrMode> {
+    match mode {
+        Some(Extension(mode)) => Ok(mode),
+        None => Ok(ocr::mode().await?),
+    }
+}
 async fn device(
     State(store): State<Store>,
+    mode: Option<Extension<OcrMode>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<hx_schema::protocol::DeviceResponse>> {
-    use hx_schema::protocol::{DeviceResponse, OcrMode};
     auth(&store, &headers, "ingest").await?;
-    let available =
-        tokio::task::spawn_blocking(|| hx_visual::VisionCliEngine::default().executable().is_ok())
-            .await
-            .unwrap_or(false);
-    Ok(Json(DeviceResponse {
-        ocr: if available {
-            OcrMode::Server
-        } else {
-            OcrMode::Device
-        },
+    Ok(Json(hx_schema::protocol::DeviceResponse {
+        ocr: ocr_mode(mode).await?,
     }))
+}
+
+async fn upload_ocr(
+    State(store): State<Store>,
+    mode: Option<Extension<OcrMode>>,
+    Path(sha): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let token = auth(&store, &headers, "ingest").await?;
+    if ocr_mode(mode).await? == OcrMode::Server {
+        return Err(ApiError(StatusCode::CONFLICT, "server performs OCR".into()));
+    }
+    // Never return captured text in parse/validation errors or logs.
+    let request: hx_schema::protocol::OcrRequest =
+        serde_json::from_slice(&body).map_err(|_| bad("invalid OCR request"))?;
+    if !hx_store::valid_hash(&sha) || !ocr::valid_device_request(&request) {
+        return Err(bad("invalid OCR request"));
+    }
+    if !store.accept_device_ocr(&sha, &request, &token).await? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "no authorized media.still".into(),
+        ));
+    }
+    // The durable one-second loop publishes lineage. Its failures must never
+    // turn a committed result into a permanent refusal at the client's boundary.
+    Ok(StatusCode::OK)
 }
 
 async fn events(

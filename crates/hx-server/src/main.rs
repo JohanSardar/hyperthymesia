@@ -125,19 +125,16 @@ async fn main() -> Result<()> {
                 store: store.clone(),
                 provider: processing::coordinator_provider(provider),
             };
-            let ocr_worker = if cfg!(target_os = "macos") {
-                let store = store.clone();
-                Some(tokio::spawn(async move {
-                    if hx_server::ocr::worker(store).await.is_err() {
-                        tracing::error!("OCR worker unavailable");
-                    }
-                }))
-            } else {
-                tracing::warn!(
-                    "OCR requires a macOS server; pending stills are retained for backfill"
-                );
-                None
-            };
+            let ocr_mode = hx_server::ocr::mode().await?;
+            let ocr_store = store.clone();
+            let ocr_worker = tokio::spawn(async move {
+                if hx_server::ocr::worker_in_mode(ocr_store, ocr_mode)
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("OCR worker unavailable");
+                }
+            });
             let worker = tokio::spawn(async move {
                 let mut next_schedule = tokio::time::Instant::now();
                 loop {
@@ -157,24 +154,23 @@ async fn main() -> Result<()> {
                 }
             });
             let stop_worker = worker.abort_handle();
-            let stop_ocr = ocr_worker.as_ref().map(|worker| worker.abort_handle());
-            let result = axum::serve(listener, hx_server::router(store, policy))
-                .with_graceful_shutdown(async move {
-                    shutdown.await;
-                    // Cancel provider work before waiting for HTTP connections
-                    // to drain. Dropping fx's output future kills its child.
-                    stop_worker.abort();
-                    if let Some(worker) = stop_ocr {
-                        worker.abort();
-                    }
-                })
-                .await;
+            let stop_ocr = ocr_worker.abort_handle();
+            let result = axum::serve(
+                listener,
+                hx_server::router(store, policy).layer(axum::Extension(ocr_mode)),
+            )
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                // Cancel provider work before waiting for HTTP connections
+                // to drain. Dropping fx's output future kills its child.
+                stop_worker.abort();
+                stop_ocr.abort();
+            })
+            .await;
             worker.abort();
             let _ = worker.await;
-            if let Some(worker) = ocr_worker {
-                worker.abort();
-                let _ = worker.await;
-            }
+            ocr_worker.abort();
+            let _ = ocr_worker.await;
             result?;
         }
     }
