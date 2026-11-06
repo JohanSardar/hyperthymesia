@@ -8,7 +8,7 @@ Status: **consensus plan** (2026-10-30). Agreed between Claude (author) and Astr
 
 **Goal:** an exact, *meaningful* replica of every day. Not "was on Chrome" but "spent 22 min comparing standing desks across the laptop and phone, then ordered one". Health and location get added later on the same timeline.
 
-- Devices do lightweight capture of everything possible. **All data goes to one server, and all processing (including OCR) happens there.**
+- Devices do lightweight capture of everything possible. **All data goes to one server for processing. OCR runs on a Mac server with a resolvable Vision helper, otherwise on the Mac capture app.**
 - **Modular core:** no source-specific logic. Every source and output is a connector (process / MCP / API).
 - LLM interpretation every **4 h**. No human review loop. No LLM budget cap.
 - Interpretations are kept forever. Raw screen video is kept ~30 days, then keyframes plus text.
@@ -119,7 +119,7 @@ Store: **Postgres** (data, FTS, pgvector, job queue) plus content-addressed blob
 | Native app text | bounded AX extraction (time and node deadlines via `AXUIElementSetMessagingTimeout`); Chromium/Electron AX enabled once per PID on capture workers | on |
 | Replay video | ScreenCaptureKit (drops idle frames) → VideoToolbox HEVC, low bitrate, 60 s chunks | on |
 | OCR-grade stills | sparse stills of the foreground context on focus change plus periodic sampling while content changes, **under a configured cadence/byte budget**; skipped captures recorded as coverage limits; kept even when text exists | on |
-| OCR | **none on device**; server only | — |
+| OCR | Apple Vision on the Mac app when the server advertises device OCR; otherwise on the server. Same sampling and source disclosure policy on both paths. | negotiated |
 | Raw keystrokes | never | — |
 | Audio | not in v1 | — |
 
@@ -159,7 +159,7 @@ Every collector has overflow counters, cancellation, restart/re-registration on 
 
 ### 5.1 Normalize, extract, compile
 - **Normalizers** are versioned, async and quarantinable.
-- **Visual processor:** decodes stills and keyframes and runs OCR behind an interface (Vision if the server is a Mac, otherwise an evaluated portable engine or a vision model). Exact hashes allow safe cache hits; perceptual similarity is only a sampling hint. Coverage is recorded per surface (complete / partial / truncated / unknown).
+- **Visual processor:** uses Apple Vision on a Mac server with a resolvable helper; otherwise the Mac app uploads results through authenticated `PUT /v1/ocr/{sha}`. No portable OCR engine is built. The first complete or sampled device result per exact hash and connector instance wins across engine versions, and never reaches another device's still. Perceptual similarity is only a sampling hint and never borrows text. OCR coverage is `partial`; derived text inherits its source still's disclosure decision. A device-mode server publishes lineage every second, including for duplicate stills arriving after the result. Existing unprocessed stills moved from a Mac server remain stored without text, with no backfill.
 - **Compiler** (deterministic, pure L1 → L2):
   - each source/device is compiled independently into lanes
   - lanes are overlaid on a global axis
@@ -233,7 +233,7 @@ crates/
   hx-agent-app       menu-bar app, onboarding, LaunchAgent
   hx-store           Postgres, blob store, retention/GC, backup manifests
   hx-jobs            queue: leases, attempts, idempotent outputs, quarantine
-  hx-visual          server visual processor (decode, keyframes, OCR interface)
+  hx-visual          shared visual processor (decode, thumbnail sampling, Vision OCR interface)
   hx-compile         pure L1 → L2
   hx-interpret       claims, checks, revisions, entity assertions, model providers
   hx-server          ingest, REST, dashboard (MCP later)

@@ -905,7 +905,7 @@ async fn revision24_compares_timeline_hash_instead_of_generation() {
 
 #[tokio::test]
 #[cfg(unix)]
-async fn fx_stops_on_changed_input_at_tool_boundary_and_live_lookup_is_local() {
+async fn fx_stops_on_changed_input_at_tool_boundary_and_failed_live_lookup_is_local() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new().await;
     let w = window();
@@ -924,7 +924,9 @@ server=json.loads((pathlib.Path(os.environ['HOME'])/'.fx/mcp.json').read_text())
 def call(name, args):
  request=urllib.request.Request(server['url'], data=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':name,'arguments':args}}).encode(), headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['HX_MCP_TOKEN']})
  return json.load(urllib.request.urlopen(request))['result']
-assert not call('live_lookup', {'source':'synthetic','request':'synthetic lookup'})['isError']
+failed=call('live_lookup', {'source':'synthetic','request':{'kind':'http','method':'GET','url':'https://example.invalid'}})
+assert failed['isError']
+assert json.loads(failed['content'][0]['text'])=={'error':'invalid source ID','retryable':False}
 (root/'ready').touch()
 while not (root/'changed').exists(): time.sleep(0.005)
 call('list_sources', {})
