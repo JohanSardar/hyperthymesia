@@ -432,7 +432,7 @@ async fn run_limited(
     std::fs::write(
         profile.join("mcp.json"),
         serde_json::to_vec(
-            &json!({"mcpServers":{"hyperthymesia":{"type":"http","url":format!("http://{addr}/mcp"),"bearer_token_env":"HX_MCP_TOKEN","operation_timeout_ms":15000}}}),
+            &json!({"mcpServers":{"hyperthymesia":{"type":"http","url":format!("http://{addr}/mcp"),"bearer_token_env":"HX_MCP_TOKEN","operation_timeout_ms":200000}}}),
         )?,
     )?;
     std::fs::write(work.join("replica-v9.txt"), PROMPT)?;

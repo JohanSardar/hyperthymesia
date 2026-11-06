@@ -179,6 +179,19 @@ impl SourceAudit {
                 );
             }
         }
+        // Not in the source, so the column sums above can't see it. Device results
+        // carry a non-empty scope and only arrive after cutover.
+        for table in ["ocr_jobs", "ocr_evidence"] {
+            let scoped: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE scope<>''"
+            )))
+            .fetch_one(&store.pool)
+            .await?;
+            ensure!(
+                scoped == 0,
+                "independent source audit: {table}.scope differs"
+            );
+        }
         Ok(())
     }
 }

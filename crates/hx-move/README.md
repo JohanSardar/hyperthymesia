@@ -195,7 +195,9 @@ OCR progress is seeded for every engine version already present in `ocr_jobs`.
 All still/blob associations without existing derived evidence are retained;
 failed/sampled associations remain dormant until reset. This includes unpublished
 blobs, so a late upload is discovered after cutover. A new engine version starts
-from zero, intentionally matching the runtime's versioned OCR behavior.
+from zero, intentionally matching the runtime's versioned OCR behavior. Postgres
+OCR ran only on the server, so every moved job and citation gets the empty `scope`
+that means server-run, and the row hash and independent audit both check it.
 
 Migration 10 already applied the legacy admission repairs now represented by
 `hx-store` test fixtures. The mover **does not replay** those data repairs: job
