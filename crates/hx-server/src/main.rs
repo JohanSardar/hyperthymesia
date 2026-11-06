@@ -29,11 +29,14 @@ enum Command {
         command: TokenCommand,
     },
     /// Print a single-use pairing link, valid for 15 minutes.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Pair {
+        #[command(subcommand)]
+        command: Option<PairCommand>,
         #[arg(long, default_value = "http://127.0.0.1:7377")]
         url: String,
-        #[arg(long)]
-        name: String,
+        #[arg(long, required = true)]
+        name: Option<String>,
     },
     Compile {
         #[arg(long)]
@@ -48,6 +51,13 @@ enum Command {
         to: DateTime<Utc>,
     },
     Gc,
+}
+#[derive(Subcommand)]
+enum PairCommand {
+    /// List code hash IDs and metadata, never the pairing secrets.
+    List,
+    /// Revoke a full code ID from pair list. Does not revoke an issued token.
+    Revoke { id: String },
 }
 #[derive(Subcommand)]
 enum TokenCommand {
@@ -114,7 +124,29 @@ async fn main() -> Result<()> {
             }
             println!("Token revoked.");
         }
-        Command::Pair { url, name } => {
+        Command::Pair {
+            command: Some(PairCommand::List),
+            ..
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.list_pair_codes().await?)?
+            );
+        }
+        Command::Pair {
+            command: Some(PairCommand::Revoke { id }),
+            ..
+        } => {
+            if !store.revoke_pair_code(&id).await? {
+                bail!("code ID not found");
+            }
+            println!("Pairing code revoked.");
+        }
+        Command::Pair {
+            command: None,
+            url,
+            name,
+        } => {
             let server =
                 url::Url::parse(&url).map_err(|_| anyhow::anyhow!("invalid server URL"))?;
             let loopback = server.host_str().is_some_and(|host| {
@@ -135,7 +167,9 @@ async fn main() -> Result<()> {
                     "pairing requires a server URL with HTTPS (or loopback HTTP), without credentials, query or fragment"
                 );
             }
-            let code = store.create_pair_code(&name).await?;
+            let code = store
+                .create_pair_code(&name.context("--name is required")?)
+                .await?;
             let mut link = url::Url::parse("hyperthymesia://pair")?;
             link.query_pairs_mut()
                 .append_pair("server", server.as_str().trim_end_matches('/'))

@@ -82,7 +82,7 @@ pub struct PairRequest {
     pub device_id: String,
 }
 
-/// Returned once by POST /v1/pair; failures uniformly return HTTP 410.
+/// Returned once by POST /v1/pair. Refusals return 410; internal errors return 503.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PairResponse {

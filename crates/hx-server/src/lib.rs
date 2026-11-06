@@ -107,7 +107,8 @@ async fn pair(
         axum::extract::rejection::JsonRejection,
     >,
 ) -> ApiResult<Response> {
-    // Do not expose extractor, validation, or database errors (or their inputs).
+    // Refusals are uniform. Internal errors carry no body or credential detail
+    // and invite a retry instead of telling the client its code is dead.
     let gone = || {
         ApiError(
             StatusCode::GONE,
@@ -115,11 +116,14 @@ async fn pair(
         )
     };
     let Json(request) = request.map_err(|_| gone())?;
-    let token = store
+    let token = match store
         .redeem_pair_code(&request.code, &request.device_id)
         .await
-        .map_err(|_| gone())?
-        .ok_or_else(gone)?;
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => return Err(gone()),
+        Err(_) => return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    };
     Ok((
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(hx_schema::protocol::PairResponse { token }),
