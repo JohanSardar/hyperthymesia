@@ -22,6 +22,9 @@ pub enum Request {
         argv: Vec<String>,
         #[serde(default)]
         env: BTreeMap<String, String>,
+        /// Absent: stdout must be JSON. Present: stdout is text lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<TextLines>,
     },
     Mcp {
         #[serde(flatten)]
@@ -37,6 +40,26 @@ pub enum Request {
 pub enum McpTransport {
     Http { url: String },
     Stdio { argv: Vec<String> },
+}
+
+/// Data, not a parser: CLI stdout becomes `{"lines":[{"line","fields"}]}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextLines {
+    pub separator: String,
+}
+
+fn text_lines(stdout: &[u8], separator: &str) -> Result<Value, RequestError> {
+    let text = std::str::from_utf8(stdout).map_err(|_| RequestError::CliJson)?;
+    let lines: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split(separator).collect();
+            serde_json::json!({"line": line, "fields": fields})
+        })
+        .collect();
+    Ok(serde_json::json!({"lines": lines}))
 }
 
 /// Owner configuration, never supplied by a recipe or a source response.
@@ -204,7 +227,13 @@ impl Request {
     /// login, executable search path, runtime loader or credential directory.
     pub fn validate_cli(&self) -> Result<(), RequestError> {
         let argv = match self {
-            Self::Cli { argv, env } => {
+            Self::Cli { argv, env, text } => {
+                if text
+                    .as_ref()
+                    .is_some_and(|t| t.separator.is_empty() || t.separator.len() > 8)
+                {
+                    return Err(RequestError::CliInvalid);
+                }
                 // Only explicit key/token variables are useful request input.
                 // All directory, runtime and lookup variables are owner context.
                 if env.iter().any(|(name, value)| {
@@ -392,7 +421,7 @@ impl Request {
                 tool,
                 arguments,
             } => crate::mcp::execute(transport, tool, arguments, values, timeout, host, gate).await,
-            Self::Cli { argv, env } => {
+            Self::Cli { argv, env, text } => {
                 if timeout.is_zero() || argv.first().is_none_or(String::is_empty) {
                     return Err(RequestError::CliInvalid);
                 }
@@ -430,7 +459,12 @@ impl Request {
                         None => RequestError::Signal,
                     });
                 }
-                serde_json::from_slice(&output.stdout).map_err(|_| RequestError::CliJson)
+                match text {
+                    Some(text) => text_lines(&output.stdout, &text.separator),
+                    None => {
+                        serde_json::from_slice(&output.stdout).map_err(|_| RequestError::CliJson)
+                    }
+                }
             }
         }
     }
@@ -471,6 +505,7 @@ impl Request {
         }
         let url = substitute_url(url, values)?;
         let client = reqwest::Client::builder()
+            .user_agent("Hyperthymesia")
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
@@ -1100,6 +1135,7 @@ mod tests {
         let cli = Request::Cli {
             argv: vec!["must-not-execute".into()],
             env: BTreeMap::new(),
+            text: None,
         };
         assert_eq!(
             cli.execute_http(Placeholders::default(), Duration::from_secs(1))
