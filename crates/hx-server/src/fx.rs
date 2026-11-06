@@ -764,7 +764,8 @@ pub(crate) async fn interpret_window_with_settle(
             }
         }
     }
-    broker.check_generation().await?;
+    // A paid result exists from here on: writer contention must not cost it.
+    hx_store::retry_busy("check generation", |_| broker.check_generation()).await?;
     let interpretation = best.context("invalid fx interpretation")?;
     ensure!(
         DisclosurePolicy::from_env()?.digest() == policy.digest()
@@ -775,8 +776,11 @@ pub(crate) async fn interpret_window_with_settle(
     ensure!(!audit.exhausted, "MCP budget exhausted");
     let namespaces: Vec<String> = audit.input_namespaces.iter().cloned().collect();
     let mut value = serde_json::to_value(interpretation)?;
-    let timeline_hash = store.compiled_timeline_hash(window, generation).await?
-        .ok_or(hx_jobs::Deferred::InputChanged)?;
+    let timeline_hash = hx_store::retry_busy("read timeline hash", |_| {
+        store.compiled_timeline_hash(window, generation)
+    })
+    .await?
+    .ok_or(hx_jobs::Deferred::InputChanged)?;
     value["input_manifest"] = selection.input_manifest(window, &timeline_hash, generation, &policy, sensitive, &namespaces);
     value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":selection.model,"effort":selection.effort,"fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     Ok(store
@@ -953,8 +957,8 @@ mod tests {
                     let manifest = Selection::from_env().unwrap().input_manifest(window, "synthetic-hash", 7, &policy, sensitive, &namespaces);
                     assert_eq!(serde_json::to_vec(&manifest).unwrap(), serde_json::to_vec(&legacy).unwrap());
                 }
-                let pool = sqlx::postgres::PgPoolOptions::new()
-                    .connect_lazy("postgres://hx:hx@localhost:55432/hx")
+                let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                    .connect_lazy("sqlite:///nonexistent-fx-fixture.sqlite")
                     .unwrap();
                 let broker = Broker::new(
                     Store::new(pool, std::env::var_os("HOME").unwrap()),

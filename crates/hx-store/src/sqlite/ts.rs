@@ -23,6 +23,12 @@ impl From<DateTime<Utc>> for Ts {
     }
 }
 
+impl From<Ts> for DateTime<Utc> {
+    fn from(value: Ts) -> Self {
+        DateTime::from_timestamp_micros(value.0).expect("stored timestamp in chrono range")
+    }
+}
+
 impl Type<Sqlite> for Ts {
     fn type_info() -> SqliteTypeInfo {
         <i64 as Type<Sqlite>>::type_info()

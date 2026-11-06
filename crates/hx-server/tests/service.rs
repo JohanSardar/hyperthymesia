@@ -16,16 +16,6 @@ fn executable(path: &Path, script: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-fn fixture_url(store: &Store) -> String {
-    let base = std::env::var("HX_TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://hx:hx@localhost:55432/hx".into());
-    format!(
-        "{}/{}",
-        base.rsplit_once('/').unwrap().0,
-        store.pool.connect_options().get_database().unwrap()
-    )
-}
-
 async fn seed(store: &Store, old: bool) -> Interval {
     let w = hx_store::window_at(Utc::now() - Duration::hours(if old { 240 } else { 8 }));
     let e: Envelope = serde_json::from_value(json!({
@@ -150,8 +140,8 @@ async fn missing_login_defers_without_spending_attempt() {
 
 #[tokio::test]
 async fn healthz_is_public_and_only_reports_status() {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_lazy("sqlite:///nonexistent-healthz-fixture.sqlite")
         .unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let response = hx_server::router(
@@ -241,7 +231,6 @@ fn doctor_needs_no_database_or_model() {
             .arg("doctor")
             .env_clear()
             .env("HOME", &root)
-            .env("DATABASE_URL", "not-a-database")
             .env("HX_FX_BINARY", binary)
             .env("HX_FX_CREDENTIAL", credential)
             .env("HX_PROVIDER", if case == "stub" { "stub" } else { "fx" })
@@ -286,11 +275,10 @@ async fn sigterm_during_fx_run_leaves_no_child() {
     let login = scratch.path().join("login.json");
     std::fs::write(&login, b"{\"synthetic\":true}").unwrap();
     let mut server = Command::new(env!("CARGO_BIN_EXE_hx-server"))
-        .args(["serve", "--listen", "127.0.0.1:0", "--data-dir"])
-        .arg(scratch.path())
+        .args(["serve", "--listen", "127.0.0.1:0"])
         .env_clear()
         .env("HOME", scratch.path())
-        .env("DATABASE_URL", fixture_url(&f.store))
+        .env("HX_STATE_DIR", &f.store.data_dir)
         .env("HX_PROVIDER", "fx")
         .env("HX_FX_BINARY", binary)
         .env("HX_FX_CREDENTIAL", login)
@@ -370,11 +358,10 @@ async fn default_stub_warns_even_when_logging_is_disabled() {
     let f = Fixture::new().await;
     let scratch = tempfile::tempdir().unwrap();
     let mut server = Command::new(env!("CARGO_BIN_EXE_hx-server"))
-        .args(["serve", "--listen", "127.0.0.1:0", "--data-dir"])
-        .arg(scratch.path())
+        .args(["serve", "--listen", "127.0.0.1:0"])
         .env_clear()
         .env("HOME", scratch.path())
-        .env("DATABASE_URL", fixture_url(&f.store))
+        .env("HX_STATE_DIR", &f.store.data_dir)
         .env("RUST_LOG", "off")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

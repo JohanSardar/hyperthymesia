@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use hx_schema::Interval;
@@ -9,12 +9,9 @@ use std::{net::SocketAddr, path::PathBuf};
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    #[arg(
-        long,
-        env = "DATABASE_URL",
-        default_value = "postgres://hx:hx@localhost:55432/hx"
-    )]
-    database_url: String,
+    /// Local state folder; required for every command except doctor and version.
+    #[arg(long, env = "HX_STATE_DIR", global = true)]
+    state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -26,8 +23,6 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:7377")]
         listen: SocketAddr,
-        #[arg(long)]
-        data_dir: PathBuf,
     },
     Token {
         #[command(subcommand)]
@@ -35,24 +30,17 @@ enum Command {
     },
     Compile {
         #[arg(long)]
-        data_dir: PathBuf,
-        #[arg(long)]
         from: DateTime<Utc>,
         #[arg(long)]
         to: DateTime<Utc>,
     },
     Interpret {
         #[arg(long)]
-        data_dir: PathBuf,
-        #[arg(long)]
         from: DateTime<Utc>,
         #[arg(long)]
         to: DateTime<Utc>,
     },
-    Gc {
-        #[arg(long)]
-        data_dir: PathBuf,
-    },
+    Gc,
 }
 #[derive(Subcommand)]
 enum TokenCommand {
@@ -79,17 +67,18 @@ async fn main() -> Result<()> {
         println!("ok: provider configured, fx version and login checks passed (no model call)");
         return Ok(());
     }
-    let dir = match &cli.command {
-        Command::Serve { data_dir, .. }
-        | Command::Compile { data_dir, .. }
-        | Command::Interpret { data_dir, .. }
-        | Command::Gc { data_dir } => data_dir.clone(),
-        _ => PathBuf::from("."),
-    };
-    let store = Store::connect(&cli.database_url, dir).await?;
+    let dir = cli
+        .state_dir
+        .context("--state-dir or HX_STATE_DIR is required")?;
+    if matches!(cli.command, Command::Migrate) {
+        let store = Store::create(&dir).await?;
+        store.pool.close().await;
+        return Ok(());
+    }
+    let store = Store::open(&dir).await?;
     match cli.command {
         Command::Doctor => unreachable!("doctor runs without a database"),
-        Command::Migrate => store.migrate().await?,
+        Command::Migrate => unreachable!("migrate creates a new state"),
         Command::Token {
             command:
                 TokenCommand::Create {
@@ -98,20 +87,13 @@ async fn main() -> Result<()> {
                     scopes,
                 },
         } => println!("{}", store.create_token(&name, prefix, scopes).await?),
-        Command::Gc { .. } => println!("Expired {} blobs", store.gc().await?),
+        Command::Gc => println!("Expired {} blobs", store.gc().await?),
         Command::Compile { from, to, .. } => {
             for w in windows(from, to)? {
                 processing::compile_window(&store, w).await?;
             }
         }
-        Command::Interpret { from, to, data_dir } => {
-            // Paid-run exclusion only works inside one folder, so a mistyped path
-            // must not create a second one beside the server's.
-            anyhow::ensure!(
-                data_dir.join("blobs").is_dir(),
-                "{} has no blobs folder; pass the server's --data-dir",
-                data_dir.display()
-            );
+        Command::Interpret { from, to } => {
             for w in windows(from, to)? {
                 processing::interpret_window(
                     &store,
