@@ -121,6 +121,7 @@ async fn http(
 ) -> Result<Value, RequestError> {
     let url = substitute_url(url, values)?;
     let client = reqwest::Client::builder()
+        .user_agent("Hyperthymesia")
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())

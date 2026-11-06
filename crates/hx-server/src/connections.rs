@@ -151,7 +151,7 @@ pub async fn page(
                             p class="hint" {"Optional read-only request checked without AI before setup. Change the executable here and in the description when using a custom CLI path. A failed check pauses setup until you reconnect."}
                             textarea name="probe_json" aria-label="Connection check JSON" {(probe)}
                         }
-                        p class="hint" {"The configured cloud model can receive captured window titles, URLs, accessibility text, screenshot OCR, fuller saved evidence from broker lookups, and source responses during setup and live lookups. Connecting starts a paid setup run; later day-page runs can also use this source."}
+                        p class="hint" {"The configured cloud model can receive captured window titles, URLs, accessibility text, screenshot OCR, fuller saved evidence from broker lookups, and source responses during setup and live lookups. Connecting starts one paid setup run. Each day of history can also buy about 6 day-page runs, plus up to 6 more 24-hour passes, so keep history low."}
                         button type="submit" {"Connect and turn on"}
                     }
                 }

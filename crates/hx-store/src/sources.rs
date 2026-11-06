@@ -207,10 +207,11 @@ impl Store {
         job: i64,
         owner: &str,
         message: &str,
+        refund_attempt: bool,
     ) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        let changed = sqlx::query("UPDATE jobs SET state='done',attempts=max(attempts-1,0),lease_owner=NULL,lease_until=NULL,last_error=$5 WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>$6 AND output_key=$3 AND kind='setup' AND EXISTS(SELECT 1 FROM sources WHERE id=$4 AND setup_generation=$7)")
-            .bind(job).bind(owner).bind(format!("setup:{source}:{generation}")).bind(source).bind(message).bind(Ts::now()).bind(generation).execute(&mut *tx).await?.rows_affected();
+        let changed = sqlx::query("UPDATE jobs SET state='done',attempts=CASE WHEN $8 THEN max(attempts-1,0) ELSE attempts END,lease_owner=NULL,lease_until=NULL,last_error=$5 WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>$6 AND output_key=$3 AND kind='setup' AND EXISTS(SELECT 1 FROM sources WHERE id=$4 AND setup_generation=$7)")
+            .bind(job).bind(owner).bind(format!("setup:{source}:{generation}")).bind(source).bind(message).bind(Ts::now()).bind(generation).bind(refund_attempt).execute(&mut *tx).await?.rows_affected();
         if changed == 1 {
             sqlx::query("UPDATE sources SET status='needs_reconnect',last_error=$2 WHERE id=$1 AND setup_generation=$3")
                 .bind(source).bind(message).bind(generation).execute(&mut *tx).await?;

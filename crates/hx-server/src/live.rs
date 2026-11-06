@@ -127,6 +127,9 @@ impl Broker {
                 .live_exchange(source_id, &request, self.setup_generation)?
                 .execute(hx_sources::request::Placeholders::default(), timeout, &host)
                 .await;
+            if key.is_some() && matches!(answer, Err(RequestError::Status(401))) {
+                self.audit.lock().await.key_refused = true;
+            }
             let answer = answer.map_err(request_error)?;
             json!({"tool":name,"request":args["request"],"response":answer,"context_only":true})
         } else {
@@ -137,6 +140,7 @@ impl Broker {
             let request = Request::Cli {
                 argv: vec!["/bin/true".into()],
                 env: Default::default(),
+                text: None,
             };
             let answer = self
                 .store
