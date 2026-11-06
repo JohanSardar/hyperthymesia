@@ -3631,8 +3631,7 @@ async fn device_ocr_validation_and_first_success_survive_retries() {
     let envelope: Value = rows[0].get("envelope");
     assert_eq!(envelope["payload"]["ocr"], body["result"]);
 
-    // A sampled result cannot become text on a retry or engine upgrade. A missing
-    // reference is a retryable ordering/storage failure, never a permanent refusal.
+    // A sampled result cannot become text on a retry or engine upgrade.
     let sampled_bytes = synthetic_png(2);
     let sampled_sha = hx_store::hash(&sampled_bytes);
     let reference = synthetic_png(3);
@@ -3660,10 +3659,6 @@ async fn device_ocr_validation_and_first_success_survive_retries() {
             OcrMode::Device,
         )
     };
-    assert_eq!(
-        put_sample(sampled.clone()).await,
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
     ingest(
         &f.store,
         vec![still(
@@ -3674,13 +3669,24 @@ async fn device_ocr_validation_and_first_success_survive_retries() {
         )],
     )
     .await;
+    assert_eq!(
+        device_ocr_put(
+            &f.store,
+            &auth,
+            &reference_sha,
+            serde_json::to_vec(&device_ocr_body(&reference)).unwrap(),
+            OcrMode::Device,
+        )
+        .await,
+        StatusCode::OK
+    );
     assert_eq!(put_sample(sampled).await, StatusCode::OK);
     let mut late_complete = device_ocr_body(&sampled_bytes);
     late_complete["engine_version"] = json!("vision:updated");
     assert_eq!(put_sample(late_complete).await, StatusCode::OK);
     f.store.publish_device_ocr_lineage().await.unwrap();
     assert_eq!(f.store.sampled_ocr_count().await.unwrap(), 1);
-    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), 1);
+    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), 2);
 
     // Different engine versions racing for the first success still publish only
     // one result and one citation for a hash.
@@ -3707,7 +3713,329 @@ async fn device_ocr_validation_and_first_success_survive_retries() {
     let (a, b) = tokio::join!(race_put(&first), race_put(&second));
     assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
     f.store.publish_device_ocr_lineage().await.unwrap();
-    assert_eq!(f.store.complete_ocr_count().await.unwrap(), 2);
-    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), 2);
+    assert_eq!(f.store.complete_ocr_count().await.unwrap(), 3);
+    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), 3);
+    f.close().await;
+}
+
+async fn ocr_still_in(
+    store: &Store,
+    auth: &str,
+    key: &str,
+    connector: &str,
+    seconds: i64,
+    bytes: &[u8],
+) {
+    let mut e = still(key, seconds, Sensitivity::Normal, bytes);
+    e.connector_instance = ConnectorInstance::new(connector);
+    let (status, body) = request(
+        store,
+        "POST",
+        "/v1/events",
+        auth,
+        serde_json::to_vec(&json!({"batch_id":ulid::Ulid::generate(),"envelopes":[e]})).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["accepted"],
+        1
+    );
+}
+async fn put_ocr_value(store: &Store, auth: &str, sha: &str, body: &Value) -> StatusCode {
+    device_ocr_put(
+        store,
+        auth,
+        sha,
+        serde_json::to_vec(body).unwrap(),
+        hx_schema::protocol::OcrMode::Device,
+    )
+    .await
+}
+async fn check_device_ocr_prefix_attack(sampled: bool) {
+    let f = Fixture::new().await;
+    let victim = secret(&f.store).await;
+    let evil = f
+        .store
+        .create_token(
+            "synthetic attacker",
+            vec!["evil:".into()],
+            vec!["ingest".into()],
+        )
+        .await
+        .unwrap();
+    let bytes = synthetic_png(10);
+    let sha = hx_store::hash(&bytes);
+    let mut honest = device_ocr_body(&bytes);
+    honest["result"]["lines"][0]["text"] = json!("HONEST SYNTHETIC TEXT");
+    ocr_still_in(&f.store, &victim, "victim", "test:victim", 0, &bytes).await;
+    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    assert_eq!(
+        put_ocr_value(&f.store, &evil, &sha, &honest).await,
+        StatusCode::CONFLICT
+    );
+    // The attack does not require possession or publication of the victim blob.
+    ocr_still_in(
+        &f.store,
+        &evil,
+        "evil-copy",
+        "evil:device",
+        8 * 3600,
+        &bytes,
+    )
+    .await;
+    let mut attack = honest.clone();
+    attack["result"]["lines"][0]["text"] = json!("FORGED SYNTHETIC TEXT");
+    if sampled {
+        let reference = synthetic_png(11);
+        let reference_sha = hx_store::hash(&reference);
+        ocr_still_in(
+            &f.store,
+            &evil,
+            "evil-reference",
+            "evil:device",
+            8 * 3600 - 1,
+            &reference,
+        )
+        .await;
+        f.store
+            .upload_blob(&reference_sha, &reference)
+            .await
+            .unwrap();
+        assert_eq!(
+            put_ocr_value(
+                &f.store,
+                &evil,
+                &reference_sha,
+                &device_ocr_body(&reference)
+            )
+            .await,
+            StatusCode::OK
+        );
+        attack["status"] = json!("sampled");
+        attack["sampled_from"] = json!(reference_sha);
+        attack["result"] = Value::Null;
+    }
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    let before = f.store.generation(w).await.unwrap();
+    assert_eq!(
+        put_ocr_value(&f.store, &evil, &sha, &attack).await,
+        StatusCode::OK
+    );
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    let victim_rows: Vec<_> = f
+        .store
+        .derived_ocr_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.get::<Value, _>("envelope")["connector_instance"] == "test:victim")
+        .collect();
+    assert!(victim_rows.is_empty(), "attacker minted victim evidence");
+    assert_eq!(
+        f.store.generation(w).await.unwrap(),
+        before,
+        "attacker dirtied victim window"
+    );
+    let mut failed = honest.clone();
+    failed["status"] = json!("failed");
+    failed["perceptual_hash"] = Value::Null;
+    failed["result"] = Value::Null;
+    assert_eq!(
+        put_ocr_value(&f.store, &victim, &sha, &failed).await,
+        StatusCode::OK
+    );
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    assert_eq!(
+        f.store.generation(w).await.unwrap(),
+        before,
+        "failed result dirtied window"
+    );
+    assert_eq!(
+        put_ocr_value(&f.store, &victim, &sha, &honest).await,
+        StatusCode::OK
+    );
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    let rows = f.store.derived_ocr_records().await.unwrap();
+    let victim_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.get::<Value, _>("envelope")["connector_instance"] == "test:victim")
+        .collect();
+    assert_eq!(victim_rows.len(), 1, "attacker blocked honest OCR");
+    assert_eq!(
+        victim_rows[0].get::<Value, _>("envelope")["payload"]["ocr"],
+        honest["result"]
+    );
+    if !sampled {
+        // Both devices really hold this hash: each keeps its own first result.
+        let evil_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.get::<Value, _>("envelope")["connector_instance"] == "evil:device")
+            .collect();
+        assert_eq!(evil_rows.len(), 1);
+        assert_eq!(
+            evil_rows[0].get::<Value, _>("envelope")["payload"]["ocr"],
+            attack["result"]
+        );
+    }
+    let after = f.store.generation(w).await.unwrap();
+    assert_eq!(after, before + 1);
+    // Retries and version bumps never replace either scope's first success.
+    honest["engine_version"] = json!("vision:updated");
+    honest["result"]["lines"][0]["text"] = json!("IGNORED RETRY");
+    assert_eq!(
+        put_ocr_value(&f.store, &evil, &sha, &attack).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_ocr_value(&f.store, &victim, &sha, &honest).await,
+        StatusCode::OK
+    );
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    assert_eq!(f.store.generation(w).await.unwrap(), after);
+    f.close().await;
+}
+#[tokio::test]
+async fn device_ocr_complete_cannot_forge_another_prefix() {
+    check_device_ocr_prefix_attack(false).await;
+}
+#[tokio::test]
+async fn device_ocr_sampled_cannot_suppress_another_prefix() {
+    check_device_ocr_prefix_attack(true).await;
+}
+
+#[tokio::test]
+async fn device_ocr_respects_paired_prefix_boundaries() {
+    let f = Fixture::new().await;
+    let broad = f
+        .store
+        .create_token(
+            "synthetic broad",
+            vec!["macos-agent:".into()],
+            vec!["ingest".into()],
+        )
+        .await
+        .unwrap();
+    let paired = f
+        .store
+        .create_token(
+            "synthetic paired",
+            vec!["macos-agent:mac1".into()],
+            vec!["ingest".into()],
+        )
+        .await
+        .unwrap();
+    let bytes = synthetic_png(12);
+    let sha = hx_store::hash(&bytes);
+    ocr_still_in(&f.store, &broad, "mac10", "macos-agent:mac10", 0, &bytes).await;
+    let body = device_ocr_body(&bytes);
+    assert_eq!(
+        put_ocr_value(&f.store, &paired, &sha, &body).await,
+        StatusCode::CONFLICT,
+        "mac1 matched mac10"
+    );
+    ocr_still_in(
+        &f.store,
+        &broad,
+        "mac1",
+        "macos-agent:mac1:display",
+        1,
+        &bytes,
+    )
+    .await;
+    assert_eq!(
+        put_ocr_value(&f.store, &paired, &sha, &body).await,
+        StatusCode::OK
+    );
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    let connectors = |rows: Vec<hx_store::test_support::Snapshot>| -> Vec<String> {
+        rows.iter()
+            .map(|r| {
+                r.get::<Value, _>("envelope")["connector_instance"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(
+        connectors(f.store.derived_ocr_records().await.unwrap()),
+        ["macos-agent:mac1:display"]
+    );
+    // A trailing colon keeps its namespace meaning: the broad token owns mac10.
+    assert_eq!(
+        put_ocr_value(&f.store, &broad, &sha, &body).await,
+        StatusCode::OK
+    );
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    assert_eq!(
+        connectors(f.store.derived_ocr_records().await.unwrap()),
+        ["macos-agent:mac1:display", "macos-agent:mac10"]
+    );
+    f.close().await;
+}
+
+// The client discards a still on 4xx and retries a 5xx forever, so every bad
+// reference must get one answer that also says nothing about other devices' hashes.
+#[tokio::test]
+async fn device_ocr_sampled_from_must_be_a_done_still_of_the_same_token() {
+    let f = Fixture::new().await;
+    let own = secret(&f.store).await;
+    let other = f
+        .store
+        .create_token("other", vec!["other:".into()], vec!["ingest".into()])
+        .await
+        .unwrap();
+    let mut shas = vec![];
+    for (i, connector, auth, done) in [
+        (20, "test:device", &own, false),
+        (21, "other:device", &other, true),
+        (22, "test:device", &own, false),
+        (23, "test:device", &own, true),
+    ] {
+        let bytes = synthetic_png(i);
+        let sha = hx_store::hash(&bytes);
+        ocr_still_in(
+            &f.store,
+            auth,
+            &format!("reference-{i}"),
+            connector,
+            0,
+            &bytes,
+        )
+        .await;
+        if done {
+            assert_eq!(
+                put_ocr_value(&f.store, auth, &sha, &device_ocr_body(&bytes)).await,
+                StatusCode::OK
+            );
+        }
+        shas.push(sha);
+    }
+    let mut sampled = device_ocr_body(&synthetic_png(20));
+    sampled["status"] = json!("sampled");
+    sampled["result"] = Value::Null;
+    // Unknown, another prefix's done still, itself, and a not-yet-done own still.
+    for reference in [
+        "a".repeat(64),
+        shas[1].clone(),
+        shas[0].clone(),
+        shas[2].clone(),
+    ] {
+        sampled["sampled_from"] = json!(reference);
+        assert_eq!(
+            put_ocr_value(&f.store, &own, &shas[0], &sampled).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // A refused reference never takes the first-result slot.
+    assert_eq!(f.store.sampled_ocr_count().await.unwrap(), 0);
+    // The blob may still be uploading: only the result has to be done.
+    sampled["sampled_from"] = json!(shas[3]);
+    assert_eq!(
+        put_ocr_value(&f.store, &own, &shas[0], &sampled).await,
+        StatusCode::OK
+    );
+    assert_eq!(f.store.sampled_ocr_count().await.unwrap(), 1);
     f.close().await;
 }

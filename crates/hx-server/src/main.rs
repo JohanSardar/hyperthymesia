@@ -235,6 +235,12 @@ async fn main() -> Result<()> {
                 provider: processing::coordinator_provider(provider),
             };
             let ocr_mode = hx_server::ocr::mode().await?;
+            if cfg!(target_os = "macos") && ocr_mode == hx_schema::protocol::OcrMode::Device {
+                // Error level: the default filter hides anything lower.
+                tracing::error!(
+                    "Vision helper not found on this Mac: this server will not run OCR and accepts device results instead"
+                );
+            }
             let ocr_store = store.clone();
             let ocr_worker = tokio::spawn(async move {
                 if hx_server::ocr::worker_in_mode(ocr_store, ocr_mode)

@@ -159,7 +159,7 @@ Every collector has overflow counters, cancellation, restart/re-registration on 
 
 ### 5.1 Normalize, extract, compile
 - **Normalizers** are versioned, async and quarantinable.
-- **Visual processor:** uses Apple Vision on a Mac server with a resolvable helper; otherwise the Mac app uploads results through authenticated `PUT /v1/ocr/{sha}`. No portable OCR engine is built. The first complete or sampled device result per exact hash wins across engine versions. Perceptual similarity is only a sampling hint and never borrows text. OCR coverage is `partial`; derived text inherits its source still's disclosure decision. A device-mode server publishes lineage every second, including for duplicate stills arriving after the result. Existing unprocessed stills moved from a Mac server remain stored without text, with no backfill.
+- **Visual processor:** uses Apple Vision on a Mac server with a resolvable helper; otherwise the Mac app uploads results through authenticated `PUT /v1/ocr/{sha}`. No portable OCR engine is built. The first complete or sampled device result per exact hash and connector instance wins across engine versions, and never reaches another device's still. Perceptual similarity is only a sampling hint and never borrows text. OCR coverage is `partial`; derived text inherits its source still's disclosure decision. A device-mode server publishes lineage every second, including for duplicate stills arriving after the result. Existing unprocessed stills moved from a Mac server remain stored without text, with no backfill.
 - **Compiler** (deterministic, pure L1 → L2):
   - each source/device is compiled independently into lanes
   - lanes are overlaid on a global axis

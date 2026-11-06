@@ -166,16 +166,22 @@ async fn upload_ocr(
         return Err(ApiError(StatusCode::CONFLICT, "server performs OCR".into()));
     }
     // Never return captured text in parse/validation errors or logs.
-    let request: hx_schema::protocol::OcrRequest =
+    let mut request: hx_schema::protocol::OcrRequest =
         serde_json::from_slice(&body).map_err(|_| bad("invalid OCR request"))?;
-    if !hx_store::valid_hash(&sha) || !ocr::valid_device_request(&request) {
+    if !hx_store::valid_hash(&sha) || !ocr::normalize_device_request(&mut request) {
         return Err(bad("invalid OCR request"));
     }
-    if !store.accept_device_ocr(&sha, &request, &token).await? {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "no authorized media.still".into(),
-        ));
+    match store.accept_device_ocr(&sha, &request, &token).await? {
+        hx_store::DeviceOcrOutcome::Accepted => {}
+        hx_store::DeviceOcrOutcome::NoOwnedStill => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "no authorized media.still".into(),
+            ));
+        }
+        // Same answer for an unknown hash and another device's hash. A 5xx would
+        // keep the client retrying this still and block everything behind it.
+        hx_store::DeviceOcrOutcome::InvalidReference => return Err(bad("invalid OCR request")),
     }
     // The durable one-second loop publishes lineage. Its failures must never
     // turn a committed result into a permanent refusal at the client's boundary.
