@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installer core only: never starts/stops services, migrates or reads state.
+# Verified user-service installer. Never operates on unmanaged owner state.
 set -eu
 umask 077
 
@@ -15,15 +15,30 @@ dry_run=false
 uninstall=false
 server_only=false
 app_only=false
+requested_state=
+provider=codex
+model=gpt-6.1-sol
+effort=xhigh
+configured=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) dry_run=true ;;
         --uninstall) uninstall=true ;;
         --server-only) server_only=true ;;
         --app-only) app_only=true ;;
+        --provider|--model|--effort|--state-dir)
+            option=$1
+            [ "$#" -ge 2 ] || die "missing value for $option"
+            shift
+            case "$option" in
+                --provider) provider=$1; configured=true ;;
+                --model) model=$1; configured=true ;;
+                --effort) effort=$1; configured=true ;;
+                --state-dir) requested_state=$1 ;;
+            esac ;;
         --help)
-            printf '%s\n' 'Usage: install.sh [--dry-run] [--uninstall] [--server-only|--app-only]' \
-                'Verifies and installs files only; service activation and state initialization are not included.' \
+            printf '%s\n' 'Usage: install.sh [--provider codex|grok|gateway --model M --effort E --state-dir D] [--dry-run] [--uninstall] [--server-only|--app-only]' \
+                'Installs a loopback user service; upgrades are backed up and refused during interpret leases.' \
                 'HX_RELEASE_BASE: release download directory (default: GitHub latest/download).' \
                 'HX_FX_RELEASE_BASE: fx download directory; pinned SHA-256 checks always apply.'
             exit 0 ;;
@@ -31,6 +46,8 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+case "$provider" in codex|grok|gateway) ;; *) die 'provider must be codex, grok or gateway' ;; esac
+[ -n "$model" ] && [ -n "$effort" ] || die 'model and effort must not be empty'
 [ "$server_only$app_only" != truetrue ] || die '--server-only and --app-only conflict'
 : "${HOME:?HOME must be set}"
 case "$HOME" in /*) ;; *) die 'HOME must be absolute' ;; esac
@@ -69,7 +86,12 @@ if exists "$plist" && ! managed_link "$plist" "$prefix/current/com.hyperthymesia
 if exists "$unit" && ! managed_link "$unit" "$prefix/current/hyperthymesia.service"; then owner "$unit"; fi
 if exists "$bin" && ! managed_link "$bin" "$prefix/current/hx-server"; then owner "$bin"; fi
 if exists "$app" && ! managed_link "$app" "$prefix/current/Hyperthymesia.app"; then owner "$app"; fi
-if exists "$prefix" && [ ! -f "$prefix/.installed" ]; then owner "$prefix"; fi
+if exists "$prefix"; then
+    [ -d "$prefix" ] && [ ! -L "$prefix" ] && [ -f "$prefix/.installed" ] || owner "$prefix"
+fi
+if exists "$prefix/.state-dir"; then
+    [ -f "$prefix/.state-dir" ] && [ ! -L "$prefix/.state-dir" ] || owner "$prefix/.state-dir"
+fi
 if exists "$prefix/current"; then
     [ -L "$prefix/current" ] || owner "$prefix/current"
     current_target=$(readlink "$prefix/current")
@@ -78,7 +100,64 @@ if exists "$prefix/current"; then
     [ "$current_target" = "$prefix/$current_version" ] && [ -f "$current_target/.installed" ] || owner "$prefix/current"
 fi
 
+state=$HOME/.local/state/hyperthymesia
+case "$platform" in macos-*) state=$support/server ;; esac
+if [ -n "$requested_state" ]; then state=$requested_state; fi
+# Persist the chosen state path, without ever sourcing configuration for ownership.
+if [ -f "$prefix/.state-dir" ]; then
+    installed_state=$(cat "$prefix/.state-dir")
+    [ -z "$requested_state" ] || [ "$state" = "$installed_state" ] || die 'installed state directory cannot be changed on re-run'
+    state=$installed_state
+fi
+case "$state" in /*) ;; *) die '--state-dir must be absolute' ;; esac
+case "$state" in *'
+'*|*"$(printf '\r')"*) die 'state path contains a control character' ;; esac
+# No state may be adopted from an unmarked installation (including a custom path).
+if exists "$state" && [ ! -f "$prefix/.state-dir" ]; then owner "$state"; fi
+if exists "$state"; then
+    [ -d "$state" ] && [ ! -L "$state" ] || owner "$state"
+    for file in core.sqlite agent.sqlite server.env server.log; do
+        if exists "$state/$file"; then
+            [ -f "$state/$file" ] && [ ! -L "$state/$file" ] || owner "$state/$file"
+        fi
+    done
+fi
+
+# A stable state path must never move when current is switched, and backups
+# must not be descendants of their source. Reject ambiguous path spellings.
+case "$state/" in *'/../'*|*'/./'*|*'//'*) die 'state directory must use a normalized absolute path' ;; esac
+case "$state/" in "$prefix/"*) die 'state directory must be outside the program prefix' ;; esac
+case "$prefix/" in "$state/"*) die 'state directory must not contain the program prefix' ;; esac
+
+service_stop() {
+    case "$platform" in
+        macos-*)
+            if launchctl print "gui/$(id -u)/com.hyperthymesia.server" >/dev/null 2>&1; then
+                pid=$(launchctl print "gui/$(id -u)/com.hyperthymesia.server" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p')
+                launchctl bootout "gui/$(id -u)/com.hyperthymesia.server" || return
+                # bootout can return before graceful shutdown has finished.
+                count=0
+                while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
+                    [ "$count" -lt 60 ] || return 1
+                    count=$((count + 1))
+                    sleep 1
+                done
+            fi ;;
+        linux-*) systemctl --user stop hyperthymesia.service ;;
+    esac
+}
+service_start() {
+    case "$platform" in
+        macos-*) launchctl bootstrap "gui/$(id -u)" "$plist" ;;
+        linux-*) systemctl --user daemon-reload && systemctl --user enable --now hyperthymesia.service ;;
+    esac
+}
+
 if [ "$uninstall" = true ]; then
+    if [ "$dry_run" = false ] && [ -f "$prefix/.state-dir" ]; then
+        service_stop || die 'could not stop user service; entry points kept'
+        case "$platform" in linux-*) systemctl --user disable hyperthymesia.service ;; esac
+    fi
     # Only unlink known entry points. Retain version directories too: no
     # recursive deletion can accidentally remove a user's state directory.
     for path in "$plist" "$unit" "$bin" "$app" "$prefix/current"; do
@@ -89,7 +168,7 @@ if [ "$uninstall" = true ]; then
     if [ "$dry_run" = true ]; then
         printf '%s\n' 'Dry run: only entry points would be removed; state and retained versions are kept.'
     else
-        printf '%s\n' 'Uninstalled entry points; state and retained versions were not deleted. Services were not stopped.'
+        printf '%s\n' 'Uninstalled entry points; state and retained versions were not deleted. The user service was stopped.'
     fi
     exit 0
 fi
@@ -144,11 +223,10 @@ version=${version%-"$platform".tar.gz}
 case "$version" in ''|*[!0-9A-Za-z.+-]*) die 'unsafe release version' ;; esac
 case "$version" in [0-9]*|v[0-9]*) ;; *) die 'release version must begin with a number or vNUMBER' ;; esac
 version_dir=$prefix/$version
-# An upgrade needs A3's backup/lease/migration lifecycle, not a blind switch.
-if exists "$prefix/current"; then
-    [ -L "$prefix/current" ] && [ "$(readlink "$prefix/current")" = "$version_dir" ] || die 'upgrades require the later service lifecycle installer'
-fi
 if exists "$version_dir" && [ ! -f "$version_dir/.installed" ]; then owner "$version_dir"; fi
+if [ "$app_only" = true ] && [ -f "$prefix/.state-dir" ] && [ "${current_target:-}" != "$version_dir" ]; then
+    die 'use the full installer to upgrade an installation with a managed server'
+fi
 
 fetch "$fx_base/fx-$platform.tar.gz" "$work/fx.tar.gz"
 verify "$work/fx.tar.gz" "$fx_sha"
@@ -156,12 +234,17 @@ untar "$work/fx.tar.gz" "$work/fx"
 [ -f "$work/fx/fx" ] && [ -x "$work/fx/fx" ] || die 'fx executable missing'
 # Even the version probe gets a disposable HOME, so fx cannot modify logins.
 mkdir "$work/probe-home"
-fx_version=$(HOME="$work/probe-home" FX_AUTO_UPGRADE=0 "$work/fx/fx" --version) || die 'fx --version failed'
+fx_version=$(env -i HOME="$work/probe-home" PATH=/usr/bin:/bin FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 FX_NO_OPEN_BROWSER=1 "$work/fx/fx" --version) || die 'fx --version failed'
 [ "$fx_version" = 0.0.16 ] || die "expected fx 0.0.16, got: $fx_version"
 fetch "$release_base/$asset" "$work/server.tar.gz"
 verify "$work/server.tar.gz" "$server_sha"
 untar "$work/server.tar.gz" "$work/payload"
 [ -f "$work/payload/hx-server" ] && [ -x "$work/payload/hx-server" ] || die 'hx-server executable missing'
+actual_version=$("$work/payload/hx-server" --version) || die 'hx-server --version failed'
+[ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
+if [ -f "$version_dir/hx-server" ]; then
+    [ "$(sha256 "$version_dir/hx-server")" = "$(sha256 "$work/payload/hx-server")" ] || die 'retained version differs from the release; version directories are immutable'
+fi
 
 install_app=false
 case "$platform:$server_only" in macos-aarch64:false) install_app=true ;; esac
@@ -191,8 +274,6 @@ if [ "$install_app" = true ]; then
     [ -f "$work/payload/Hyperthymesia.app/Contents/Info.plist" ] || die 'app bundle missing'
 fi
 
-state=$HOME/.local/state/hyperthymesia
-case "$platform" in macos-*) state=$support/server ;; esac
 # Single-quote arbitrary paths for the POSIX wrapper, escape XML and systemd
 # independently (systemd expands % specifiers even inside quoted arguments).
 shell_quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
@@ -202,9 +283,13 @@ cat > "$work/payload/hx-run" <<EOF
 #!/bin/sh
 # hyperthymesia installer N4
 set -eu
+umask 077
+exec >> $(shell_quote "$state/server.log") 2>&1
 set -a
 . $(shell_quote "$state/server.env")
 set +a
+export HOME=$(shell_quote "$HOME")
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 exec $(shell_quote "$prefix/current/hx-server") --state-dir $(shell_quote "$state") serve --listen 127.0.0.1:7377
 EOF
 chmod 755 "$work/payload/hx-run"
@@ -218,6 +303,8 @@ if [ "$platform" = macos-aarch64 ]; then
 <plist version="1.0"><dict>
 <key>Label</key><string>com.hyperthymesia.server</string>
 <key>ProgramArguments</key><array><string>$(xml_escape "$prefix/current/hx-run")</string></array>
+<key>StandardOutPath</key><string>$(xml_escape "$state/server.log")</string>
+<key>StandardErrorPath</key><string>$(xml_escape "$state/server.log")</string>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
 </dict></plist>
@@ -233,6 +320,8 @@ Description=Hyperthymesia server
 Type=simple
 ExecStart=/bin/sh "$(unit_escape "$prefix/current/hx-run")"
 Restart=always
+RestartSec=1
+TimeoutStopSec=60
 [Install]
 WantedBy=default.target
 EOF
@@ -251,6 +340,11 @@ if [ "$dry_run" = true ]; then
         printf 'LINK %s -> %s\n' "$bin" "$prefix/current/hx-server" "$service" "$prefix/current/$service_name"
     fi
     if [ "$install_app" = true ]; then printf 'LINK %s -> %s\n' "$app" "$prefix/current/Hyperthymesia.app"; fi
+    if [ "$app_only" = false ]; then
+        printf 'WRITE %s\n' "$prefix/.state-dir" "$state/core.sqlite" "$state/agent.sqlite" "$state/server.env" "$state/server.log"
+        printf 'MIGRATE, START user service, WAIT /healthz, DOCTOR %s\n' "$state"
+        printf 'UPGRADE: require idle, stop, backup, switch, migrate, health check; restore on failure\n'
+    fi
     printf '\n--- hx-run ---\n'
     cat "$work/payload/hx-run"
     printf '\n--- %s ---\n' "$service_name"
@@ -258,32 +352,222 @@ if [ "$dry_run" = true ]; then
     exit 0
 fi
 
-# No destination changes occur before every download, hash and version check.
+# Preflight the user bus before changing destinations. Never enable linger here.
+if [ "$app_only" = false ]; then
+    case "$platform" in
+        linux-*)
+            systemctl --user show-environment >/dev/null 2>&1 || die 'user systemd bus unavailable; ask the administrator to run: loginctl enable-linger USER (then log in again)'
+            linger=$(loginctl show-user "$(id -un)" -p Linger --value) || die 'cannot check linger; ask the administrator to run: loginctl enable-linger USER'
+            [ "$linger" = yes ] || die "persistent user service requires an administrator to run: loginctl enable-linger $(id -un)" ;;
+        macos-*) launchctl print "gui/$(id -u)" >/dev/null 2>&1 || die 'no GUI login domain; log in to a macOS desktop session first' ;;
+    esac
+fi
+old=
+if [ -L "$prefix/current" ]; then old=$(readlink "$prefix/current"); fi
+# status and the guard are read-only with respect to the databases. The guard
+# prevents the service worker from claiming work until this lifecycle returns.
+if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
+    "$work/payload/hx-server" --state-dir "$state" status --require-idle || die 'upgrade refused; old service left running'
+fi
+
+# Keep lifecycle code in a private temporary script; the guard holds its lock
+# across this process, including service stop, backup, migration and rollback.
+setting() { printf '%s=%s\n' "$1" "$(shell_quote "$2")"; }
+{
+    printf '#!/bin/sh\nset -eu\numask 077\n'
+    setting prefix "$prefix"
+    setting bin "$bin"
+    setting state "$state"
+    setting platform "$platform"
+    setting plist "$plist"
+    setting unit "$unit"
+    setting app "$app"
+    setting version_dir "$version_dir"
+    setting service "$service"
+    setting service_name "$service_name"
+    setting install_app "$install_app"
+    setting app_only "$app_only"
+    setting old "$old"
+    setting work "$work"
+    setting provider "$provider"
+    setting model "$model"
+    setting effort "$effort"
+    setting configured "$configured"
+} > "$work/lifecycle"
+# $0 can be sh when piped. Render fixed functions without reading this script.
+cat >> "$work/lifecycle" <<'LIFECYCLE'
+service_stop() {
+    case "$platform" in
+        macos-*)
+            if launchctl print "gui/$(id -u)/com.hyperthymesia.server" >/dev/null 2>&1; then
+                pid=$(launchctl print "gui/$(id -u)/com.hyperthymesia.server" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p')
+                launchctl bootout "gui/$(id -u)/com.hyperthymesia.server" || return
+                # bootout can return before graceful shutdown has finished.
+                count=0
+                while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
+                    [ "$count" -lt 60 ] || return 1
+                    count=$((count + 1))
+                    sleep 1
+                done
+            fi ;;
+        linux-*) systemctl --user stop hyperthymesia.service ;;
+    esac
+}
+service_start() {
+    case "$platform" in
+        macos-*) launchctl bootstrap "gui/$(id -u)" "$plist" ;;
+        linux-*) systemctl --user daemon-reload && systemctl --user enable --now hyperthymesia.service ;;
+    esac
+}
+switch_current() {
+    next=$(mktemp -d "$prefix/.switch.XXXXXXXX")
+    ln -s "$1" "$next/current"
+    case "$platform" in
+        macos-*) mv -fh "$next/current" "$prefix/current" ;;
+        linux-*) mv -fT "$next/current" "$prefix/current" ;;
+    esac
+    rmdir "$next"
+}
+quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
+server() (
+    set -a
+    . "$state/server.env"
+    set +a
+    "$prefix/current/hx-server" --state-dir "$state" "$@"
+)
+healthy() {
+    count=0
+    while [ "$count" -lt 30 ]; do
+        if curl -fsSL --max-time 2 http://127.0.0.1:7377/healthz -o "$work/health" 2>/dev/null; then
+            # A response from another process is insufficient: confirm our user service.
+            case "$platform" in
+                macos-*) launchctl print "gui/$(id -u)/com.hyperthymesia.server" > "$work/service-status" && grep -q 'state = running' "$work/service-status" && return 0 ;;
+                linux-*) systemctl --user is-active --quiet hyperthymesia.service && return 0 ;;
+            esac
+        fi
+        count=$((count + 1))
+        sleep 1
+    done
+    return 1
+}
+stopped=false
+backup=
+failed_state=
+rollback() {
+    result=$?
+    trap - 0 HUP INT TERM
+    if [ "$result" -ne 0 ] && [ "$stopped" = true ]; then
+        service_stop || true
+        if [ -n "$old" ]; then
+            if [ -n "$backup" ] && [ -f "$backup/manifest.json" ]; then
+                failed_state=$state.failed-$(date +%s)-$$
+                # Keep any failed-generation state for inspection. Both databases
+                # and blobs are restored together; server.env is outside P5.
+                mv "$state" "$failed_state"
+                if "$old/hx-server" --state-dir "$state" restore --from "$backup"; then
+                    cp "$failed_state/server.env" "$state/server.env"
+                    chmod 600 "$state/server.env"
+                else
+                    printf 'Restore failed. Backup: %s; failed state: %s\n' "$backup" "$failed_state" >&2
+                    result=1
+                fi
+            fi
+            switch_current "$old"
+            service_start || printf 'Old service is restartable; start it after checking the retained state and backup.\n' >&2
+        fi
+    fi
+    exit "$result"
+}
+trap rollback 0
+trap 'exit 1' HUP INT TERM
+if [ "$app_only" = false ] && [ -n "$old" ] && [ -f "$state/core.sqlite" ]; then
+    # Reject paid work before stopping. The enclosing guard closes the race.
+    "$work/payload/hx-server" --state-dir "$state" status --require-idle
+    stopped=true
+    service_stop
+    mkdir -p "$prefix/backups"
+    backup=$(mktemp -d "$prefix/backups/pre-upgrade.XXXXXXXX")
+    "$old/hx-server" --state-dir "$state" backup --to "$backup"
+fi
 mkdir -p "$prefix/tools/fx-0.0.16"
-# The guards above proved this prefix is absent or ours. Mark it first, so an
-# interrupted install can be retried instead of being refused as unmanaged.
 cp "$work/payload/.installed" "$prefix/.installed"
-if ! exists "$version_dir"; then
-    # Copy on the destination filesystem before publishing the version.
+if [ ! -e "$version_dir" ]; then
     stage=$(mktemp -d "$prefix/.staging.XXXXXXXX")
     cp -R "$work/payload/." "$stage/"
     mv "$stage" "$version_dir"
-elif [ "$install_app" = true ] && ! exists "$version_dir/Hyperthymesia.app"; then
-    cp -R "$work/payload/Hyperthymesia.app" "$version_dir/"
 fi
-# Rename, never overwrite: fx may be running, and macOS kills a signed binary
-# whose file changes in place.
+# Refresh service rendering on a same-version re-run (including N4 layouts).
+cp "$work/payload/hx-run" "$version_dir/hx-run"
+cp "$work/payload/$service_name" "$version_dir/$service_name"
 cp "$work/fx/fx" "$prefix/tools/fx-0.0.16/.fx.staging"
 chmod 755 "$prefix/tools/fx-0.0.16/.fx.staging"
 mv "$prefix/tools/fx-0.0.16/.fx.staging" "$prefix/tools/fx-0.0.16/fx"
-if ! exists "$prefix/current"; then ln -s "$version_dir" "$prefix/current"; fi
+switch_current "$version_dir"
 if [ "$app_only" = false ]; then
+    printf '%s\n' "$state" > "$prefix/.state-dir"
+    mkdir -p "$state"
+    chmod 700 "$state"
+    new_env=false
+    if [ ! -f "$state/server.env" ]; then
+        new_env=true
+        # Values are single-quoted without evaluation. Never echo the key.
+        {
+            printf 'HX_PROVIDER=fx\nFX_AUTO_UPGRADE=0\nFX_DISABLE_KEYCHAIN=1\nFX_NO_OPEN_BROWSER=1\n'
+            printf 'HX_FX_BINARY='; quote "$prefix/tools/fx-0.0.16/fx"; printf '\n'
+            printf 'HX_FX_PROVIDER='; quote "$provider"; printf '\n'
+            printf 'HX_FX_MODEL='; quote "$model"; printf '\n'
+            printf 'HX_FX_EFFORT='; quote "$effort"; printf '\n'
+            if [ "$provider" = gateway ]; then
+                printf 'AI_GATEWAY_API_KEY='; quote "${AI_GATEWAY_API_KEY:-}"; printf '\n'
+            fi
+        } > "$state/server.env"
+    elif [ "$configured" = true ]; then
+        printf 'Keeping existing server.env; edit it privately to change provider settings.\n'
+    fi
+    chmod 600 "$state/server.env"
+    : >> "$state/server.log"
+    chmod 600 "$state/server.log"
+    server migrate
     mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
-    if ! exists "$bin"; then ln -s "$prefix/current/hx-server" "$bin"; fi
-    if ! exists "$service"; then ln -s "$prefix/current/$service_name" "$service"; fi
+    [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
+    [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"
+    service_start
+    healthy || { printf 'User service did not become healthy.\n' >&2; exit 1; }
+    server doctor --state-only
+    if ! server doctor; then
+        if [ -n "$backup" ]; then
+            printf 'Upgrade readiness failed; restoring the previous installation.\n' >&2
+            exit 1
+        fi
+        printf 'Service is running; provider setup is incomplete. Doctor above names what is missing. No login or model call was made.\n' >&2
+    fi
 fi
 if [ "$install_app" = true ]; then
     mkdir -p "$HOME/Applications"
-    if ! exists "$app"; then ln -s "$prefix/current/Hyperthymesia.app" "$app"; fi
+    [ -L "$app" ] || ln -s "$prefix/current/Hyperthymesia.app" "$app"
 fi
-printf '%s\n' 'Installed verified files only. Services were not started; server.env and first run require the later lifecycle installer.'
+stopped=false
+trap - 0 HUP INT TERM
+printf 'Installed. State: %s\n' "$state"
+if [ "$app_only" = false ]; then
+    if [ "$new_env" = false ]; then
+        printf 'Next: run doctor with the preserved server.env; use its configured provider and private fx for login.\n'
+    elif [ "$provider" = gateway ]; then
+        printf 'Next: set AI_GATEWAY_API_KEY privately in server.env (mode 600).\n'
+    else
+        printf 'Next: FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 '
+        quote "$prefix/tools/fx-0.0.16/fx"
+        printf ' login %s\n' "$provider"
+    fi
+    printf 'Then: hx-server --state-dir "%s" doctor (load server.env first).\n' "$state"
+    printf 'Pair a device: hx-server --state-dir "%s" pair --url http://127.0.0.1:7377 --name DEVICE (requires the pairing server).\n' "$state"
+    printf 'Dashboard: create a read_l3 token with token create --name dashboard --prefix CONNECTOR --scopes read_l3. Keep the token private.\n'
+    printf 'Remote access: tailscale serve --bg 7377, or ssh -N -L 7377:127.0.0.1:7377 user@host.\n'
+    printf 'Automatic GC is off. A login delayed past 24 hours leaves old windows on the daily paid sweep cap.\n'
+fi
+LIFECYCLE
+if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
+    "$work/payload/hx-server" --state-dir "$state" upgrade-guard /bin/sh "$work/lifecycle"
+else
+    /bin/sh "$work/lifecycle"
+fi

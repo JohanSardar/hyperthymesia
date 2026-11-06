@@ -6,7 +6,12 @@ on:
   workflow_dispatch:
   # Artifact-only PR coverage also bootstraps this workflow before it is on main.
   pull_request:
-    paths: ['.github/workflows/release.yml']
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/install*'
+      - 'crates/hx-server/**'
+      - 'crates/hx-store/**'
+      - 'docs/install.md'
 
 # Actions are pinned to commits: they build what everyone installs.
 permissions:
@@ -155,9 +160,41 @@ jobs:
           }
           echo "$actual"
 
+  install-smoke:
+    name: install-smoke (${{ matrix.platform }})
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+          - runner: macos-15
+            platform: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: ${{ runner.temp }}/install-assets
+      - name: Locate the Linux user bus (no privileged service commands)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Install, crash-restart, refuse a held lease, and upgrade evidence
+        env:
+          HX_RELEASE_DIR: ${{ runner.temp }}/install-assets
+        run: python3 scripts/install-smoke.py
+
   assemble:
     name: Assemble verified assets
-    needs: [build, clean-linux]
+    needs: [build, clean-linux, install-smoke]
+    if: always() && needs.build.result == 'success' && needs.clean-linux.result == 'success' && (needs.install-smoke.result == 'success' || needs.install-smoke.result == 'skipped')
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
