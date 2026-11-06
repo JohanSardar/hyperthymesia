@@ -1,4 +1,4 @@
-//! Bounded HTTP and host CLI requests. MCP transport is supplied by P16.
+//! Bounded, source-scoped HTTP, CLI and MCP requests.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -64,8 +64,10 @@ pub enum RequestError {
     TooLarge,
     #[error("HTTP response is not JSON")]
     Json,
-    #[error("MCP transport is not implemented (P16)")]
+    #[error("MCP exchange failed or returned an invalid response")]
     McpUnavailable,
+    #[error("destination is not named in the owner's source description")]
+    Destination,
     #[error("invalid CLI request")]
     CliInvalid,
     #[error("host command blocked: {0}")]
@@ -95,6 +97,66 @@ impl RequestError {
 }
 
 impl Request {
+    /// Only owner-authored configuration can bind a credential destination.
+    /// Response URLs and model-chosen source IDs are not credential authority.
+    pub fn authorize(&self, description: &str) -> Result<(), RequestError> {
+        let permitted = match self {
+            Self::Http { url, .. }
+            | Self::Mcp {
+                transport: McpTransport::Http { url },
+                ..
+            } => {
+                let target = substitute_url(
+                    url,
+                    Placeholders {
+                        key: Some(""),
+                        cursor: None,
+                    },
+                )?;
+                let urls = regex::Regex::new(r#"https?://[^\s<>"'`]+"#)
+                    .map_err(|_| RequestError::Invalid)?;
+                urls.find_iter(description).any(|matched| {
+                    reqwest::Url::parse(
+                        matched
+                            .as_str()
+                            .trim_end_matches(['.', ',', ';', ')', ']', '}']),
+                    )
+                    .is_ok_and(|owner| owner.origin() == target.origin())
+                })
+            }
+            Self::Cli { argv, .. }
+            | Self::Mcp {
+                transport: McpTransport::Stdio { argv },
+                ..
+            } => {
+                let executable = argv.first().ok_or(RequestError::CliInvalid)?;
+                let launcher = executable.rsplit('/').next().unwrap_or(executable);
+                let indirect = [
+                    "sh", "bash", "zsh", "env", "python", "python3", "node", "ruby", "perl", "npx",
+                    "npm", "uv", "uvx", "bun", "deno",
+                ]
+                .contains(&launcher);
+                let literal = description.split('`').skip(1).step_by(2).any(|command| {
+                    shell_words::split(command).is_ok_and(|prefix| {
+                        !prefix.is_empty()
+                            && (!indirect || prefix.len() >= 2)
+                            && argv.starts_with(&prefix)
+                    })
+                });
+                literal
+                    || (!indirect
+                        && description.split_whitespace().any(|word| {
+                            word.trim_matches(['\'', '"', ',', '.', ';', '(', ')']) == executable
+                        }))
+            }
+        };
+        if permitted {
+            Ok(())
+        } else {
+            Err(RequestError::Destination)
+        }
+    }
+
     /// No retries and no model. CLI argv remain literal arguments, including
     /// response-controlled cursors; no substituted text is evaluated as shell.
     #[cfg(unix)]
@@ -106,7 +168,11 @@ impl Request {
     ) -> Result<Value, RequestError> {
         match self {
             Self::Http { .. } => self.execute_http(values, timeout).await,
-            Self::Mcp { .. } => Err(RequestError::McpUnavailable),
+            Self::Mcp {
+                transport,
+                tool,
+                arguments,
+            } => crate::mcp::execute(transport, tool, arguments, values, timeout, host).await,
             Self::Cli { argv, env } => {
                 if timeout.is_zero() || argv.first().is_none_or(String::is_empty) {
                     return Err(RequestError::CliInvalid);
@@ -115,10 +181,13 @@ impl Request {
                     .iter()
                     .map(|arg| substitute(arg, values))
                     .collect::<Result<Vec<_>, _>>()?;
-                let env = env
+                let mut env = env
                     .iter()
                     .map(|(key, value)| Ok((key.clone(), substitute(value, values)?)))
                     .collect::<Result<BTreeMap<_, _>, RequestError>>()?;
+                if let Some(key) = values.key {
+                    env.insert("SOURCE_KEY".into(), key.into());
+                }
                 let command = argv
                     .iter()
                     .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
@@ -220,7 +289,10 @@ impl Request {
 
 /// Pin the unexpanded authority before any response or credential is substituted.
 /// An absolute cursor is a next-link URL; ordinary cursor/key values are URL data.
-fn substitute_url(template: &str, values: Placeholders<'_>) -> Result<reqwest::Url, RequestError> {
+pub(crate) fn substitute_url(
+    template: &str,
+    values: Placeholders<'_>,
+) -> Result<reqwest::Url, RequestError> {
     let (_, rest) = template.split_once("://").ok_or(RequestError::Invalid)?;
     let authority = rest
         .split(['/', '?', '#'])
@@ -284,7 +356,7 @@ fn encode_url_value(value: &str) -> String {
 
 /// A single pass keeps credential bytes such as `{{cursor}}` literal. Substitute
 /// JSON string values before serialization so quotes cannot change the JSON shape.
-fn substitute(input: &str, values: Placeholders<'_>) -> Result<String, RequestError> {
+pub(crate) fn substitute(input: &str, values: Placeholders<'_>) -> Result<String, RequestError> {
     let mut out = String::new();
     let mut remaining = input;
     while let Some(index) = remaining.find("{{") {
@@ -305,7 +377,10 @@ fn substitute(input: &str, values: Placeholders<'_>) -> Result<String, RequestEr
     Ok(out)
 }
 
-fn substitute_json(value: &Value, values: Placeholders<'_>) -> Result<Value, RequestError> {
+pub(crate) fn substitute_json(
+    value: &Value,
+    values: Placeholders<'_>,
+) -> Result<Value, RequestError> {
     match value {
         Value::String(s) => Ok(Value::String(substitute(s, values)?)),
         Value::Array(a) => a

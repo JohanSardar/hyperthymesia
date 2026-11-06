@@ -108,7 +108,7 @@ impl Store {
     pub async fn prior_revisions(&self, before: DateTime<Utc>) -> Result<Vec<PriorRevision>> {
         sqlx::query_as("SELECT r.id,r.interpretation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.end_at<=$1 AND w.end_at>$1-57600000000 ORDER BY w.end_at DESC LIMIT 4").bind(Ts::from(before)).fetch_all(&self.pool).await
     }
-    /// Owner-facing historical lookup. Agent audit collection uses the run variant.
+    /// Owner/context-only historical lookup. Citable tool results use the run variant.
     pub async fn source_namespace(&self, id: i64) -> Result<Option<String>> {
         self.source_namespace_with_live_run(id, None).await
     }
