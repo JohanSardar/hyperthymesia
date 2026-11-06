@@ -183,6 +183,7 @@ fn doctor_needs_no_database_or_model() {
         "symlink",
         "hardlink",
         "parent-link",
+        "home-parent-link",
         "gateway",
         "gateway-missing",
     ] {
@@ -207,6 +208,7 @@ fn doctor_needs_no_database_or_model() {
             std::fs::Permissions::from_mode(if case == "mode" { 0o644 } else { 0o600 }),
         )
         .unwrap();
+        let mut home = root.clone();
         let credential = match case {
             "missing" => root.join("absent/login.json"),
             "symlink" => {
@@ -219,6 +221,15 @@ fn doctor_needs_no_database_or_model() {
                 std::fs::hard_link(&login, &link).unwrap();
                 link
             }
+            "home-parent-link" => {
+                let actual_home = root.join("home");
+                std::fs::create_dir(&actual_home).unwrap();
+                std::fs::rename(&login, actual_home.join("login.json")).unwrap();
+                let alias = root.join("alias");
+                std::os::unix::fs::symlink(&root, &alias).unwrap();
+                home = alias.join("home");
+                home.join("login.json")
+            }
             "parent-link" => {
                 let link = root.join("link");
                 std::os::unix::fs::symlink(&root, &link).unwrap();
@@ -230,7 +241,7 @@ fn doctor_needs_no_database_or_model() {
         command
             .arg("doctor")
             .env_clear()
-            .env("HOME", &root)
+            .env("HOME", &home)
             .env("HX_FX_BINARY", binary)
             .env("HX_FX_CREDENTIAL", credential)
             .env("HX_PROVIDER", if case == "stub" { "stub" } else { "fx" })
@@ -248,7 +259,7 @@ fn doctor_needs_no_database_or_model() {
         let output = command.output().unwrap();
         assert_eq!(
             output.status.success(),
-            matches!(case, "ok" | "gateway"),
+            matches!(case, "ok" | "gateway" | "home-parent-link"),
             "{case}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -491,6 +502,35 @@ async fn upgrade_guard_keeps_requests_retryable_and_refuses_live_leases() {
     use tokio::time::{Duration, sleep, timeout};
     let f = Fixture::new().await;
     let home = tempfile::tempdir().unwrap();
+    // Model a short non-interpret worker tick. It must delay an upgrade rather
+    // than making a healthy, idle install fail nondeterministically.
+    let busy = std::fs::File::create(f.store.data_dir.join("locks/upgrade.lock")).unwrap();
+    busy.try_lock_shared().unwrap();
+    let marker = home.path().join("after-busy-tick");
+    let mut waiting = Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .args(["upgrade-guard", "/usr/bin/touch"])
+        .arg(&marker)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("HX_STATE_DIR", &f.store.data_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let early = timeout(Duration::from_millis(300), waiting.wait()).await;
+    drop(busy);
+    let waited = early.is_err();
+    let status = match early {
+        Ok(status) => status.unwrap(),
+        Err(_) => timeout(Duration::from_secs(5), waiting.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+    };
+    assert!(waited, "upgrade guard must wait for a short busy tick");
+    assert!(status.success());
+    assert!(marker.exists());
     let address = {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         socket.local_addr().unwrap()

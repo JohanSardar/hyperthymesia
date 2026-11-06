@@ -16,7 +16,7 @@ curl -fsSL https://github.com/JohanSardar/hyperthymesia/releases/latest/download
 
 Options: `--provider codex|grok|gateway`, `--model M`, `--effort E`,
 `--state-dir /absolute/local/path`, `--server-only`, `--app-only`, `--dry-run`,
-`--uninstall`. Defaults explicitly select **fx / codex / gpt-6.1-sol / xhigh**.
+`--uninstall`, `--start-fresh`. Defaults explicitly select **fx / codex / gpt-6.1-sol / xhigh**.
 Grok/gateway users should select their supported model. Real logins beyond
 Codex still need owner validation; see [unknowns](specs/unknowns.md).
 
@@ -70,7 +70,8 @@ FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 \
   "$HOME/.local/share/hyperthymesia/tools/fx-0.0.16/fx" login codex
 ```
 
-Doctor requires a 0600 login file, one hard link and no symlink path components.
+Doctor requires a 0600 login file with one hard link. The login and its parents
+below HOME must not be symlinks; a symlinked HOME or HOME ancestor is allowed.
 Defaults: `~/.fx/chatgpt-auth.json` or `~/.fx/grok-auth.json`. A login delayed
 past window end +24h leaves old windows on the one-window-per-day paid sweep.
 
@@ -92,7 +93,11 @@ hx-server --state-dir "$STATE" doctor
 hx-server --state-dir "$STATE" status
 ```
 
-`status` prints JSON with `running_interpret_leases`; `--require-idle` fails for
+`status` prints JSON with `running_interpret_leases` and `retained` copies
+(path and logical bytes, or a per-copy read error). This includes pre-upgrade
+backups and sibling `server.failed-*` folders; sizes include both databases and
+blobs, so repeated failed attempts can use substantial disk space. Nothing is
+automatically pruned. `--require-idle` fails for
 a live lease. It never migrates, revives jobs or calls a provider.
 `doctor --state-only` checks privacy, exact schema and both SQLite databases
 without requiring login. Doctor without state retains provider-only checks.
@@ -124,17 +129,21 @@ Rerun with the same state directory. All assets are verified before destination
 changes. Unmanaged owner paths cause **exit 3**: legacy `server-data`,
 `agent.json`, an unmanaged plist/unit, binary, app, prefix or state directory.
 Legacy paths are checked by existence only, never read. There is no override
-or automatic mover; see [moving to SQLite](moving-to-sqlite.md).
+or automatic mover; see the [legacy mover and its limits](../crates/hx-move/README.md).
 
 An upgrade:
 
-1. Checks schema/checksums and refuses live interpret leases. An exclusive
-   guard also refuses an active worker/request, closing the status/stop race.
-   Retry an idle busy tick.
+1. Checks state privacy, SQLite integrity, environment syntax and schema/checksums
+   before stopping anything, and refuses live interpret leases. An exclusive
+   guard closes the status/stop race. It waits up to five seconds for short
+   worker ticks/requests to drain, checking for live interpret leases throughout;
+   a live lease is refused immediately. Persistently busy state is refused.
 2. Stops with SIGTERM and runs P5 `hx-server backup` into
-   `<prefix>/backups/pre-upgrade.*` before switching or migrating.
+   `<prefix>/backups/pre-upgrade.*` before switching or migrating, including
+   reinstall after uninstall. The last installed binary remains available.
 3. Switches `current`, explicitly migrates, starts and requires `/healthz`,
-   state doctor and provider doctor to pass. Workers stay idle and other HTTP
+   state doctor to pass. Provider doctor only warns with the missing setup step;
+   missing login never prevents a healthy upgrade. Workers stay idle and other HTTP
    requests return 503 until verification ends; agents retain retryable uploads.
 4. Keeps the previous version and backup. A failed step after stop restores
    both databases and blobs, preserves `server.env`, switches back and restarts.
@@ -148,6 +157,23 @@ Rollback requires restoring a pre-upgrade backup into an absent/empty directory;
 pointing an older binary at a newer schema is insufficient. Backups omit
 `server.env`; keep that file separately and private.
 
+A registered install whose core disappears refuses before changing anything,
+including when a custom volume is unmounted. Reconnect the volume first. Look
+for the original state in sibling `server.failed-*` folders and verified copies
+in `<prefix>/backups/`; do not ingest into a replacement empty history. Stop the
+user service, move any remaining partial state aside, and use a retained binary:
+
+```sh
+"$HOME/.local/share/hyperthymesia/VERSION/hx-server" --state-dir "$STATE" \
+  restore --from "$HOME/.local/share/hyperthymesia/backups/pre-upgrade.COPY"
+```
+
+Restore `server.env` separately from a private saved copy, chmod it 0600, then
+rerun the installer. To intentionally discard the active history, move it aside
+and use `--start-fresh` with an absent or empty target. This never adopts an
+unmanaged installation and never deletes retained evidence. Keep backups and
+failed copies until recovery is verified; `status` reports their paths/sizes.
+
 A hard interruption can leave the service stopped; retained binaries, state
 and backup remain available for recovery. Diagnose before retrying and keep
 backups/failed state until verified. Versions/backups are not pruned automatically.
@@ -160,10 +186,16 @@ it never deletes state, credentials, backups or retained versions.
 owner refusal, private config, lease refusal and failed-upgrade recovery. Never
 run real installer service steps on the owner's Mac.
 
-`install-smoke` runs for PR/manual dispatch on disposable GitHub-hosted Linux
+`install-smoke` runs for PR/manual dispatch and owner-tagged releases on disposable GitHub-hosted Linux
 and macOS runners: real release/pinned-fx verification, real service startup,
-`kill -9` restart, fake fx model isolation, an injected held lease, and upgrade
+`kill -9` restart, login-free rerun under a symlinked HOME parent, fake fx model
+isolation, an injected held lease, and upgrade
 with identical seeded evidence and served citation. Its layout upgrade uses
 `0.1.0` → `v0.1.0` from the same binary. Separate fail-first store tests exercise
-out-of-order DDL, failed DDL rollback, and newer/tampered-schema refusal. Real
-reboot, headless login and app permissions still need owner VPS/second-user checks.
+out-of-order DDL, including the real `0002_sources.sql` upgrade from `[1,3]`
+to `[1,2,3]` with evidence and pairing preserved, failed DDL rollback, and
+newer/tampered-schema refusal. Table-rebuilding DDL is tested transactionally
+with foreign keys enabled, matching `Store::create`. The smoke does not prove
+a schema-changing upgrade on a running real service, cross-version binary
+compatibility, real provider login or paid execution. Real reboot, headless login and app permissions
+still need owner VPS/second-user checks.

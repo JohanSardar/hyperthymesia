@@ -63,8 +63,6 @@ esac
     stub('systemctl', 'printf "%s\\n" "$*" >> "$TEST_COMMAND_LOG"; [ "$1" = --user ] || exit 97\n')
     stub('launchctl', 'printf "%s\\n" "$*" >> "$TEST_COMMAND_LOG"; case "$*" in *gui/*) ;; *) exit 97;; esac; echo "state = running"\n')
     stub('loginctl', '[ "$1" = show-user ] || exit 97; echo yes\n')
-    # Exercise both platforms on either host; rename symlinks without following.
-    stub('mv', "exec python3 -c 'import os,sys; a=[x for x in sys.argv[1:] if not x.startswith(\"-\")]; os.rename(*a)' \"$@\"\n")
     stub('sleep', 'exit 0\n')
     fixture = root / 'release'
     fixture.mkdir()
@@ -97,7 +95,17 @@ status) [ "${TEST_HELD_LEASE:-}" != yes ] || exit 1; echo '{"running_interpret_l
 upgrade-guard) exec "$@" ;;
 backup) mkdir -p "$2"; cp "$state/core.sqlite" "$state/agent.sqlite" "$2/"; echo '{}' > "$2/manifest.json" ;;
 restore) mkdir -p "$state/blobs" "$state/locks"; cp "$2/core.sqlite" "$2/agent.sqlite" "$state/" ;;
-doctor) : ;;
+doctor)
+    case "$*" in
+        *--allow-older-schema*) : ;;
+        *--state-only*) [ "${TEST_FAIL_STEP:-}" != post-doctor ] || exit 1 ;;
+        *) [ "${TEST_FAIL_STEP:-}" != provider ] || exit 1 ;;
+    esac ;;
+install-link)
+    [ "$1" = --link ] && [ "$3" = --target ] || exit 97
+    if [ "${TEST_ROLLBACK_FAIL:-}" = switch ] && [ "${4##*/}" = 0.1.0 ]; then exit 1; fi
+    exec python3 -c 'import os,sys,tempfile; link,target=sys.argv[1:]; d=tempfile.mkdtemp(dir=os.path.dirname(link)); p=d+"/current"; os.symlink(target,p); os.rename(p,link); os.rmdir(d)' "$2" "$4" ;;
+
 serve) printf "%s\\n" --state-dir "$state" serve "$@" > "$TEST_SERVER_ARGS"; printf "%s\\n" "$TEST_ENV" > "$TEST_SERVER_ENV" ;;
 *) exit 97 ;;
 esac
@@ -153,6 +161,25 @@ esac
     assert run(h).returncode == 0
     assert (state / 'server.env').read_bytes() == original_env
     print('ok: one command migrates, starts a user service, preserves private env')
+
+    # A remembered history must never turn into an empty replacement core,
+    # including a custom state path whose volume disappeared.
+    for custom in (False, True):
+        h = home()
+        state = h / ('mounted/history' if custom else '.local/state/hyperthymesia')
+        args = ('--state-dir', str(state)) if custom else ()
+        assert run(h, *args).returncode == 0
+        (state / 'core.sqlite').write_text('irreplaceable synthetic evidence')
+        saved = state.with_name(state.name + '.failed-synthetic')
+        state.rename(saved)
+        result = fails_unchanged(h, 1, *args)
+        assert 'backups/' in result.stderr and 'failed-' in result.stderr
+        assert 'restore' in result.stderr and '--start-fresh' in result.stderr
+        assert not state.exists()
+        assert (saved / 'core.sqlite').read_text() == 'irreplaceable synthetic evidence'
+        assert run(h, *args, '--start-fresh').returncode == 0
+        assert (saved / 'core.sqlite').read_text() == 'irreplaceable synthetic evidence'
+    print('ok: missing registered state refuses without writes; fresh history is explicit')
 
     # A successful dry run must render the complete plan before rejection tests
     # can be credited: rejecting every invocation is not a valid installer.
@@ -212,7 +239,7 @@ esac
         before_paths = sorted(str(path.relative_to(h)) for path in h.rglob('*'))
         result = run(h, '--dry-run', os_name='Darwin', arch='arm64')
         assert result.returncode == 3, result.stderr
-        assert 'docs/moving-to-sqlite.md' in result.stderr
+        assert 'crates/hx-move/README.md' in result.stderr
         assert p.is_fifo()
         result = run(h, '--uninstall', os_name='Darwin', arch='arm64')
         assert result.returncode == 3, result.stderr
@@ -275,6 +302,17 @@ esac
         assert not (h / '.local/bin/hx-server').is_symlink()
     print('ok: installs, service syntax, repeat install and state-preserving uninstall')
 
+    # Publishing a prefix without its marker must be impossible even if the
+    # marker copy fails. The staged directory can be ignored safely on retry.
+    h = home()
+    stub('cp', 'case "$*" in *hyperthymesia.staging.*/.installed*) exit 1;; esac\nexec /bin/cp "$@"\n')
+    failed = run(h)
+    (stubs / 'cp').unlink()
+    assert failed.returncode != 0
+    assert not (h / '.local/share/hyperthymesia').exists()
+    assert run(h).returncode == 0
+    print('ok: ownership marker is published atomically with prefix')
+
     # A disk-full or interrupted first install must stay ours to retry; the owner
     # refusal has no override, so a marker-less prefix would be a dead end.
     h = home()
@@ -311,15 +349,62 @@ esac
         archive(fixture / f'hx-server-0.1.1-{platform}.tar.gz', files)
         asset.unlink()
     sums()
-    os.environ['TEST_FAIL_STEP'] = 'doctor'
+    os.environ['TEST_FAIL_STEP'] = 'post-doctor'
     result = run(h, '--server-only')
     os.environ.pop('TEST_FAIL_STEP')
     assert result.returncode != 0
     assert os.readlink(h / '.local/share/hyperthymesia/current') == old
     assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
     assert (state / 'server.env').read_bytes() == env_before
-    assert run(h, '--server-only').returncode == 0
+    assert (state / 'server.log').stat().st_mode & 0o777 == 0o600
+    os.environ['TEST_FAIL_STEP'] = 'provider'
+    provider_warning = run(h, '--server-only')
+    os.environ.pop('TEST_FAIL_STEP')
+    assert provider_warning.returncode == 0, provider_warning.stderr
+    assert 'provider setup is incomplete' in provider_warning.stderr
     assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
     assert Path(old).is_dir(), 'previous version was removed'
-    print('ok: failed upgrade restores old version/evidence; successful upgrade keeps them')
+    print('ok: failed upgrade restores old version/evidence; missing provider only warns')
+
+    # Uninstall does not erase history or the obligation to back up on reinstall.
+    assert run(h, '--uninstall').returncode == 0
+    backups = set((h / '.local/share/hyperthymesia/backups').iterdir())
+    assert run(h, '--server-only').returncode == 0
+    assert set((h / '.local/share/hyperthymesia/backups').iterdir()) > backups
+    assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
+    print('ok: reinstall without current backs up existing evidence')
+
+    # Failed recovery IO must never short-circuit the attempt to restart old.
+    for fault in ('move', 'copy', 'switch'):
+        h = home()
+        # Reuse the earlier retained version as a fixture of an old install.
+        prefix = h / '.local/share/hyperthymesia'
+        shutil.copytree(Path(old).parent, prefix, symlinks=True)
+        current = prefix / 'current'
+        current.unlink()
+        current.symlink_to(prefix / '0.1.0')
+        (prefix / '.last-version').write_text(str(prefix / '0.1.0') + '\n')
+        state = h / '.local/state/hyperthymesia'
+        state.mkdir(parents=True, mode=0o700)
+        (prefix / '.state-dir').write_text(str(state) + '\n')
+        for name in ('core.sqlite', 'agent.sqlite', 'server.env', 'server.log'):
+            (state / name).write_text('' if name != 'core.sqlite' else 'saved')
+            (state / name).chmod(0o600)
+        if fault == 'move':
+            stub('mv', 'case "$*" in *failed-*) exit 1;; esac\nexec /bin/mv "$@"\n')
+        if fault == 'copy':
+            stub('cp', 'case "$*" in *failed-*/server.env*) exit 1;; esac\nexec /bin/cp "$@"\n')
+        log = root / 'commands'
+        log.write_text('')
+        os.environ['TEST_FAIL_STEP'] = 'post-doctor'
+        os.environ['TEST_ROLLBACK_FAIL'] = fault
+        result = run(h, '--server-only')
+        os.environ.pop('TEST_FAIL_STEP')
+        os.environ.pop('TEST_ROLLBACK_FAIL')
+        for command in ('mv', 'cp'):
+            if (stubs / command).exists(): (stubs / command).unlink()
+        assert result.returncode != 0
+        assert log.read_text().count('enable --now hyperthymesia.service') == 2, result.stderr
+        assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
+    print('ok: recovery IO failures still attempt old-service restart and report damage')
 PY

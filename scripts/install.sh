@@ -5,7 +5,7 @@ umask 077
 
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 owner() {
-    printf 'install: existing unmanaged installation: %s\nSee docs/moving-to-sqlite.md before proceeding. There is no override.\n' "$1" >&2
+    printf 'install: existing unmanaged installation: %s\nSee crates/hx-move/README.md for the legacy mover and its limits. There is no override.\n' "$1" >&2
     exit 3
 }
 exists() { [ -e "$1" ] || [ -L "$1" ]; }
@@ -13,6 +13,7 @@ managed_link() { [ -L "$1" ] && [ "$(readlink "$1")" = "$2" ] && [ -f "$prefix/.
 
 dry_run=false
 uninstall=false
+start_fresh=false
 server_only=false
 app_only=false
 requested_state=
@@ -24,6 +25,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) dry_run=true ;;
         --uninstall) uninstall=true ;;
+        --start-fresh) start_fresh=true ;;
         --server-only) server_only=true ;;
         --app-only) app_only=true ;;
         --provider|--model|--effort|--state-dir)
@@ -37,7 +39,7 @@ while [ "$#" -gt 0 ]; do
                 --state-dir) requested_state=$1 ;;
             esac ;;
         --help)
-            printf '%s\n' 'Usage: install.sh [--provider codex|grok|gateway --model M --effort E --state-dir D] [--dry-run] [--uninstall] [--server-only|--app-only]' \
+            printf '%s\n' 'Usage: install.sh [--provider codex|grok|gateway --model M --effort E --state-dir D] [--dry-run] [--start-fresh] [--uninstall] [--server-only|--app-only]' \
                 'Installs a loopback user service; upgrades are backed up and refused during interpret leases.' \
                 'HX_RELEASE_BASE: release download directory (default: GitHub latest/download).' \
                 'HX_FX_RELEASE_BASE: fx download directory; pinned SHA-256 checks always apply.'
@@ -92,6 +94,14 @@ fi
 if exists "$prefix/.state-dir"; then
     [ -f "$prefix/.state-dir" ] && [ ! -L "$prefix/.state-dir" ] || owner "$prefix/.state-dir"
 fi
+if exists "$prefix/.last-version"; then
+    [ -f "$prefix/.last-version" ] && [ ! -L "$prefix/.last-version" ] || owner "$prefix/.last-version"
+    last_version=$(cat "$prefix/.last-version")
+    case "$last_version" in "$prefix/"*) ;; *) owner "$prefix/.last-version" ;; esac
+    last_name=${last_version#"$prefix/"}
+    case "$last_name" in ''|*/*|.|..) owner "$prefix/.last-version" ;; esac
+    [ -f "$last_version/.installed" ] && [ ! -L "$last_version" ] || owner "$prefix/.last-version"
+fi
 if exists "$prefix/current"; then
     [ -L "$prefix/current" ] || owner "$prefix/current"
     current_target=$(readlink "$prefix/current")
@@ -121,6 +131,17 @@ if exists "$state"; then
             [ -f "$state/$file" ] && [ ! -L "$state/$file" ] || owner "$state/$file"
         fi
     done
+fi
+
+# The path record is a promise of history, even after uninstall or an unmount.
+# Refuse before downloads, manager commands or any destination mutation.
+if [ "$uninstall" = false ] && [ "$app_only" = false ] && [ -f "$prefix/.state-dir" ] && [ ! -f "$state/core.sqlite" ]; then
+    if [ "$start_fresh" = false ]; then
+        die "registered state is missing core.sqlite at $state. Reconnect its volume or find old copies at $state.failed-* and $prefix/backups/. Stop the service and use a retained hx-server restore --from BACKUP into an absent/empty $state; keep server.env private. To intentionally create empty history, rerun with --start-fresh."
+    fi
+    if exists "$state" && [ -n "$(ls -A "$state")" ]; then
+        die '--start-fresh requires an absent or empty state folder; move the remaining state aside for recovery first'
+    fi
 fi
 
 # A stable state path must never move when current is switched, and backups
@@ -157,6 +178,9 @@ if [ "$uninstall" = true ]; then
     if [ "$dry_run" = false ] && [ -f "$prefix/.state-dir" ]; then
         service_stop || die 'could not stop user service; entry points kept'
         case "$platform" in linux-*) systemctl --user disable hyperthymesia.service ;; esac
+    fi
+    if [ "$dry_run" = false ] && [ -n "${current_target:-}" ]; then
+        printf '%s\n' "$current_target" > "$prefix/.last-version"
     fi
     # Only unlink known entry points. Retain version directories too: no
     # recursive deletion can accidentally remove a user's state directory.
@@ -334,14 +358,14 @@ if [ "$dry_run" = true ]; then
     (cd "$work/payload" && find . -type f -print) | while IFS= read -r file; do
         printf 'WRITE %s/%s\n' "$version_dir" "${file#./}"
     done
-    printf 'WRITE %s\n' "$prefix/.installed" "$prefix/tools/fx-0.0.16/fx"
+    printf 'WRITE %s\n' "$prefix/.installed" "$prefix/.last-version" "$prefix/tools/fx-0.0.16/fx"
     printf 'LINK %s -> %s\n' "$prefix/current" "$version_dir"
     if [ "$app_only" = false ]; then
         printf 'LINK %s -> %s\n' "$bin" "$prefix/current/hx-server" "$service" "$prefix/current/$service_name"
     fi
     if [ "$install_app" = true ]; then printf 'LINK %s -> %s\n' "$app" "$prefix/current/Hyperthymesia.app"; fi
     if [ "$app_only" = false ]; then
-        printf 'WRITE %s\n' "$prefix/.state-dir" "$state/core.sqlite" "$state/agent.sqlite" "$state/server.env" "$state/server.log"
+        printf 'WRITE %s\n' "$prefix/.state-dir" "$state/core.sqlite" "$state/agent.sqlite" "$state/server.env" "$state/server.log" "$state/.install-prefix"
         printf 'MIGRATE, START user service, WAIT /healthz, DOCTOR %s\n' "$state"
         printf 'UPGRADE: require idle, stop, backup, switch, migrate, health check; restore on failure\n'
     fi
@@ -364,9 +388,21 @@ if [ "$app_only" = false ]; then
 fi
 old=
 if [ -L "$prefix/current" ]; then old=$(readlink "$prefix/current"); fi
+# Uninstall retains binaries but removes current. A retained marked version is
+# still a rollback/backup tool; never depend on the current symlink existing.
+if [ -z "$old" ] && [ -n "${last_version:-}" ]; then old=$last_version; fi
+if [ -z "$old" ]; then
+    for retained in "$prefix"/*; do
+        if [ -d "$retained" ] && [ ! -L "$retained" ] && [ -f "$retained/.installed" ] && [ -x "$retained/hx-server" ]; then
+            if [ ! -f "$state/core.sqlite" ] || "$retained/hx-server" --state-dir "$state" doctor --state-only >/dev/null 2>&1; then old=$retained; fi
+        fi
+    done
+fi
 # status and the guard are read-only with respect to the databases. The guard
 # prevents the service worker from claiming work until this lifecycle returns.
 if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
+    /bin/sh -n "$state/server.env" || die 'invalid server.env syntax; old service left running'
+    "$work/payload/hx-server" --state-dir "$state" doctor --state-only --allow-older-schema || die 'upgrade state preflight failed; old service left running'
     "$work/payload/hx-server" --state-dir "$state" status --require-idle || die 'upgrade refused; old service left running'
 fi
 
@@ -420,13 +456,8 @@ service_start() {
     esac
 }
 switch_current() {
-    next=$(mktemp -d "$prefix/.switch.XXXXXXXX")
-    ln -s "$1" "$next/current"
-    case "$platform" in
-        macos-*) mv -fh "$next/current" "$prefix/current" ;;
-        linux-*) mv -fT "$next/current" "$prefix/current" ;;
-    esac
-    rmdir "$next"
+    # Rust rename replaces a symlink atomically on both supported platforms.
+    "$work/payload/hx-server" --state-dir "$state" install-link --link "$prefix/current" --target "$1"
 }
 quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
 server() (
@@ -453,44 +484,83 @@ healthy() {
 stopped=false
 backup=
 failed_state=
+migration_started=false
+backup_server=$work/payload/hx-server
+if [ -n "$old" ]; then backup_server=$old/hx-server; fi
 rollback() {
     result=$?
     trap - 0 HUP INT TERM
+    # Recovery must attempt every step, even when storage itself is failing.
+    set +e
     if [ "$result" -ne 0 ] && [ "$stopped" = true ]; then
-        service_stop || true
-        if [ -n "$old" ]; then
-            if [ -n "$backup" ] && [ -f "$backup/manifest.json" ]; then
-                failed_state=$state.failed-$(date +%s)-$$
-                # Keep any failed-generation state for inspection. Both databases
-                # and blobs are restored together; server.env is outside P5.
-                mv "$state" "$failed_state"
-                if "$old/hx-server" --state-dir "$state" restore --from "$backup"; then
-                    cp "$failed_state/server.env" "$state/server.env"
-                    chmod 600 "$state/server.env"
+        service_stop || printf 'Could not stop candidate service during recovery.\n' >&2
+        restored=true
+        if [ -n "$backup" ] && [ -f "$backup/manifest.json" ] && [ "$migration_started" = true ]; then
+            failed_state=$state.failed-$(date +%s)-$$
+            if mv "$state" "$failed_state"; then
+                if "$backup_server" --state-dir "$state" restore --from "$backup"; then
+                    cp "$failed_state/server.env" "$state/server.env" || restored=false
+                    chmod 700 "$state" || restored=false
+                    chmod 600 "$state/server.env" || restored=false
+                    touch "$state/server.log" || restored=false
+                    chmod 600 "$state/server.log" || restored=false
+                    printf '%s\n' "$prefix" > "$state/.install-prefix" || restored=false
                 else
-                    printf 'Restore failed. Backup: %s; failed state: %s\n' "$backup" "$failed_state" >&2
-                    result=1
+                    restored=false
                 fi
+            else
+                restored=false
             fi
-            switch_current "$old"
-            service_start || printf 'Old service is restartable; start it after checking the retained state and backup.\n' >&2
+            if [ "$restored" = false ]; then
+                printf 'Recovery incomplete. Backup: %s; retained failed state: %s. Restore into an absent/empty state folder before restarting.\n' "$backup" "$failed_state" >&2
+            fi
+        fi
+        if [ -n "$old" ]; then
+            if ! switch_current "$old"; then
+                restored=false
+                printf 'Could not restore current link to %s. Old binary remains there.\n' "$old" >&2
+            fi
+            # Always try the old service after link restoration, including after
+            # a failed copy/rename. Its exact-schema open refuses unsafe state.
+            mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
+            [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
+            [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"
+            if service_start && healthy; then
+                if [ "$restored" = true ]; then
+                    printf 'Previous service restarted.\n' >&2
+                else
+                    printf 'Service responded, but state recovery is incomplete; inspect the retained copies.\n' >&2
+                fi
+            else
+                printf 'Previous service did not recover. Retained binary: %s; state: %s; backup: %s.\n' "$old" "$state" "$backup" >&2
+            fi
         fi
     fi
     exit "$result"
 }
 trap rollback 0
 trap 'exit 1' HUP INT TERM
-if [ "$app_only" = false ] && [ -n "$old" ] && [ -f "$state/core.sqlite" ]; then
+if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
     # Reject paid work before stopping. The enclosing guard closes the race.
     "$work/payload/hx-server" --state-dir "$state" status --require-idle
     stopped=true
     service_stop
     mkdir -p "$prefix/backups"
     backup=$(mktemp -d "$prefix/backups/pre-upgrade.XXXXXXXX")
-    "$old/hx-server" --state-dir "$state" backup --to "$backup"
+    "$backup_server" --state-dir "$state" backup --to "$backup"
+elif [ "$app_only" = false ] && [ -n "$old" ]; then
+    stopped=true
+    service_stop
+fi
+# Publish the ownership marker and directory together. An interrupted staging
+# directory is outside the prefix; no unmarked prefix is ever exposed.
+if [ ! -d "$prefix" ]; then
+    mkdir -p "$(dirname "$prefix")"
+    prefix_stage=$(mktemp -d "$prefix.staging.XXXXXXXX")
+    cp "$work/payload/.installed" "$prefix_stage/.installed"
+    mv "$prefix_stage" "$prefix"
 fi
 mkdir -p "$prefix/tools/fx-0.0.16"
-cp "$work/payload/.installed" "$prefix/.installed"
 if [ ! -e "$version_dir" ]; then
     stage=$(mktemp -d "$prefix/.staging.XXXXXXXX")
     cp -R "$work/payload/." "$stage/"
@@ -527,7 +597,9 @@ if [ "$app_only" = false ]; then
     chmod 600 "$state/server.env"
     : >> "$state/server.log"
     chmod 600 "$state/server.log"
+    migration_started=true
     server migrate
+    printf '%s\n' "$prefix" > "$state/.install-prefix"
     mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
     [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
     [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"
@@ -535,10 +607,6 @@ if [ "$app_only" = false ]; then
     healthy || { printf 'User service did not become healthy.\n' >&2; exit 1; }
     server doctor --state-only
     if ! server doctor; then
-        if [ -n "$backup" ]; then
-            printf 'Upgrade readiness failed; restoring the previous installation.\n' >&2
-            exit 1
-        fi
         printf 'Service is running; provider setup is incomplete. Doctor above names what is missing. No login or model call was made.\n' >&2
     fi
 fi
@@ -546,6 +614,7 @@ if [ "$install_app" = true ]; then
     mkdir -p "$HOME/Applications"
     [ -L "$app" ] || ln -s "$prefix/current/Hyperthymesia.app" "$app"
 fi
+printf '%s\n' "$version_dir" > "$prefix/.last-version"
 stopped=false
 trap - 0 HUP INT TERM
 printf 'Installed. State: %s\n' "$state"

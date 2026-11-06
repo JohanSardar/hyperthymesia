@@ -27,7 +27,11 @@ service = 'hyperthymesia.service'
 
 with tempfile.TemporaryDirectory(prefix='hx-install-smoke-', dir=os.environ['RUNNER_TEMP']) as tmp:
     root = Path(tmp)
-    home = root / 'home'
+    actual = root / 'actual'
+    actual.mkdir(mode=0o700)
+    alias = root / 'home-parent'
+    alias.symlink_to(actual, target_is_directory=True)
+    home = alias / 'home'
     home.mkdir(mode=0o700)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('HX_', 'FX_'))}
     env.update(HOME=str(home), HX_RELEASE_BASE=assets.as_uri())
@@ -105,6 +109,12 @@ with tempfile.TemporaryDirectory(prefix='hx-install-smoke-', dir=os.environ['RUN
         assert len(list(home.rglob('core.sqlite'))) == 1, 'first install created more than one core'
         print('ok: one command starts a real user service with private state', flush=True)
 
+        # Missing provider login must never prevent an otherwise healthy rerun.
+        run(['/bin/sh', installer, '--server-only'])
+        wait_for(health)
+        first = wait_for(pid)
+        print('ok: upgrade before login succeeds under a symlinked HOME parent', flush=True)
+
         # A fake model executable can only answer --version; no network/model
         # operation is allowed. The installer still verifies the real pinned fx.
         fake = root / 'fake-fx'
@@ -135,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix='hx-install-smoke-', dir=os.environ['RUN
             'connector_instance': 'test:install', 'source_key': 'synthetic', 'revision': '1',
             'operation': 'observe', 'kind': 'web.visit', 'schema_version': 1,
             # Current-window evidence cannot admit an interpretation yet.
-            'time': {'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())},
+            'time': {'observed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'resolution_ms': 1000},
             'sensitivity': 'normal', 'payload': {'url': 'https://example.invalid', 'title': 'Synthetic installer evidence'},
         }
         ack = api('/v1/events', token, {'batch_id': '01J00000000000000000000002', 'envelopes': [event]})
@@ -178,6 +188,10 @@ with tempfile.TemporaryDirectory(prefix='hx-install-smoke-', dir=os.environ['RUN
         assert db('SELECT id,envelope FROM events ORDER BY id') == rows_before
         assert api(f'/v1/evidence/{evidence_id}', token) == evidence_before
         assert list((prefix / 'backups').glob('*/manifest.json')), 'upgrade skipped P5 backup'
+        status = json.loads(run([server, '--state-dir', state, 'status']).stdout)
+        retained = {item['path']: item['bytes'] for item in status['retained']}
+        for backup in (prefix / 'backups').iterdir():
+            assert retained[str(backup)] > 0, retained
         print('ok: upgrade keeps seeded evidence, env, backup and previous version', flush=True)
     finally:
         # Always stop the real service before the temporary HOME is deleted.

@@ -33,6 +33,9 @@ enum Command {
         /// Check only state/schema/privacy; provider login may still be missing.
         #[arg(long)]
         state_only: bool,
+        /// Installer preflight: accept missing migrations, never changed/newer ones.
+        #[arg(long, requires = "state_only")]
+        allow_older_schema: bool,
     },
     /// Read schema compatibility and the number of live interpret leases.
     Status {
@@ -44,6 +47,14 @@ enum Command {
     UpgradeGuard {
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<std::ffi::OsString>,
+    },
+    /// Atomically replace an installer symlink without platform-specific mv flags.
+    #[command(hide = true)]
+    InstallLink {
+        #[arg(long)]
+        link: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
     },
     Serve {
         #[arg(long, default_value = "127.0.0.1:7377")]
@@ -105,10 +116,35 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
-    if let Command::Doctor { state_only } = &cli.command {
+    if let Command::InstallLink { link, target } = &cli.command {
+        if let Ok(metadata) = std::fs::symlink_metadata(link) {
+            anyhow::ensure!(
+                metadata.file_type().is_symlink(),
+                "installer link is not a symlink"
+            );
+        }
+        let parent = link.parent().context("installer link parent")?;
+        let stage = tempfile::Builder::new()
+            .prefix(".switch.")
+            .tempdir_in(parent)?;
+        let next = stage.path().join("current");
+        std::os::unix::fs::symlink(target, &next)?;
+        std::fs::rename(&next, link)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        return Ok(());
+    }
+    if let Command::Doctor {
+        state_only,
+        allow_older_schema,
+    } = &cli.command
+    {
         if let Some(dir) = &cli.state_dir {
-            Store::check_state(dir).await?;
-            println!("ok: private state, current schema and SQLite integrity");
+            if *allow_older_schema {
+                Store::check_upgrade_state(dir).await?;
+            } else {
+                Store::check_state(dir).await?;
+            }
+            println!("ok: private state, compatible schema and SQLite integrity");
         } else if *state_only {
             bail!("--state-dir or HX_STATE_DIR is required for --state-only");
         }
@@ -132,7 +168,10 @@ async fn main() -> Result<()> {
     }
     if let Command::Status { require_idle } = &cli.command {
         let leases = Store::status(&dir).await?;
-        println!("{}", serde_json::json!({"running_interpret_leases":leases}));
+        println!(
+            "{}",
+            serde_json::json!({"running_interpret_leases":leases, "retained": retained_copies(&dir)})
+        );
         if *require_idle && leases != 0 {
             bail!("upgrade refused: running interpret lease");
         }
@@ -140,8 +179,26 @@ async fn main() -> Result<()> {
     }
     if let Command::UpgradeGuard { command } = &cli.command {
         let lock = worker_lock(&dir)?;
-        lock.try_lock()
-            .context("upgrade refused: worker is active; retry when idle")?;
+        // Idle ticks and in-flight uploads briefly hold a shared lock too.
+        // Wait for those to drain, but never wait out a paid interpret lease.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if Store::status(&dir).await? != 0 {
+                bail!("upgrade refused: running interpret lease");
+            }
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock)
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .context("upgrade refused: worker is active; retry when idle");
+                }
+            }
+        }
         if Store::status(&dir).await? != 0 {
             bail!("upgrade refused: running interpret lease");
         }
@@ -174,7 +231,10 @@ async fn main() -> Result<()> {
     }
     let store = Store::open(&dir).await?;
     match cli.command {
-        Command::Doctor { .. } | Command::Status { .. } | Command::UpgradeGuard { .. } => {
+        Command::Doctor { .. }
+        | Command::Status { .. }
+        | Command::UpgradeGuard { .. }
+        | Command::InstallLink { .. } => {
             unreachable!("readiness commands run before opening the store")
         }
         Command::Migrate => unreachable!("migrate runs before opening the store"),
@@ -453,4 +513,49 @@ async fn maintenance_gate(
     let response = next.run(request).await;
     drop(lock);
     response
+}
+
+// Metadata only; never follow links or inspect backup/secret contents. Errors
+// are reported per copy, not turned into an upgrade refusal.
+fn retained_copies(state: &std::path::Path) -> Vec<serde_json::Value> {
+    fn size(path: &std::path::Path) -> std::io::Result<u64> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if !meta.is_dir() {
+            return Ok(meta.len());
+        }
+        let mut bytes = 0;
+        for entry in std::fs::read_dir(path)? {
+            bytes += size(&entry?.path())?;
+        }
+        Ok(bytes)
+    }
+    let mut paths = Vec::new();
+    if let (Some(parent), Some(name)) = (state.parent(), state.file_name()) {
+        let start = format!("{}.failed-", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            paths.extend(
+                entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(&start))
+                    .map(|e| e.path()),
+            );
+        }
+    }
+    // Written by the installer, so custom state paths also find their backups.
+    if let Ok(prefix) = std::fs::read_to_string(state.join(".install-prefix")) {
+        let prefix = PathBuf::from(prefix.trim_end());
+        if prefix.is_absolute() && prefix.join(".installed").is_file() {
+            if let Ok(entries) = std::fs::read_dir(prefix.join("backups")) {
+                paths.extend(entries.flatten().map(|e| e.path()));
+            }
+        }
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| match size(&path) {
+            Ok(bytes) => serde_json::json!({"path":path,"bytes":bytes}),
+            Err(error) => serde_json::json!({"path":path,"error":error.to_string()}),
+        })
+        .collect()
 }
