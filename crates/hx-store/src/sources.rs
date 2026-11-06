@@ -162,7 +162,11 @@ impl Store {
                 .await?;
             log_switch(&mut tx, "source", id, enabled).await?;
         }
-        tx.commit().await
+        tx.commit().await?;
+        if enabled == Some(false) {
+            self.cancel_source_exchanges(id, None).await;
+        }
+        Ok(())
     }
     pub async fn recipe_exists(&self, id: &str) -> Result<bool> {
         Ok(
@@ -250,7 +254,7 @@ impl Store {
 
     /// Setup-only save. HTTP identity is source + method + normalized URL path;
     /// query, headers, body and display name do not create a new owner switch.
-    /// A genuinely different path (or CLI name / MCP tool) is a different
+    /// A genuinely different path (or CLI argv / MCP tool) is a different
     /// pull. This is an identity boundary, not a detector for equivalent APIs.
     /// A re-save never writes enabled or owner_off, or resets the pull cursor.
     pub async fn save_recipe(&self, source: &str, recipe: &Recipe) -> Result<StoredRecipe> {
@@ -265,12 +269,26 @@ impl Store {
         recipe.validate()?;
         let mut recipe = recipe.clone();
         recipe.source = source.to_owned();
-        let identity_hash = recipe_identity(&recipe)?;
+        let mut identity_hash = recipe_identity(&recipe)?;
         let value = stored_json(serde_json::to_value(&recipe)?);
         let id = new_id();
         let mut tx = self.begin_write().await?;
         ensure_source_on(&mut tx, source).await?;
         ensure_setup_generation(&mut tx, source, generation).await?;
+        // Older CLI rows used their display name in the hash. Compare the saved
+        // requests under the current rules, retaining the row, switch and cursor.
+        // If older code already made duplicates, an owner-off row wins.
+        let existing: Vec<StoredRecipe> =
+            sqlx::query_as("SELECT * FROM recipes WHERE source_id=$1 ORDER BY owner_off DESC,id")
+                .bind(source)
+                .fetch_all(&mut *tx)
+                .await?;
+        for saved in existing {
+            if recipe_identity(&saved.recipe.0)? == identity_hash {
+                identity_hash = saved.identity_hash;
+                break;
+            }
+        }
         let row: StoredRecipe = sqlx::query_as("INSERT INTO recipes(id,source_id,name,identity_hash,recipe) VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_id,identity_hash) DO UPDATE SET name=EXCLUDED.name,recipe=EXCLUDED.recipe RETURNING *")
             .bind(id).bind(source).bind(&recipe.name).bind(identity_hash).bind(value).fetch_one(&mut *tx).await?;
         sqlx::query(
@@ -432,6 +450,14 @@ impl Store {
             _ => bail!("unknown switch kind"),
         };
         let mut tx = self.begin_write().await?;
+        let recipe: Option<StoredRecipe> = if kind == "recipe" && !enabled {
+            sqlx::query_as("SELECT * FROM recipes WHERE id=$1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            None
+        };
         let updated = sqlx::query(sql)
             .bind(id)
             .bind(enabled)
@@ -439,7 +465,15 @@ impl Store {
             .await?;
         ensure!(updated.rows_affected() == 1, "unknown switch target");
         log_switch(&mut tx, kind, id, enabled).await?;
-        tx.commit().await
+        tx.commit().await?;
+        if let Some(recipe) = recipe {
+            self.cancel_source_exchanges(
+                &recipe.source_id,
+                Some((id, &recipe_identity(&recipe.recipe.0)?)),
+            )
+            .await;
+        }
+        Ok(())
     }
 
     /// Run-scoped context only. The broker issues the run ULID and scrubs the
@@ -707,9 +741,10 @@ pub fn recipe_identity(recipe: &Recipe) -> Result<String> {
                 normalized_path(url)?
             ])
         }
-        // CLI has no HTTP method/path. Its stable recipe name distinguishes
-        // pulls from the same executable; flags/env changes preserve the switch.
-        Request::Cli { argv, .. } => json!(["cli", executable(argv)?, recipe.name.trim()]),
+        // Environment changes, like HTTP headers/body, retain the switch.
+        // In particular ignored/overridden env vars must not bypass an off.
+        // The display name, mapping and cadence are never request identity.
+        Request::Cli { argv, .. } => json!(["cli", argv]),
         Request::Mcp {
             transport, tool, ..
         } => match transport {

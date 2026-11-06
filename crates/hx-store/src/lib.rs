@@ -855,3 +855,5 @@ pub use persistence::{
 
 mod contention;
 pub use contention::{is_busy, retry_busy};
+
+mod source_io;

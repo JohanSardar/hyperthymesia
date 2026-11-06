@@ -50,6 +50,8 @@ pub struct Placeholders<'a> {
 /// contain a source credential. Callers can safely persist this message.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RequestError {
+    #[error("source request cancelled by owner switch")]
+    Cancelled,
     #[error("only HTTP execution is available")]
     Unsupported,
     #[error("invalid HTTP request")]
@@ -93,6 +95,19 @@ impl RequestError {
 
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Transport | Self::Status(408 | 429 | 500..=599))
+    }
+}
+
+/// Rechecked immediately before each transport request or process start.
+/// Callers also cancel the enclosing future while a response is in flight.
+pub trait RequestGate: Sync {
+    fn check(&self) -> impl std::future::Future<Output = Result<(), RequestError>> + Send;
+}
+
+struct Unrestricted;
+impl RequestGate for Unrestricted {
+    async fn check(&self) -> Result<(), RequestError> {
+        Ok(())
     }
 }
 
@@ -166,13 +181,25 @@ impl Request {
         timeout: Duration,
         host: &crate::host::HostRunner,
     ) -> Result<Value, RequestError> {
+        self.execute_guarded(values, timeout, host, &Unrestricted)
+            .await
+    }
+
+    #[cfg(unix)]
+    pub async fn execute_guarded(
+        &self,
+        values: Placeholders<'_>,
+        timeout: Duration,
+        host: &crate::host::HostRunner,
+        gate: &impl RequestGate,
+    ) -> Result<Value, RequestError> {
         match self {
-            Self::Http { .. } => self.execute_http(values, timeout).await,
+            Self::Http { .. } => self.execute_http_guarded(values, timeout, gate).await,
             Self::Mcp {
                 transport,
                 tool,
                 arguments,
-            } => crate::mcp::execute(transport, tool, arguments, values, timeout, host).await,
+            } => crate::mcp::execute(transport, tool, arguments, values, timeout, host, gate).await,
             Self::Cli { argv, env } => {
                 if timeout.is_zero() || argv.first().is_none_or(String::is_empty) {
                     return Err(RequestError::CliInvalid);
@@ -193,6 +220,7 @@ impl Request {
                     .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
                     .collect::<Vec<_>>()
                     .join(" ");
+                gate.check().await?;
                 let output =
                     host.run(&command, &env, timeout)
                         .await
@@ -221,6 +249,16 @@ impl Request {
         &self,
         values: Placeholders<'_>,
         timeout: Duration,
+    ) -> Result<Value, RequestError> {
+        self.execute_http_guarded(values, timeout, &Unrestricted)
+            .await
+    }
+
+    async fn execute_http_guarded(
+        &self,
+        values: Placeholders<'_>,
+        timeout: Duration,
+        gate: &impl RequestGate,
     ) -> Result<Value, RequestError> {
         let Self::Http {
             method,
@@ -259,6 +297,7 @@ impl Request {
             request = request.json(&substitute_json(body, values)?);
         }
         let request = request.build().map_err(|_| RequestError::Invalid)?;
+        gate.check().await?;
         let mut response = client
             .execute(request)
             .await

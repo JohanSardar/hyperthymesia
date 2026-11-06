@@ -236,8 +236,8 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
         let response = if let Some(pending) = checkpoint.pending.take() {
             pending
         } else {
-            match recipe
-                .request
+            let exchange = store.recipe_exchange(&source.id, recipe, Some(id), None)?;
+            match exchange
                 .execute(
                     Placeholders {
                         key: key.as_deref(),
@@ -249,6 +249,10 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
                 .await
             {
                 Ok(value) => value,
+                Err(RequestError::Cancelled) => {
+                    report.stopped = true;
+                    break;
+                }
                 Err(error) => {
                     let reconnect = error.needs_reconnect()
                         || matches!(error, RequestError::Exit(code) if recipe.reconnect_exit_codes.contains(&code))
