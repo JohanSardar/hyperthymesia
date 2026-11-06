@@ -302,6 +302,7 @@ async fn query_and_headers_cannot_replace_an_owner_disabled_pull() -> Result<()>
         "https://synthetic.invalid/m?",
         "https://synthetic.invalid/m?page=2",
         "https://synthetic.invalid/a/../%6d?new=1",
+        "https://synthetic.invalid/m/",
     ] {
         recipe.request = serde_json::from_value(
             json!({"kind":"http", "method":"get", "url":url, "headers":{"Accept":"application/json"}}),
