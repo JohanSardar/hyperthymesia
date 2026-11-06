@@ -13,17 +13,22 @@ struct Args {
     /// Must be absent or empty. No default.
     #[arg(long, env = "HX_STATE_DIR")]
     state_dir: PathBuf,
+    /// Compatibility flag: every published blob is always fully hashed.
     #[arg(long)]
     verify_all_blobs: bool,
+    /// Acknowledge an intentionally empty source database.
+    #[arg(long)]
+    allow_empty: bool,
 }
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
     match move_postgres(&Options {
-        postgres_url: args.postgres_url,
+        postgres_url: args.postgres_url.clone(),
         source_data_dir: args.source_data_dir,
         state_dir: args.state_dir,
         verify_all_blobs: args.verify_all_blobs,
+        allow_empty: args.allow_empty,
     })
     .await
     {
@@ -34,12 +39,10 @@ async fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        // SQL errors can contain row contents, paths, or connection secrets.
-        // Keep stderr safe to share. The library retains structured errors for
-        // synthetic tests and independent review, never prints source values.
-        Err(_) => {
+        Err(error) => {
             eprintln!(
-                "Move refused or verification failed. No new target was published; stop writers and check the migration version, lease state, target emptiness, blob availability, disk space and permissions before retrying."
+                "Move refused: {}",
+                hx_move::diagnostics::diagnostic(&error, &args.postgres_url)
             );
             ExitCode::FAILURE
         }

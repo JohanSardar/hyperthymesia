@@ -34,6 +34,22 @@ async fn every_table_is_hashed_and_one_changed_byte_fails_verification() -> Resu
         persistent.into_iter().collect::<BTreeSet<_>>() == hashes.keys().cloned().collect(),
         "every application table needs a hash"
     );
+    for table in schema::tables() {
+        let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info($1)")
+            .bind(table.name)
+            .fetch_all(&store.pool)
+            .await?;
+        let expected: BTreeSet<_> = schema::target_table(&table)
+            .columns
+            .into_iter()
+            .map(|c| c.0.to_owned())
+            .collect();
+        ensure!(
+            columns.into_iter().collect::<BTreeSet<_>>() == expected,
+            "{} has uncovered columns",
+            table.name
+        );
+    }
     ensure!(hashes.values().all(|h| h.sha256.len() == 64));
     core::verify(&store, &hashes).await?;
     sqlx::query("UPDATE device_tokens SET name='b'")

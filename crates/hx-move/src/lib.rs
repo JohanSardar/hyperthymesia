@@ -1,5 +1,7 @@
 //! Owner-run, verified, one-way cutover. No production API writes to Postgres.
+mod audit;
 pub mod core;
+pub mod diagnostics;
 pub mod postgres;
 pub mod schema;
 mod verification;
@@ -16,6 +18,8 @@ pub struct Options {
     /// Must be absent or an empty directory on a local filesystem.
     pub state_dir: PathBuf,
     pub verify_all_blobs: bool,
+    /// Explicitly acknowledge an empty source; never inferred from the environment.
+    pub allow_empty: bool,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Report {
@@ -30,7 +34,12 @@ pub struct Report {
 pub async fn move_postgres(options: &Options) -> Result<Report> {
     refuse_target(&options.state_dir)?;
     let mut source = postgres::Snapshot::open(&options.postgres_url).await?;
+    ensure!(
+        options.allow_empty || source.event_count().await? > 0,
+        "source has zero events; pass --allow-empty only to acknowledge an intentionally empty history"
+    );
     let before = source.hashes().await?;
+    let independent = audit::SourceAudit::read(&mut source).await?;
     let parent = options
         .state_dir
         .parent()
@@ -66,6 +75,7 @@ pub async fn move_postgres(options: &Options) -> Result<Report> {
     let store = Store::new(pool, &state);
     let result = async {
         let expected = source.load(&store).await?;
+        independent.verify(&store).await?;
         core::verify(&store, &expected).await?;
         ensure!(
             source.hashes().await? == before,
@@ -77,6 +87,7 @@ pub async fn move_postgres(options: &Options) -> Result<Report> {
             verification::blobs(&store, &options.source_data_dir, options.verify_all_blobs).await?;
         // Re-read after all verification to catch any unintended staging edits.
         core::verify(&store, &expected).await?;
+        independent.verify(&store).await?;
         source.ensure_unchanged().await?;
         Ok::<_, anyhow::Error>(Report {
             tables: expected,
@@ -91,8 +102,9 @@ pub async fn move_postgres(options: &Options) -> Result<Report> {
     // Closing before cleanup/rename also works on platforms that forbid
     // deleting open database files. Errors never publish a target core.
     store.pool.close().await;
-    source.close().await?;
+    let closed = source.close().await;
     let report = result?;
+    closed?;
     std::fs::rename(state.join("core.sqlite.moving"), state.join("core.sqlite"))?;
     std::fs::File::open(state.join("core.sqlite"))?.sync_all()?;
     std::fs::File::open(state.join("agent.sqlite"))?.sync_all()?;
@@ -122,3 +134,7 @@ fn refuse_target(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;

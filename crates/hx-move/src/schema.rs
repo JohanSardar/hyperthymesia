@@ -142,6 +142,12 @@ pub fn tables() -> Vec<Table> {
             true,
         ),
         Table::new(
+            "pair_codes",
+            "hash:s name:s expires_at:t used_at:t revoked:b token_hash:s",
+            "hash",
+            false,
+        ),
+        Table::new(
             "revision_dependencies",
             "revision_id:i prior_revision_id:i",
             "revision_id,prior_revision_id",

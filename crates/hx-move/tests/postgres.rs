@@ -1,5 +1,6 @@
 //! Opt-in only. Always creates and drops its own database; never accepts an
 //! existing database as fixture data. No services are needed by cargo test.
+mod support;
 use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
 use hx_move::{
@@ -8,47 +9,12 @@ use hx_move::{
 };
 use hx_store::{Store, Ts};
 use serde_json::{Value, json};
-use sqlx::{Connection, Executor, PgConnection, postgres::PgConnectOptions};
-use std::{
-    str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use sqlx::{Connection, PgConnection};
 
 #[tokio::test]
 #[ignore = "requires a scratch Postgres service; run in mover-postgres CI"]
 async fn synthetic_postgres_cutover_preserves_identity_and_paid_budgets() -> Result<()> {
-    let url = std::env::var("HX_MOVE_TEST_POSTGRES")
-        .unwrap_or_else(|_| "postgres://hx:hx@localhost:55432/hx".into());
-    let base = PgConnectOptions::from_str(&url)?;
-    ensure!(
-        base.get_database() == Some("hx"),
-        "test admin database must be hx"
-    );
-    let mut admin = PgConnection::connect_with(&base).await?;
-    let name = format!(
-        "hx_move_{}_{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    );
-    admin
-        .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
-        .await?;
-    let scratch_url = format!(
-        "{}/{}",
-        url.rsplit_once('/')
-            .ok_or_else(|| anyhow::anyhow!("test URL"))?
-            .0,
-        name
-    );
-    let result = exercise(&scratch_url).await;
-    // Cleanup also happens on a failed assertion or a refused move.
-    admin
-        .execute(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE {name} WITH (FORCE)"
-        )))
-        .await?;
-    admin.close().await?;
-    result
+    support::with_database(|url| async move { exercise(&url).await }).await
 }
 
 async fn exercise(url: &str) -> Result<()> {
@@ -138,6 +104,18 @@ async fn exercise(url: &str) -> Result<()> {
             sqlx::query("INSERT INTO normalized(event_id,normalizer_version,payload,search_text) VALUES($1,'normalize/v1','{\"z\":1e24,\"a\":-0.0}','syntheticneedle')").bind(id).execute(&mut pg).await?;
         }
     }
+    for (i, id) in [40, 41, 42, 43, 1001].into_iter().enumerate() {
+        let text = format!(
+            "syntheticneedle {} {}",
+            SEARCH_REGRESSIONS[i],
+            if i == 4 { SEARCH_REGRESSIONS[5] } else { "" }
+        );
+        sqlx::query("UPDATE normalized SET search_text=$2 WHERE event_id=$1")
+            .bind(id)
+            .bind(text)
+            .execute(&mut pg)
+            .await?;
+    }
     sqlx::query("INSERT INTO ocr_jobs(sha256,engine_version,source_event_id,status,result) VALUES($1,'synthetic-ocr/v1',41,'complete','{\"lines\":[{\"text\":\"syntheticneedle\",\"confidence\":0.9,\"bbox\":{\"x\":0,\"y\":0,\"width\":1,\"height\":1}}],\"engine_name\":\"synthetic\",\"engine_version\":\"v1\",\"coverage\":\"partial\",\"n\":1.9783974156629658e-165}')").bind(&sha).execute(&mut pg).await?;
     for (id, source) in [(91, 41), (92, 43)] {
         sqlx::query("INSERT INTO ocr_evidence(id,observation_id,source_event_id,sha256,engine_version) VALUES($1,$2,$3,$4,'synthetic-ocr/v1')").bind(id).bind(format!("01ARZ3NDEKTSV4RRFFQ69G5F{:02}",id)).bind(source).bind(&sha).execute(&mut pg).await?;
@@ -186,7 +164,7 @@ async fn exercise(url: &str) -> Result<()> {
             202,
             content.clone(),
             Some(
-                "{\"calls\":[{\"tool\":\"prior_context\",\"result\":{\"revisions\":[{\"revision_id\":201}]}}]}",
+                "{\"calls\":[{\"tool\":\"prior_context\",\"result\":{\"evidence\":[777777],\"revisions\":[{\"revision_id\":201}]}}]}",
             ),
             output_key.clone(),
         ),
@@ -203,7 +181,7 @@ async fn exercise(url: &str) -> Result<()> {
         .execute(&mut pg)
         .await?;
     sqlx::query("INSERT INTO watermarks VALUES('synthetic:test','2026-01-02T08:00:00Z',18446744073709551615)").execute(&mut pg).await?;
-    sqlx::query("INSERT INTO device_tokens VALUES('synthetic-hash','synthetic-token',ARRAY['synthetic:'],ARRAY['ingest'],false)").execute(&mut pg).await?;
+    sqlx::query("INSERT INTO device_tokens VALUES($1,'synthetic-token',ARRAY['synthetic:'],ARRAY['ingest'],false)").bind(hx_store::hash(b"synthetic-token-secret")).execute(&mut pg).await?;
     sqlx::query("INSERT INTO entity_assertions(id,entity,assertion,evidence,sensitivity) VALUES(301,'synthetic-entity','{\"z\":1e-8,\"a\":-0.0}',ARRAY[41,91]::bigint[],'restricted')").execute(&mut pg).await?;
     for (id, slot, state, revivals) in [
         (401, "interpret", "done", 1),
@@ -233,6 +211,7 @@ async fn exercise(url: &str) -> Result<()> {
             .execute(&mut pg)
             .await?;
     }
+    pg.close().await?;
     let mut source = Snapshot::open(url).await?;
     let before = source.hashes().await?;
     source.close().await?;
@@ -241,6 +220,7 @@ async fn exercise(url: &str) -> Result<()> {
         source_data_dir: legacy.clone(),
         state_dir: target.clone(),
         verify_all_blobs: true,
+        allow_empty: false,
     };
     // Fail after rows have loaded: the staged blob has the right size but the
     // wrong bytes. A retry must succeed without deleting anything by hand.
@@ -260,7 +240,11 @@ async fn exercise(url: &str) -> Result<()> {
         .arg("--verify-all-blobs")
         .output()
         .await?;
-    ensure!(output.status.success(), "synthetic mover CLI failed");
+    ensure!(
+        output.status.success(),
+        "synthetic mover CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     ensure!(output.stderr.is_empty(), "unexpected CLI stderr");
     ensure!(
         !String::from_utf8_lossy(&output.stdout).contains("syntheticneedle"),
@@ -280,6 +264,15 @@ async fn exercise(url: &str) -> Result<()> {
     );
     let store = Store::open(&target).await?;
     hx_move::core::verify(&store, &report.tables).await?;
+    ensure!(
+        report.tables["pair_codes"].rows == 0,
+        "legacy Postgres has no pair codes"
+    );
+    let token = store
+        .authenticate("synthetic-token-secret")
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("moved device token no longer authenticates"))?;
+    ensure!(token.prefixes == ["synthetic:"] && token.scopes == ["ingest"]);
     for (id, original) in &originals {
         let new: String = sqlx::query_scalar("SELECT envelope FROM events WHERE id=$1")
             .bind(id)
@@ -442,6 +435,7 @@ async fn exercise(url: &str) -> Result<()> {
     source.close().await?;
     store.pool.close().await;
     // A live lease must fail before any target files are created.
+    pg = PgConnection::connect(url).await?;
     sqlx::query("UPDATE jobs SET state='running',lease_until=now()+interval '1 hour' WHERE id=401")
         .execute(&mut pg)
         .await?;
@@ -449,15 +443,211 @@ async fn exercise(url: &str) -> Result<()> {
         state_dir: dir.path().join("live-lease"),
         ..options
     };
-    ensure!(move_postgres(&lease_options).await.is_err() && !lease_options.state_dir.exists());
+    pg.close().await?;
+    let error = move_postgres(&lease_options)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("live lease accepted"))?;
+    ensure!(error.to_string().contains("live lease") && !lease_options.state_dir.exists());
+    pg = PgConnection::connect(url).await?;
     sqlx::query("UPDATE jobs SET state='done',lease_until=NULL WHERE id=401")
         .execute(&mut pg)
         .await?;
     sqlx::query("INSERT INTO events(id,observation_id,connector_instance,source_key,revision,kind,source_start,observed_at,sensitivity,envelope) SELECT 91,observation_id,connector_instance,'collision','0',kind,source_start,observed_at,sensitivity,envelope FROM events WHERE id=41").execute(&mut pg).await?;
-    ensure!(
-        move_postgres(&lease_options).await.is_err() && !lease_options.state_dir.exists(),
-        "overlapping IDs were accepted"
-    );
     pg.close().await?;
+    let error = move_postgres(&lease_options)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("overlapping IDs accepted"))?;
+    ensure!(
+        error.to_string().contains("overlapping evidence IDs") && !lease_options.state_dir.exists()
+    );
     Ok(())
+}
+
+const SEARCH_REGRESSIONS: [&str; 6] = [
+    "Rust sqlite - Google Search https://www.google.com/search?q=rust+sqlite",
+    "example.com/a?b=1",
+    "https://mail.google.com/mail/u/0/#inbox",
+    "docs.rs/sqlx/latest/sqlx/",
+    "https://youtu.be/abc?t=30",
+    "İstanbul",
+];
+
+#[tokio::test]
+#[ignore = "requires a scratch Postgres service"]
+async fn url_and_unicode_search_rows_move_and_tampered_fts_is_refused() -> Result<()> {
+    support::with_database(|url| async move {
+        let mut pg = PgConnection::connect(&url).await?;
+        FROZEN.run(&mut pg).await?;
+        for (n,text) in SEARCH_REGRESSIONS.iter().enumerate() {
+            let id = n as i64+1;
+            sqlx::query("INSERT INTO events(id,observation_id,connector_instance,source_key,revision,kind,source_start,observed_at,sensitivity,envelope) VALUES($1,'synthetic','synthetic:test',$2,'0','synthetic.point',now(),now(),'normal','{}')").bind(id).bind(id.to_string()).execute(&mut pg).await?;
+            sqlx::query("INSERT INTO normalized(event_id,normalizer_version,payload,search_text) VALUES($1,'synthetic','{}',$2)").bind(id).bind(text).execute(&mut pg).await?;
+        }
+        pg.close().await?;
+        let dir = tempfile::tempdir()?;
+        let options = Options { postgres_url:url, source_data_dir:dir.path().join("legacy"),state_dir:dir.path().join("moved"),verify_all_blobs:true,allow_empty:false };
+        let report = move_postgres(&options).await?;
+        let store = Store::open(&options.state_dir).await?;
+        hx_move::core::verify(&store,&report.tables).await?;
+        sqlx::query("INSERT INTO normalized_fts(normalized_fts,rowid,search_text) VALUES('delete',6,$1)").bind(SEARCH_REGRESSIONS[5]).execute(&store.pool).await?;
+        ensure!(hx_move::core::verify(&store,&report.tables).await.is_err(), "corrupt FTS row was accepted");
+        store.pool.close().await;
+        Ok(())
+    }).await
+}
+
+#[tokio::test]
+#[ignore = "requires a scratch Postgres service"]
+async fn source_fences_empty_acknowledgement_and_safe_cli_diagnostics() -> Result<()> {
+    support::with_database(|url| async move {
+        let mut pg = PgConnection::connect(&url).await?;
+        FROZEN.run(&mut pg).await?;
+        let error = Snapshot::open(&url)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("other client accepted"))?;
+        ensure!(error.to_string().contains("1 other client session"));
+        pg.close().await?;
+        let mut source = Snapshot::open(&url).await?;
+        // The start check has already cached pg_stat_activity. An ID-free
+        // writer must nevertheless be visible at the final fence.
+        let mut pg = PgConnection::connect(&url).await?;
+        sqlx::query("INSERT INTO watermarks VALUES('synthetic',now(),1)")
+            .execute(&mut pg)
+            .await?;
+        let error = source
+            .ensure_unchanged()
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("final fence missed other client"))?;
+        ensure!(error.to_string().contains("1 other client session"));
+        source.close().await?;
+        sqlx::query("CREATE TABLE unknown_table ()")
+            .execute(&mut pg)
+            .await?;
+        pg.close().await?;
+        let error = Snapshot::open(&url)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("unknown table accepted"))?;
+        ensure!(
+            error
+                .to_string()
+                .contains("unknown source table \"public.unknown_table\"")
+        );
+        let mut pg = PgConnection::connect(&url).await?;
+        sqlx::query("DROP TABLE unknown_table")
+            .execute(&mut pg)
+            .await?;
+        sqlx::query("ALTER TABLE normalized ADD COLUMN unknown_column text")
+            .execute(&mut pg)
+            .await?;
+        pg.close().await?;
+        let error = Snapshot::open(&url)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("unknown column accepted"))?;
+        ensure!(error.to_string().contains("unknown_column"));
+        let mut pg = PgConnection::connect(&url).await?;
+        sqlx::query("ALTER TABLE normalized DROP COLUMN unknown_column")
+            .execute(&mut pg)
+            .await?;
+        // Database detail includes the duplicated secret; public diagnostics
+        // must retain the useful SQLSTATE without printing that value.
+        let db_error = sqlx::query("INSERT INTO watermarks VALUES('synthetic',now(),2)")
+            .execute(&mut pg)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected duplicate"))?;
+        let diagnostic = hx_move::diagnostics::diagnostic(&db_error.into(), &url);
+        ensure!(diagnostic.contains("23505") && !diagnostic.contains("synthetic"));
+        pg.close().await?;
+        let dir = tempfile::tempdir()?;
+        let options = Options {
+            postgres_url: url.clone(),
+            source_data_dir: dir.path().join("legacy"),
+            state_dir: dir.path().join("moved"),
+            verify_all_blobs: false,
+            allow_empty: false,
+        };
+        let output = cli(&options, false).await?;
+        let stderr = String::from_utf8(output.stderr)?;
+        ensure!(
+            !output.status.success()
+                && stderr.contains("zero events")
+                && stderr.contains("--allow-empty")
+        );
+        ensure!(!options.state_dir.exists());
+        let output = cli(&options, true).await?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: hx_move::Report = serde_json::from_slice(&output.stdout)?;
+        ensure!(report.tables["events"].rows == 0);
+        Ok(())
+    })
+    .await
+}
+
+async fn cli(options: &Options, allow_empty: bool) -> Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_hx-move"));
+    cmd.env("HX_MOVE_POSTGRES_URL", &options.postgres_url)
+        .arg("--source-data-dir")
+        .arg(&options.source_data_dir)
+        .arg("--state-dir")
+        .arg(&options.state_dir);
+    if allow_empty {
+        cmd.arg("--allow-empty");
+    }
+    Ok(cmd.output().await?)
+}
+
+#[tokio::test]
+#[ignore = "requires a scratch Postgres service"]
+async fn cli_reports_all_blob_problems_and_only_published_citations_block() -> Result<()> {
+    support::with_database(|url| async move {
+        let mut pg = PgConnection::connect(&url).await?;
+        FROZEN.run(&mut pg).await?;
+        sqlx::query("INSERT INTO events(id,observation_id,connector_instance,source_key,revision,kind,source_start,observed_at,sensitivity,envelope) VALUES(1,'synthetic','synthetic:test','synthetic','0','synthetic.point',now(),now(),'normal','{}')").execute(&mut pg).await?;
+        sqlx::query("INSERT INTO windows(start_at,end_at) VALUES('2026-01-02T04:00:00Z','2026-01-02T08:00:00Z')").execute(&mut pg).await?;
+        sqlx::query("INSERT INTO revisions(start_at,input_generation,interpretation,output_key,agent_run) VALUES('2026-01-02T04:00:00Z',0,'{\"episodes\":[{\"evidence\":[777777]}]}','synthetic','{\"calls\":[{\"result\":{\"evidence\":[888888]}}]}')").execute(&mut pg).await?;
+        pg.close().await?;
+        let dir = tempfile::tempdir()?;
+        let options = Options {postgres_url:url.clone(),source_data_dir:dir.path().join("legacy"),state_dir:dir.path().join("moved"),verify_all_blobs:false,allow_empty:false};
+        let output = cli(&options,false).await?;
+        let stderr = String::from_utf8(output.stderr)?;
+        ensure!(!output.status.success() && stderr.contains("unresolved citation"));
+        ensure!(!stderr.contains("777777") && !stderr.contains("888888") && !options.state_dir.exists());
+        // Preserve the failed tool lookup, remove only the invalid published
+        // citation, and check every blob error is reported by the real CLI.
+        let mut pg = PgConnection::connect(&url).await?;
+        sqlx::query("ALTER TABLE revisions DISABLE TRIGGER USER").execute(&mut pg).await?;
+        sqlx::query("UPDATE revisions SET interpretation='{}'").execute(&mut pg).await?;
+        sqlx::query("ALTER TABLE revisions ENABLE TRIGGER USER").execute(&mut pg).await?;
+        let hashes: Vec<_> = [b"missing-one".as_slice(),b"missing-two",b"wrong-size",b"wrong-hash"].into_iter().map(hx_store::hash).collect();
+        for sha in &hashes {
+            sqlx::query("INSERT INTO blobs(sha256,bytes,published) VALUES($1,10,true)").bind(sha).execute(&mut pg).await?;
+        }
+        pg.close().await?;
+        for (index,bytes) in [(2,b"short".as_slice()),(3,b"0123456789")] {
+            let sha = &hashes[index];
+            let path = options.source_data_dir.join("blobs").join(&sha[..2]).join(sha);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path,bytes)?;
+        }
+        let output = cli(&options,false).await?;
+        let stderr = String::from_utf8(output.stderr)?;
+        ensure!(!output.status.success() && stderr.contains("4 problem(s)"),"{stderr}");
+        ensure!(hashes.iter().all(|sha|stderr.contains(sha)));
+        ensure!(stderr.contains("file unavailable") && stderr.contains("size mismatch") && stderr.contains("SHA-256 mismatch"));
+        ensure!(!stderr.contains("0123456789") && !stderr.contains("888888") && !options.state_dir.exists());
+        // Retry must reach the same complete diagnostic without manual cleanup.
+        let retry = cli(&options,false).await?;
+        ensure!(retry.stderr == stderr.as_bytes() && !retry.status.success());
+        Ok(())
+    }).await
 }

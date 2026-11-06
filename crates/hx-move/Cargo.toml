@@ -16,6 +16,10 @@ serde_json.workspace = true
 tokio.workspace = true
 sqlx = { workspace = true, features = ["postgres"] }
 sha2.workspace = true
+md-5 = { version = "0.11", default-features = false }
+chrono.workspace = true
+url = "2"
+percent-encoding = "2"
 hex.workspace = true
 tempfile.workspace = true
 clap = { workspace = true, features = ["env"] }
@@ -25,4 +29,3 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hx-server = { path = "../hx-server" }
 hx-compile.workspace = true
 hx-schema.workspace = true
-chrono.workspace = true

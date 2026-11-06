@@ -61,7 +61,7 @@ jobs:
       - name: Move and verify a fresh migration-10 synthetic database
         env:
           HX_MOVE_TEST_POSTGRES: postgres://hx:hx@localhost:5432/hx
-        run: cargo test -p hx-move --test postgres -- --ignored
+        run: cargo test -p hx-move -- --ignored
 
   rust-macos:
     name: Rust (macOS, capture agent)
