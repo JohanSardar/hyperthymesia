@@ -218,7 +218,7 @@ pub fn target_table(table: &Table) -> Table {
         "event_blobs" => "event_id,sha256",
         "watermarks" => "connector_instance",
         "device_tokens" => "hash",
-        "ocr_jobs" => "sha256,engine_version",
+        "ocr_jobs" => "sha256,engine_version,scope",
         _ => table.key,
     };
     match table.name {
@@ -226,6 +226,8 @@ pub fn target_table(table: &Table) -> Table {
         "jobs" => target
             .columns
             .extend([("window_start", 't'), ("generation", 'i')]),
+        // Postgres only ever ran OCR on the server: the empty scope, never a device's.
+        "ocr_jobs" | "ocr_evidence" => target.columns.push(("scope", 's')),
         _ => {}
     }
     target
