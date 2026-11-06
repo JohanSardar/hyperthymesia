@@ -47,6 +47,12 @@ pub fn valid_hash(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+fn random_secret() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(hex::encode(bytes))
+}
 pub fn window_at(t: DateTime<Utc>) -> Interval {
     let start = DateTime::from_timestamp(t.timestamp().div_euclid(14400) * 14400, 0)
         .expect("valid timestamp");
@@ -71,10 +77,7 @@ impl Store {
         {
             bail!("unknown scope");
         }
-        let mut bytes = [0_u8; 32];
-        use std::io::Read;
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        let secret = hex::encode(bytes);
+        let secret = random_secret()?;
         sqlx::query("INSERT INTO device_tokens(hash,name,prefixes,scopes) VALUES($1,$2,$3,$4)")
             .bind(hash(secret.as_bytes()))
             .bind(name)
@@ -781,6 +784,9 @@ mod concurrency_tests;
 
 mod reads;
 pub use reads::*;
+
+mod pairing;
+pub use pairing::TokenInfo;
 
 mod processing;
 pub use processing::*;
