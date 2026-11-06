@@ -425,3 +425,25 @@ async fn online_backup_restores_identical_citations_and_search() -> Result<()> {
     }
     Ok(())
 }
+
+// A backup is a whole life's record, wherever `--to` happens to point.
+#[tokio::test]
+async fn backup_is_private_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let to = scratch.path().join("backup");
+    hx_store::Store::create(&state)
+        .await
+        .unwrap()
+        .pool
+        .close()
+        .await;
+    hx_store::backup::backup(&state, &to).await.unwrap();
+    let mode =
+        |path: std::path::PathBuf| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(to.clone()), 0o700);
+    for name in ["core.sqlite", "agent.sqlite", "manifest.json"] {
+        assert_eq!(mode(to.join(name)), 0o600, "{name}");
+    }
+}
