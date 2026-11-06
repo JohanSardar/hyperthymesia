@@ -1,5 +1,9 @@
 # Unknowns for connectors and providers (#31)
 
+This is a historical probe report. The current server uses SQLite without a
+database service; use the [README](../../README.md) for installation and current
+source setup. The outcomes below describe the build at the time of the probes.
+
 Checked 2026-11-05 on macOS with fx 0.0.16 (build `481104fd`, the `v0.0.16` tag) and gws 0.22.5.
 Nothing used a real login, real data or a paid model. Probes ran under empty temp HOMEs, with made-up
 logins, a local stub model and a throwaway Postgres. The stub relies on fx's own test hooks
