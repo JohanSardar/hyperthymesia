@@ -38,6 +38,16 @@ enum Command {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// Print a single-use pairing link, valid for 15 minutes.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Pair {
+        #[command(subcommand)]
+        command: Option<PairCommand>,
+        #[arg(long, default_value = "http://127.0.0.1:7377")]
+        url: String,
+        #[arg(long, required = true)]
+        name: Option<String>,
+    },
     Compile {
         #[arg(long)]
         from: DateTime<Utc>,
@@ -53,7 +63,18 @@ enum Command {
     Gc,
 }
 #[derive(Subcommand)]
+enum PairCommand {
+    /// List code hash IDs and metadata, never the pairing secrets.
+    List,
+    /// Revoke a full code ID from pair list. Does not revoke an issued token.
+    Revoke { id: String },
+}
+#[derive(Subcommand)]
 enum TokenCommand {
+    /// List token IDs, names, scopes, prefixes and revocation state (no secrets).
+    List,
+    /// Revoke the full token ID printed by token list. Effective next request.
+    Revoke { id: String },
     Create {
         #[arg(long)]
         name: String,
@@ -107,6 +128,74 @@ async fn main() -> Result<()> {
                     scopes,
                 },
         } => println!("{}", store.create_token(&name, prefix, scopes).await?),
+        Command::Token {
+            command: TokenCommand::List,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.list_tokens().await?)?
+            );
+        }
+        Command::Token {
+            command: TokenCommand::Revoke { id },
+        } => {
+            if !store.revoke_token(&id).await? {
+                bail!("token ID not found");
+            }
+            println!("Token revoked.");
+        }
+        Command::Pair {
+            command: Some(PairCommand::List),
+            ..
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.list_pair_codes().await?)?
+            );
+        }
+        Command::Pair {
+            command: Some(PairCommand::Revoke { id }),
+            ..
+        } => {
+            if !store.revoke_pair_code(&id).await? {
+                bail!("code ID not found");
+            }
+            println!("Pairing code revoked.");
+        }
+        Command::Pair {
+            command: None,
+            url,
+            name,
+        } => {
+            let server =
+                url::Url::parse(&url).map_err(|_| anyhow::anyhow!("invalid server URL"))?;
+            let loopback = server.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+            if server.host().is_none()
+                || !server.username().is_empty()
+                || server.password().is_some()
+                || server.query().is_some()
+                || server.fragment().is_some()
+                || !(server.scheme() == "https" || (server.scheme() == "http" && loopback))
+            {
+                bail!(
+                    "pairing requires a server URL with HTTPS (or loopback HTTP), without credentials, query or fragment"
+                );
+            }
+            let code = store
+                .create_pair_code(&name.context("--name is required")?)
+                .await?;
+            let mut link = url::Url::parse("hyperthymesia://pair")?;
+            link.query_pairs_mut()
+                .append_pair("server", server.as_str().trim_end_matches('/'))
+                .append_pair("code", &code);
+            println!("{link}");
+        }
         Command::Gc => println!("Expired {} blobs", store.gc().await?),
         Command::Compile { from, to, .. } => {
             for w in windows(from, to)? {
