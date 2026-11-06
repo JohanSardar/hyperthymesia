@@ -36,6 +36,33 @@ jobs:
       - name: test
         run: cargo test --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
 
+  mover-postgres:
+    name: Mover (synthetic Postgres cutover)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: hx
+          POSTGRES_PASSWORD: hx
+          POSTGRES_DB: hx
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U hx -d hx"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Move and verify a fresh migration-10 synthetic database
+        env:
+          HX_MOVE_TEST_POSTGRES: postgres://hx:hx@localhost:5432/hx
+        run: cargo test -p hx-move --test postgres -- --ignored
+
   rust-macos:
     name: Rust (macOS, capture agent)
     runs-on: macos-latest
