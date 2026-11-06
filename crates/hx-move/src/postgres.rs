@@ -218,6 +218,9 @@ impl Snapshot {
                                 .unwrap_or(Cell::Null),
                         );
                     }
+                    if matches!(table.name, "ocr_jobs" | "ocr_evidence") {
+                        cells.push(Cell::Text(String::new()));
+                    }
                     insert(&mut tx, &target, &cells).await?;
                 }
                 hash.add(&cells);
@@ -385,6 +388,7 @@ mod tests {
             sqlx::query("INSERT INTO events(id,observation_id,connector_instance,source_key,revision,kind,source_start,observed_at,sensitivity,envelope) VALUES(41,'synthetic','synthetic:test','source-key','revision-value','synthetic.point','2026-01-02T04:00:00.123456Z','2026-01-02T04:00:00Z','normal','{\"z\":1e24,\"a\":-0.0}')").execute(&mut pg).await?;
             sqlx::query("INSERT INTO normalized(event_id,normalizer_version,payload,search_text) VALUES(41,'synthetic','{\"z\":1e-8,\"a\":2}','syntheticneedle')").execute(&mut pg).await?;
             sqlx::query("INSERT INTO blobs(sha256,bytes,published) VALUES($1,2,true)").bind("a".repeat(64)).execute(&mut pg).await?;
+            sqlx::query("INSERT INTO ocr_jobs(sha256,engine_version,source_event_id,status,result) VALUES($1,'synthetic-ocr/v1',41,'complete','{\"lines\":[]}')").bind("a".repeat(64)).execute(&mut pg).await?;
             pg.close().await?;
             let mut source = Snapshot::open(&url).await?;
             let audit = SourceAudit::read(&mut source).await?;
@@ -400,6 +404,17 @@ mod tests {
                 if expected_error.is_empty() { result?; }
                 else { ensure!(result.is_err_and(|error| error.to_string().contains(expected_error)),"independent audit missed wrong reader: {expected_error}"); }
             }
+            // A moved job can only be server-run. Both checks must refuse a device scope.
+            let dir = tempfile::tempdir()?;
+            let store = Store::create(dir.path()).await?;
+            let hashes = source.load_with(&store, Table::postgres_select).await?;
+            core::verify(&store, &hashes).await?;
+            audit.verify(&store).await?;
+            sqlx::query("UPDATE ocr_jobs SET scope='synthetic:device'").execute(&store.pool).await?;
+            ensure!(core::verify(&store, &hashes).await.is_err(), "row check missed a moved scope");
+            let result = audit.verify(&store).await;
+            ensure!(result.is_err_and(|error| error.to_string().contains("ocr_jobs.scope")), "independent audit missed a moved scope");
+            store.pool.close().await;
             source.close().await?;
             Ok(())
         }).await
