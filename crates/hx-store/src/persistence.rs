@@ -110,3 +110,34 @@ pub async fn record_revision_dependencies(
     }
     Ok(())
 }
+
+/// Object containment for revision identities: missing differs from JSON null,
+/// extra stored fields are allowed, and every requested field participates.
+pub(crate) fn json_contains(stored: &Value, requested: &Value) -> bool {
+    match (stored, requested) {
+        (Value::Object(a), Value::Object(b)) => b.iter().all(|(k, v)| {
+            a.get(k).is_some_and(|a| {
+                std::mem::discriminant(a) == std::mem::discriminant(v) && json_contains(a, v)
+            })
+        }),
+        (Value::Array(a), Value::Array(b)) => b.iter().all(|b| {
+            a.iter()
+                .any(|a| a.is_array() == b.is_array() && json_contains(a, b))
+        }),
+        (Value::Array(a), b) if !b.is_object() => {
+            a.iter().any(|a| !a.is_array() && json_contains(a, b))
+        }
+        (Value::Number(_), Value::Number(_)) => {
+            let normalize = |v: &Value| {
+                let s = stored_json(v.clone());
+                if s.contains('.') {
+                    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+                } else {
+                    s
+                }
+            };
+            normalize(stored) == normalize(requested)
+        }
+        _ => stored == requested,
+    }
+}

@@ -2,34 +2,89 @@
 use super::*;
 impl Store {
     pub async fn discover_ocr(&self, version: &str) -> Result<()> {
-        let mut tx = self.begin_write().await?;
-        sqlx::query("INSERT INTO ocr_jobs(sha256,engine_version,source_event_id,available_at) SELECT sha256,$1,id,$2 FROM (SELECT b.sha256,e.id,e.source_start,row_number() OVER (PARTITION BY b.sha256 ORDER BY e.source_start,e.id) AS rn FROM events e JOIN event_blobs eb ON eb.event_id=e.id JOIN blobs b USING(sha256) WHERE e.kind='media.still' AND b.published AND NOT b.evidence_expired AND NOT EXISTS(SELECT 1 FROM ocr_jobs o WHERE o.sha256=b.sha256 AND o.engine_version=$1)) WHERE rn=1 ORDER BY sha256,source_start,id LIMIT 128 ON CONFLICT DO NOTHING")
-            .bind(version).bind(Ts::now()).execute(&mut *tx).await?;
-        tx.commit().await?;
+        // IDs are allocated and committed under the same single writer. No
+        // lower event ID can commit after this snapshot's cursor. Source time
+        // is deliberately not the cursor: old observations may arrive today.
+        let cursor: (i64, String) =
+            sqlx::query_as("SELECT event_id,sha256 FROM ocr_scan_progress WHERE engine_version=$1")
+                .bind(version)
+                .fetch_optional(&self.pool)
+                .await?
+                .unwrap_or_default();
+        let sources: Vec<(i64,Option<String>)> = sqlx::query_as("SELECT e.id,eb.sha256 FROM events e INDEXED BY events_stills LEFT JOIN event_blobs eb ON eb.event_id=e.id WHERE e.kind='media.still' AND e.id >= $1 AND (e.id>$1 OR eb.sha256>$2) ORDER BY e.id,eb.sha256 LIMIT 128")
+            .bind(cursor.0).bind(&cursor.1).fetch_all(&self.pool).await?;
+        if let Some(last) = sources.last() {
+            let mut tx = self.begin_write().await?;
+            for (source, sha) in &sources {
+                let Some(sha) = sha else { continue };
+                sqlx::query(
+                    "INSERT INTO ocr_pending_sources(engine_version,source_event_id,sha256) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+                )
+                .bind(version)
+                .bind(source)
+                .bind(sha)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query("INSERT INTO ocr_scan_progress VALUES($1,$2,$3) ON CONFLICT(engine_version) DO UPDATE SET event_id=EXCLUDED.event_id,sha256=EXCLUDED.sha256 WHERE (event_id,sha256)<(EXCLUDED.event_id,EXCLUDED.sha256)")
+                .bind(version).bind(last.0).bind(last.1.as_deref().unwrap_or("")).execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+        // Pending associations retain unpublished blobs and unfinished results.
+        // Candidate scans are reads; only point rechecks and <=128 inserts hold
+        // the writer. Empty, caught-up passes take no write transaction at all.
+        let candidates: Vec<(i64,String)> = sqlx::query_as("SELECT (SELECT e.id FROM event_blobs eb JOIN events e ON e.id=eb.event_id WHERE eb.sha256=p.sha256 AND e.kind='media.still' ORDER BY e.source_start,e.id LIMIT 1),p.sha256 FROM ocr_pending_sources p CROSS JOIN blobs b ON b.sha256=p.sha256 WHERE p.engine_version=$1 AND NOT p.settled AND b.published AND NOT b.evidence_expired AND NOT EXISTS(SELECT 1 FROM ocr_jobs o WHERE o.sha256=p.sha256 AND o.engine_version=$1) ORDER BY p.source_event_id,p.sha256 LIMIT 128")
+            .bind(version).fetch_all(&self.pool).await?;
+        if !candidates.is_empty() {
+            let mut tx = self.begin_write().await?;
+            let now = Ts::now();
+            for (source, sha) in candidates {
+                sqlx::query("INSERT INTO ocr_jobs(sha256,engine_version,source_event_id,available_at) SELECT sha256,$1,$2,$3 FROM blobs WHERE sha256=$4 AND published AND NOT evidence_expired ON CONFLICT DO NOTHING")
+                    .bind(version).bind(source).bind(now).bind(sha).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+        }
         self.publish_ocr_lineage(version).await
     }
 
     pub async fn publish_ocr_lineage(&self, version: &str) -> Result<()> {
-        let mut tx = self.begin_write().await?;
-        let candidates: Vec<(i64,String,String,Ts)> = sqlx::query_as("SELECT e.id,o.sha256,o.engine_version,e.source_start FROM ocr_jobs o JOIN event_blobs eb USING(sha256) JOIN events e ON e.id=eb.event_id WHERE o.engine_version=$1 AND o.status='complete' AND e.kind='media.still' AND NOT EXISTS(SELECT 1 FROM ocr_evidence d WHERE d.source_event_id=e.id AND d.sha256=o.sha256 AND d.engine_version=o.engine_version) ORDER BY e.source_start,e.id LIMIT 128")
-            .bind(version).fetch_all(&mut *tx).await?;
-        let mut times = Vec::new();
-        for (source, sha, engine, at) in candidates {
-            if tx.insert_evidence(sqlx::query_scalar("INSERT INTO ocr_evidence(id,source_event_id,sha256,engine_version,observation_id) VALUES((SELECT next_id FROM evidence_seq),$1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id")
-                .bind(source).bind(sha).bind(engine).bind(hx_schema::ObservationId::generate().to_string())).await?.is_some() {
-                times.push(DateTime::<Utc>::from(at));
-            }
+        let candidates: Vec<(i64,String)> = sqlx::query_as("SELECT p.source_event_id,p.sha256 FROM ocr_pending_sources p CROSS JOIN ocr_jobs o ON o.sha256=p.sha256 AND o.engine_version=p.engine_version WHERE p.engine_version=$1 AND NOT p.settled AND o.status IN ('complete','sampled','failed') ORDER BY p.source_event_id,p.sha256 LIMIT 16")
+            .bind(version).fetch_all(&self.pool).await?;
+        if candidates.is_empty() {
+            return Ok(());
         }
+        // A lineage batch may dirty two large timelines per source. Keep it
+        // smaller than discovery so those row updates also bound writer time.
+        let mut tx = self.begin_write().await?;
         let mut windows = std::collections::BTreeMap::new();
-        for at in times {
-            // A point can also be evidence in the next window's 30-minute overlap.
-            for w in [window_at(at), window_at(at + Duration::minutes(30))] {
-                windows.insert(w.start, w);
+        for (source, sha) in candidates {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM ocr_jobs WHERE sha256=$1 AND engine_version=$2",
+            )
+            .bind(&sha)
+            .bind(version)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if status.as_deref() == Some("complete")
+                && tx.insert_evidence(sqlx::query_scalar("INSERT INTO ocr_evidence(id,source_event_id,sha256,engine_version,observation_id) VALUES((SELECT next_id FROM evidence_seq),$1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id")
+                    .bind(source).bind(&sha).bind(version).bind(hx_schema::ObservationId::generate().to_string())).await?.is_some() {
+                    let at: Ts = sqlx::query_scalar("SELECT source_start FROM events WHERE id=$1").bind(source).fetch_one(&mut *tx).await?;
+                    let at = DateTime::<Utc>::from(at);
+                    for w in [window_at(at),window_at(at+Duration::minutes(30))] { windows.insert(w.start,w); }
+            }
+            if status.as_deref() == Some("complete") {
+                sqlx::query("DELETE FROM ocr_pending_sources WHERE engine_version=$1 AND source_event_id=$2 AND sha256=$3")
+                    .bind(version).bind(source).bind(&sha).execute(&mut *tx).await?;
+            } else if matches!(status.as_deref(), Some("sampled" | "failed")) {
+                // Keep dormant associations for an operator reset without
+                // making idle scans revisit terminal history.
+                sqlx::query("UPDATE ocr_pending_sources SET settled=1 WHERE engine_version=$1 AND source_event_id=$2 AND sha256=$3")
+                    .bind(version).bind(source).bind(&sha).execute(&mut *tx).await?;
             }
         }
         for w in windows.values() {
             let generation: i64 = sqlx::query_scalar("INSERT INTO windows(start_at,end_at) VALUES($1,$2) ON CONFLICT(start_at) DO UPDATE SET generation=windows.generation+1,dirty=true RETURNING generation")
-            .bind(Ts::from(w.start)).bind(Ts::from(w.end)).fetch_one(&mut *tx).await?;
+                .bind(Ts::from(w.start)).bind(Ts::from(w.end)).fetch_one(&mut *tx).await?;
             request_window_job(&mut tx, "compile", *w, generation, Ts::now()).await?;
         }
         tx.commit().await?;

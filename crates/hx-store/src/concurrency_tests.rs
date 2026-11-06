@@ -91,20 +91,34 @@ async fn interpretation_lock_releases_on_process_death_and_drop() {
     );
 }
 
-/// The only test hook is *after* a per-blob commit, outside all write work.
-/// Keeping the hook at the loop boundary makes the test fail if the writer is
-/// instead held across the whole run: the observer cannot see the first delete.
+/// Commit observation lives inside WriteTransaction::commit, before it returns.
+/// Thus moving unlink after commit cannot race ahead of the test's observation.
+/// The second deletion is ordered before upload admission, then paused after
+/// commit until that upload finishes. Hooks exist only in unit-test builds.
 #[derive(Default)]
 pub(crate) struct GcBoundary {
     committed: tokio::sync::Notify,
     resume: tokio::sync::Notify,
     seen: std::sync::atomic::AtomicBool,
+    deleting: tokio::sync::Notify,
+    delete: tokio::sync::Notify,
+    second_committed: tokio::sync::Notify,
+    finish: tokio::sync::Notify,
 }
 impl GcBoundary {
+    pub(crate) async fn before_unlink(&self) {
+        if self.seen.load(std::sync::atomic::Ordering::SeqCst) {
+            self.deleting.notify_one();
+            self.delete.notified().await;
+        }
+    }
     pub(crate) async fn after_commit(&self) {
         if !self.seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
             self.committed.notify_one();
             self.resume.notified().await;
+        } else {
+            self.second_committed.notify_one();
+            self.finish.notified().await;
         }
     }
 }
@@ -153,11 +167,11 @@ async fn reupload_during_gc_keeps_its_file_and_does_not_wait_for_other_blobs() {
     );
     assert!(!gc.is_finished());
 
-    // Both candidates for the second blob wait behind a separate short writer.
-    // Either ordering is safe: upload first refreshes retention, GC first unlinks
-    // then upload republishes. Neither may error or leave a published missing file.
-    let gate = observer.begin_write().await.unwrap();
+    // Force GC to own the second blob's writer before starting its upload.
     boundary.resume.notify_one();
+    timeout(Wait::from_secs(5), boundary.deleting.notified())
+        .await
+        .unwrap();
     let upload_store = observer.clone();
     let upload_sha = second.clone();
     let upload_bytes = other_bytes.to_vec();
@@ -168,13 +182,21 @@ async fn reupload_during_gc_keeps_its_file_and_does_not_wait_for_other_blobs() {
         !reupload.is_finished(),
         "second writer must wait for the gate"
     );
-    assert!(!gc.is_finished(), "GC must also wait for the gate");
-    gate.commit().await.unwrap();
+    assert!(!gc.is_finished(), "GC must wait at the deletion barrier");
+    boundary.delete.notify_one();
+    timeout(Wait::from_secs(5), boundary.second_committed.notified())
+        .await
+        .unwrap();
     timeout(Wait::from_secs(5), &mut reupload)
         .await
         .expect("upload must succeed within busy_timeout")
         .unwrap()
         .unwrap();
+    assert!(
+        !gc.is_finished(),
+        "upload must finish while GC is paused just after commit"
+    );
+    boundary.finish.notify_one();
     let expired = timeout(Wait::from_secs(5), &mut gc)
         .await
         .expect("GC must succeed within busy_timeout")

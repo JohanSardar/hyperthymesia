@@ -12,9 +12,9 @@ impl Fixture {
         let store = Store::create(dir.path()).await.unwrap();
         Self { store, _dir: dir }
     }
-    /// Build synthetic legacy records in the current schema. `migrate` below
+    /// Build synthetic legacy records in the current schema. `apply_legacy_admission_fixture` below
     /// models only the paid-admission metadata applied by the future mover.
-    pub async fn through_migration(_version: i64) -> Self {
+    pub async fn legacy_admission_fixture() -> Self {
         Self::new().await
     }
     pub async fn close(self) {
@@ -38,7 +38,7 @@ pub struct JobState {
     pub revivals: i32,
 }
 impl Store {
-    pub async fn migrate(&self) -> Result<()> {
+    pub async fn apply_legacy_admission_fixture(&self) -> Result<()> {
         // Synthetic equivalent of the legacy admission repair; never production startup.
         let mut tx = self.begin_write().await?;
         let now = Ts::now();
