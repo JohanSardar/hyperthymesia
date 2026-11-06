@@ -426,6 +426,13 @@ pub struct Runner<P> {
 impl<P: Provider> Handler for Runner<P> {
     async fn handle(&self, job: &Job) -> Result<()> {
         match job.kind.as_str() {
+            "pull" => {
+                let recipe = job.payload["recipe"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("pull job requires recipe"))?;
+                let report = crate::pull::run(&self.store, recipe, Utc::now()).await?;
+                tracing::info!(recipe, ?report, "source pull finished");
+            }
             "normalize" => {
                 if let Some(id) = job.payload["event_id"].as_i64() {
                     self.store.normalize(id).await?;
@@ -535,6 +542,7 @@ pub async fn schedule(store: &Store) -> Result<()> {
     store.generation(current).await?;
     store.schedule_compilations().await?;
     store.schedule_daily_sweep(Utc::now()).await?;
+    crate::pull::schedule(store, Utc::now()).await?;
     Ok(())
 }
 

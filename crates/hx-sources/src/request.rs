@@ -1,4 +1,4 @@
-//! Transport-neutral request shapes. Only HTTP is executed in this piece.
+//! Bounded HTTP and host CLI requests. MCP transport is supplied by P16.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -64,6 +64,24 @@ pub enum RequestError {
     TooLarge,
     #[error("HTTP response is not JSON")]
     Json,
+    #[error("MCP transport is not implemented (P16)")]
+    McpUnavailable,
+    #[error("invalid CLI request")]
+    CliInvalid,
+    #[error("host command blocked: {0}")]
+    HostBlocked(&'static str),
+    #[error("host command deadline exceeded")]
+    HostDeadline,
+    #[error("host command output exceeds 1 MB")]
+    HostOutputLimit,
+    #[error("host command could not start or read output")]
+    HostIo,
+    #[error("host command exited with code {0}")]
+    Exit(i32),
+    #[error("host command terminated by signal")]
+    Signal,
+    #[error("host command response is not JSON")]
+    CliJson,
 }
 
 impl RequestError {
@@ -77,6 +95,57 @@ impl RequestError {
 }
 
 impl Request {
+    /// No retries and no model. CLI argv remain literal arguments, including
+    /// response-controlled cursors; no substituted text is evaluated as shell.
+    #[cfg(unix)]
+    pub async fn execute(
+        &self,
+        values: Placeholders<'_>,
+        timeout: Duration,
+        host: &crate::host::HostRunner,
+    ) -> Result<Value, RequestError> {
+        match self {
+            Self::Http { .. } => self.execute_http(values, timeout).await,
+            Self::Mcp { .. } => Err(RequestError::McpUnavailable),
+            Self::Cli { argv, env } => {
+                if timeout.is_zero() || argv.first().is_none_or(String::is_empty) {
+                    return Err(RequestError::CliInvalid);
+                }
+                let argv = argv
+                    .iter()
+                    .map(|arg| substitute(arg, values))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let env = env
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), substitute(value, values)?)))
+                    .collect::<Result<BTreeMap<_, _>, RequestError>>()?;
+                let command = argv
+                    .iter()
+                    .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let output =
+                    host.run(&command, &env, timeout)
+                        .await
+                        .map_err(|error| match error {
+                            crate::host::HostError::Blocked(reason) => {
+                                RequestError::HostBlocked(reason)
+                            }
+                            crate::host::HostError::Deadline => RequestError::HostDeadline,
+                            crate::host::HostError::OutputLimit => RequestError::HostOutputLimit,
+                            crate::host::HostError::Io(_) => RequestError::HostIo,
+                        })?;
+                if !output.status.success() {
+                    return Err(match output.status.code() {
+                        Some(code) => RequestError::Exit(code),
+                        None => RequestError::Signal,
+                    });
+                }
+                serde_json::from_slice(&output.stdout).map_err(|_| RequestError::CliJson)
+            }
+        }
+    }
+
     /// One HTTP exchange, no retries. Timeout covers headers and the entire body.
     /// Scrub the returned JSON before mapping, saving, or returning it to a model.
     pub async fn execute_http(

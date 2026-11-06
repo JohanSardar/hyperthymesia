@@ -5,6 +5,7 @@ pub mod fx;
 pub mod mcp;
 pub mod ocr;
 pub mod processing;
+pub mod pull;
 pub mod sources;
 use axum::{
     Extension, Json, Router,
