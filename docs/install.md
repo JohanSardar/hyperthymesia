@@ -98,9 +98,9 @@ a live lease. It never migrates, revives jobs or calls a provider.
 without requiring login. Doctor without state retains provider-only checks.
 
 Next: `hx-server --state-dir "$STATE" pair --url URL --name DEVICE`, then
-`hx-agent pair '<link>'` or the app's pairing action. This requires the pairing
-server piece in the installed release; installation prints the next step and
-never claims to have paired a device. Open the app and grant permissions.
+`hx-agent pair '<link>'` or the app's pairing action. Installation prints the
+next step and never claims to have paired a device. Open the app and grant
+permissions.
 
 For remote access use `tailscale serve --bg 7377` and its HTTPS URL, or maintain
 `ssh -N -L 7377:127.0.0.1:7377 user@host` with `http://127.0.0.1:7377`.
