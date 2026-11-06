@@ -10,7 +10,7 @@ use hx_sources::{
     host::HostRunner,
     keys::KeyStore,
     recipe::{MapContext, PullMapper, Recipe},
-    request::{MAX_TIMEOUT, Placeholders},
+    request::{MAX_TIMEOUT, Placeholders, RequestGate},
 };
 use hx_store::Store;
 use serde_json::{Value, json};
@@ -143,23 +143,16 @@ impl Broker {
                 .await?;
             return Ok(json!({"id":saved.id,"enabled":saved.enabled,"owner_off":saved.owner_off}));
         }
-        let identity = hx_store::sources::recipe_identity(&recipe)?;
-        ensure!(
-            !self
-                .store
-                .recipes(Some(source_id))
-                .await?
-                .iter()
-                .any(|r| r.identity_hash == identity && r.owner_off),
-            "pull is off; only the owner can enable it"
-        );
+        let exchange =
+            self.store
+                .recipe_exchange(source_id, &recipe, None, self.setup_generation)?;
+        exchange.check().await?;
         let key = KeyStore::new(&self.store.data_dir)?.read(source_id)?;
         let filter = self.secret_filter().await?;
         let work = tempfile::tempdir()?;
         let host = HostRunner::from_env(self.store.data_dir.clone(), work.path().to_owned());
         self.check_source(args).await?;
-        let response = recipe
-            .request
+        let response = exchange
             .execute(
                 Placeholders {
                     key: key.as_deref(),

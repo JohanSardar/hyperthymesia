@@ -2,8 +2,8 @@
 use crate::{
     host::{HostRunner, OUTPUT_LIMIT, ProcessGroup},
     request::{
-        MAX_HTTP_RESPONSE_BYTES, MAX_TIMEOUT, McpTransport, Placeholders, RequestError, substitute,
-        substitute_json, substitute_url,
+        MAX_HTTP_RESPONSE_BYTES, MAX_TIMEOUT, McpTransport, Placeholders, RequestError,
+        RequestGate, substitute, substitute_json, substitute_url,
     },
 };
 use serde_json::{Value, json};
@@ -56,6 +56,7 @@ pub(crate) async fn execute(
     values: Placeholders<'_>,
     timeout: Duration,
     host: &HostRunner,
+    gate: &impl RequestGate,
 ) -> Result<Value, RequestError> {
     if timeout.is_zero() || tool.is_empty() || tool.len() > 256 {
         return Err(RequestError::McpUnavailable);
@@ -63,15 +64,20 @@ pub(crate) async fn execute(
     let call = lookup(tool, substitute_json(arguments, values)?);
     tokio::time::timeout(timeout.min(MAX_TIMEOUT), async {
         match transport {
-            McpTransport::Http { url } => http(url, &call, values).await,
-            McpTransport::Stdio { argv } => stdio(argv, &call, values, host).await,
+            McpTransport::Http { url } => http(url, &call, values, gate).await,
+            McpTransport::Stdio { argv } => stdio(argv, &call, values, host, gate).await,
         }
     })
     .await
     .map_err(|_| RequestError::Transport)?
 }
 
-async fn http(url: &str, call: &Value, values: Placeholders<'_>) -> Result<Value, RequestError> {
+async fn http(
+    url: &str,
+    call: &Value,
+    values: Placeholders<'_>,
+    gate: &impl RequestGate,
+) -> Result<Value, RequestError> {
     let url = substitute_url(url, values)?;
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -92,6 +98,7 @@ async fn http(url: &str, call: &Value, values: Placeholders<'_>) -> Result<Value
                 .map_err(|_| RequestError::Invalid)?,
         );
     }
+    gate.check().await?;
     let response = client
         .post(url.clone())
         .headers(headers.clone())
@@ -114,6 +121,7 @@ async fn http(url: &str, call: &Value, values: Placeholders<'_>) -> Result<Value
         "mcp-protocol-version",
         version.parse().map_err(|_| RequestError::McpUnavailable)?,
     );
+    gate.check().await?;
     let notified = client
         .post(url.clone())
         .headers(headers.clone())
@@ -124,6 +132,7 @@ async fn http(url: &str, call: &Value, values: Placeholders<'_>) -> Result<Value
     if !notified.status().is_success() {
         return Err(RequestError::Status(notified.status().as_u16()));
     }
+    gate.check().await?;
     let response = client
         .post(url)
         .headers(headers)
@@ -179,6 +188,7 @@ async fn stdio(
     call: &Value,
     values: Placeholders<'_>,
     host: &HostRunner,
+    gate: &impl RequestGate,
 ) -> Result<Value, RequestError> {
     if argv.first().is_none_or(String::is_empty) {
         return Err(RequestError::CliInvalid);
@@ -192,6 +202,7 @@ async fn stdio(
         .key
         .map(|key| BTreeMap::from([("SOURCE_KEY".into(), key.into())]))
         .unwrap_or_default();
+    gate.check().await?;
     let mut child = host
         .command(&command, &env)
         .map_err(|error| match error {
@@ -215,6 +226,7 @@ async fn stdio(
             let mut bytes =
                 serde_json::to_vec(&message).map_err(|_| RequestError::McpUnavailable)?;
             bytes.push(b'\n');
+            gate.check().await?;
             input
                 .write_all(&bytes)
                 .await
