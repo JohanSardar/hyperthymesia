@@ -431,15 +431,16 @@ impl Broker {
         let mut revisions = vec![];
         for row in rows {
             let value: Value = row.interpretation;
-            // Prose cannot be selectively redacted. Fail closed for legacy/changed policies.
-            if value["input_manifest"]["disclosure_policy"]["digest"] != self.policy.digest()
-                || value["input_manifest"]["sensitive_egress"] != json!(self.sensitive)
+            if crate::disclosure::revision_disclosable(
+                &self.store,
+                &value,
+                &self.policy,
+                self.sensitive,
+            )
+            .await?
             {
-                continue;
-            }
-            let ids = revision_evidence(&value);
-            if self.allowed_ids(&ids).await? {
-                revisions.push(json!({"revision_id":row.id,"episodes":value["episodes"],"tasks":value["tasks"],"summary":value["summary"],"evidence":ids,"self_generated":true}));
+                let ids = revision_evidence(&value);
+                revisions.push(json!({"revision_id":row.id,"episodes":value["episodes"],"tasks":value["tasks"],"summary":value["summary"],"evidence":ids,"input_namespaces":value["input_manifest"]["input_namespaces"],"self_generated":true}));
             }
         }
         Ok(json!({"entities":entities,"revisions":revisions}))
@@ -473,6 +474,18 @@ impl Broker {
         } else {
             result
         };
+        if name == "prior_context" {
+            for revision in result["revisions"].as_array().into_iter().flatten() {
+                audit.input_namespaces.extend(
+                    revision["input_namespaces"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
         collect_evidence(&result, &mut audit.evidence);
         if let Some(value) = result.get("attention") {
             let lanes: Vec<hx_compile::Lane> = serde_json::from_value(value.clone())?;
@@ -787,7 +800,8 @@ pub(crate) async fn owner_allowed_ids(
 }
 
 fn visible(policy: &DisclosurePolicy, sensitive: SensitiveEgress, e: &Envelope) -> bool {
-    policy.effective_class(e) != Sensitivity::Restricted
+    !(sensitive == SensitiveEgress::Redact && e.connector_instance.as_str().starts_with("source:"))
+        && policy.effective_class(e) != Sensitivity::Restricted
         && !(sensitive == SensitiveEgress::Redact
             && policy.effective_class(e) == Sensitivity::Sensitive)
         && !matches!(e.kind.as_str(), "policy.gap" | "media.chunk")
