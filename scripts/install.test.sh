@@ -15,7 +15,7 @@ import tarfile
 import tempfile
 import zipfile
 
-SOURCE = Path('scripts/install.sh').resolve()
+SOURCE = Path(os.environ.get('HX_TEST_INSTALLER_SOURCE', 'scripts/install.sh')).resolve()
 PINS = (
     '2158a8d42e77457a774400d225d9802bb6c0e60a0bb0674a1116bc31252490d6',
     'f0fb822c7be546c80bcc89d50521bc1454435e0c6f586e8420c4e2b84fa80599',
@@ -50,11 +50,20 @@ with tempfile.TemporaryDirectory(prefix='hx-installer-test-') as tmp:
         path.chmod(0o755)
     stub('uname', 'case "$1" in -s) echo "$TEST_OS";; -m) echo "$TEST_ARCH";; *) exit 97;; esac\n')
     stub('curl', '''# Only the installer's -fsSL URL -o FILE interface is allowed.
+if [ "$#" -eq 6 ] && [ "$2" = --max-time ]; then shift 3; set -- -fsSL "$@"; fi
 [ "$#" -eq 4 ] && [ "$1" = -fsSL ] && [ "$3" = -o ] || exit 97
-case "$2" in file://*) cp "${2#file://}" "$4";; *) echo 'network forbidden' >&2; exit 97;; esac
+case "$2" in
+    file://*) cp "${2#file://}" "$4" ;;
+    http://127.0.0.1:7377/healthz) [ "${TEST_FAIL_STEP:-}" != health ] || exit 1; printf '{"status":"ok"}' > "$4" ;;
+    *) echo 'network forbidden' >&2; exit 97 ;;
+esac
 ''')
-    for command in ('launchctl', 'systemctl', 'loginctl', 'sudo', 'security'):
+    for command in ('sudo', 'security'):
         stub(command, 'echo "forbidden service command" >> "$TEST_COMMAND_LOG"; exit 97\n')
+    stub('systemctl', 'printf "%s\\n" "$*" >> "$TEST_COMMAND_LOG"; [ "$1" = --user ] || exit 97\n')
+    stub('launchctl', 'printf "%s\\n" "$*" >> "$TEST_COMMAND_LOG"; case "$*" in *gui/*) ;; *) exit 97;; esac; echo "state = running"\n')
+    stub('loginctl', '[ "$1" = show-user ] || exit 97; echo yes\n')
+    stub('sleep', 'exit 0\n')
     fixture = root / 'release'
     fixture.mkdir()
     fx = root / 'fx.tar.gz'
@@ -71,7 +80,36 @@ case "$2" in file://*) cp "${2#file://}" "$4";; *) echo 'network forbidden' >&2;
     installer.write_text(source)
     for platform in ('linux-x86_64', 'linux-aarch64', 'macos-aarch64'):
         archive(fixture / f'hx-server-0.1.0-{platform}.tar.gz', {
-            'hx-server': b'#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_SERVER_ARGS"\nprintf "%s\\n" "$TEST_ENV" > "$TEST_SERVER_ENV"\n',
+            'hx-server': b'''#!/bin/sh
+set -eu
+if [ "$1" = --version ]; then echo 'hx-server 0.1.0'; exit; fi
+[ "$1" = --state-dir ] || exit 97
+state=$2
+shift 2
+command=$1
+shift
+[ "${TEST_FAIL_STEP:-}" != "$command" ] || exit 1
+case "$command" in
+migrate) mkdir -p "$state/blobs" "$state/locks"; : >> "$state/core.sqlite"; : >> "$state/agent.sqlite"; chmod 600 "$state/"*.sqlite ;;
+status) [ "${TEST_HELD_LEASE:-}" != yes ] || exit 1; echo '{"running_interpret_leases":0}' ;;
+upgrade-guard) exec "$@" ;;
+backup) mkdir -p "$2"; cp "$state/core.sqlite" "$state/agent.sqlite" "$2/"; echo '{}' > "$2/manifest.json" ;;
+restore) mkdir -p "$state/blobs" "$state/locks"; cp "$2/core.sqlite" "$2/agent.sqlite" "$state/" ;;
+doctor)
+    case "$*" in
+        *--allow-older-schema*) : ;;
+        *--state-only*) [ "${TEST_FAIL_STEP:-}" != post-doctor ] || exit 1 ;;
+        *) [ "${TEST_FAIL_STEP:-}" != provider ] || exit 1 ;;
+    esac ;;
+install-link)
+    [ "$1" = --link ] && [ "$3" = --target ] || exit 97
+    if [ "${TEST_ROLLBACK_FAIL:-}" = switch ] && [ "${4##*/}" = 0.1.0 ]; then exit 1; fi
+    exec python3 -c 'import os,sys,tempfile; link,target=sys.argv[1:]; d=tempfile.mkdtemp(dir=os.path.dirname(link)); p=d+"/current"; os.symlink(target,p); os.rename(p,link); os.rmdir(d)' "$2" "$4" ;;
+
+serve) printf "%s\\n" --state-dir "$state" serve "$@" > "$TEST_SERVER_ARGS"; printf "%s\\n" "$TEST_ENV" > "$TEST_SERVER_ENV" ;;
+*) exit 97 ;;
+esac
+''',
             'hx-vision-ocr': b'#!/bin/sh\nexit 0\n',
         })
     app_name = 'Hyperthymesia-0.1.0-macos-aarch64.zip'
@@ -96,9 +134,11 @@ case "$2" in file://*) cp "${2#file://}" "$4";; *) echo 'network forbidden' >&2;
         env.update(HOME=str(h), PATH=str(stubs) + os.pathsep + os.environ['PATH'],
                    TMPDIR=str(root), HX_RELEASE_BASE=fixture.as_uri(),
                    HX_FX_RELEASE_BASE=fixture.as_uri(), TEST_OS=os_name, TEST_ARCH=arch,
-                   TEST_COMMAND_LOG=str(root / 'commands'))
+                   TEST_COMMAND_LOG=str(root / 'commands'),
+                   AI_GATEWAY_API_KEY='synthetic-key-never-print',
+                   TEST_FAIL_STEP=os.environ.get('TEST_FAIL_STEP', ''),
+                   TEST_HELD_LEASE=os.environ.get('TEST_HELD_LEASE', ''))
         result = subprocess.run(['/bin/sh', str(script), *args], env=env, text=True, capture_output=True, timeout=20)
-        assert not (root / 'commands').exists(), 'called a real-service interface'
         return result
     def fails_unchanged(h, expected, *args, **kwargs):
         before = snapshot(h)
@@ -106,6 +146,40 @@ case "$2" in file://*) cp "${2#file://}" "$4";; *) echo 'network forbidden' >&2;
         assert result.returncode == expected, (result.returncode, result.stdout, result.stderr)
         assert snapshot(h) == before, 'failure changed HOME'
         return result
+
+    # Fail-first against the files-only installer: one command must initialize
+    # private state and invoke a user service without exposing a supplied secret.
+    h = home()
+    result = run(h, '--provider', 'gateway')
+    assert result.returncode == 0, result.stderr
+    state = h / '.local/state/hyperthymesia'
+    assert (state / 'core.sqlite').is_file(), 'one-command install did not migrate'
+    assert state.stat().st_mode & 0o777 == 0o700
+    assert (state / 'server.env').stat().st_mode & 0o777 == 0o600
+    assert 'synthetic-key-never-print' not in result.stdout + result.stderr
+    original_env = (state / 'server.env').read_bytes()
+    assert run(h).returncode == 0
+    assert (state / 'server.env').read_bytes() == original_env
+    print('ok: one command migrates, starts a user service, preserves private env')
+
+    # A remembered history must never turn into an empty replacement core,
+    # including a custom state path whose volume disappeared.
+    for custom in (False, True):
+        h = home()
+        state = h / ('mounted/history' if custom else '.local/state/hyperthymesia')
+        args = ('--state-dir', str(state)) if custom else ()
+        assert run(h, *args).returncode == 0
+        (state / 'core.sqlite').write_text('irreplaceable synthetic evidence')
+        saved = state.with_name(state.name + '.failed-synthetic')
+        state.rename(saved)
+        result = fails_unchanged(h, 1, *args)
+        assert 'backups/' in result.stderr and 'failed-' in result.stderr
+        assert 'restore' in result.stderr and '--start-fresh' in result.stderr
+        assert not state.exists()
+        assert (saved / 'core.sqlite').read_text() == 'irreplaceable synthetic evidence'
+        assert run(h, *args, '--start-fresh').returncode == 0
+        assert (saved / 'core.sqlite').read_text() == 'irreplaceable synthetic evidence'
+    print('ok: missing registered state refuses without writes; fresh history is explicit')
 
     # A successful dry run must render the complete plan before rejection tests
     # can be credited: rejecting every invocation is not a valid installer.
@@ -165,7 +239,7 @@ case "$2" in file://*) cp "${2#file://}" "$4";; *) echo 'network forbidden' >&2;
         before_paths = sorted(str(path.relative_to(h)) for path in h.rglob('*'))
         result = run(h, '--dry-run', os_name='Darwin', arch='arm64')
         assert result.returncode == 3, result.stderr
-        assert 'docs/moving-to-sqlite.md' in result.stderr
+        assert 'crates/hx-move/README.md' in result.stderr
         assert p.is_fifo()
         result = run(h, '--uninstall', os_name='Darwin', arch='arm64')
         assert result.returncode == 3, result.stderr
@@ -228,6 +302,17 @@ case "$2" in file://*) cp "${2#file://}" "$4";; *) echo 'network forbidden' >&2;
         assert not (h / '.local/bin/hx-server').is_symlink()
     print('ok: installs, service syntax, repeat install and state-preserving uninstall')
 
+    # Publishing a prefix without its marker must be impossible even if the
+    # marker copy fails. The staged directory can be ignored safely on retry.
+    h = home()
+    stub('cp', 'case "$*" in *hyperthymesia.staging.*/.installed*) exit 1;; esac\nexec /bin/cp "$@"\n')
+    failed = run(h)
+    (stubs / 'cp').unlink()
+    assert failed.returncode != 0
+    assert not (h / '.local/share/hyperthymesia').exists()
+    assert run(h).returncode == 0
+    print('ok: ownership marker is published atomically with prefix')
+
     # A disk-full or interrupted first install must stay ours to retry; the owner
     # refusal has no override, so a marker-less prefix would be a dead end.
     h = home()
@@ -239,4 +324,98 @@ case "$2" in file://*) cp "${2#file://}" "$4";; *) echo 'network forbidden' >&2;
     assert retry.returncode == 0, (retry.returncode, retry.stderr)
     assert (h / '.local/share/hyperthymesia/tools/fx-0.0.16/fx').is_file()
     print('ok: an interrupted first install can be retried')
+
+    h = home()
+    assert run(h).returncode == 0
+    before = snapshot(h)
+    os.environ['TEST_HELD_LEASE'] = 'yes'
+    result = run(h)
+    os.environ.pop('TEST_HELD_LEASE')
+    assert result.returncode != 0
+    assert snapshot(h) == before, 'held lease changed installation'
+    print('ok: held lease refuses upgrade without writes')
+
+    # Refusable state checks happen before any stop or destination write.
+    log = root / 'commands'
+    log.write_text('')
+    os.environ['TEST_FAIL_STEP'] = 'doctor'
+    fails_unchanged(h, 1)
+    os.environ.pop('TEST_FAIL_STEP')
+    assert '--user stop' not in log.read_text()
+    print('ok: state preflight refusal leaves old service and files untouched')
+
+    # An upgraded payload must survive rollback with its old evidence/env intact.
+    state = h / '.local/state/hyperthymesia'
+    (state / 'core.sqlite').write_text('synthetic seeded evidence')
+    env_before = (state / 'server.env').read_bytes()
+    old = os.readlink(h / '.local/share/hyperthymesia/current')
+    for platform in ('linux-x86_64', 'linux-aarch64', 'macos-aarch64'):
+        asset = fixture / f'hx-server-0.1.0-{platform}.tar.gz'
+        files = {}
+        with tarfile.open(asset) as archive_in:
+            for member in archive_in:
+                files[member.name] = archive_in.extractfile(member).read().replace(b'hx-server 0.1.0', b'hx-server 0.1.1')
+        archive(fixture / f'hx-server-0.1.1-{platform}.tar.gz', files)
+        asset.unlink()
+    sums()
+    os.environ['TEST_FAIL_STEP'] = 'post-doctor'
+    result = run(h, '--server-only')
+    os.environ.pop('TEST_FAIL_STEP')
+    assert result.returncode != 0
+    assert os.readlink(h / '.local/share/hyperthymesia/current') == old
+    assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
+    assert (state / 'server.env').read_bytes() == env_before
+    assert (state / 'server.log').stat().st_mode & 0o777 == 0o600
+    os.environ['TEST_FAIL_STEP'] = 'provider'
+    provider_warning = run(h, '--server-only')
+    os.environ.pop('TEST_FAIL_STEP')
+    assert provider_warning.returncode == 0, provider_warning.stderr
+    assert 'provider setup is incomplete' in provider_warning.stderr
+    assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
+    assert Path(old).is_dir(), 'previous version was removed'
+    print('ok: failed upgrade restores old version/evidence; missing provider only warns')
+
+    # Uninstall does not erase history or the obligation to back up on reinstall.
+    assert run(h, '--uninstall').returncode == 0
+    backups = set((h / '.local/share/hyperthymesia/backups').iterdir())
+    assert run(h, '--server-only').returncode == 0
+    assert set((h / '.local/share/hyperthymesia/backups').iterdir()) > backups
+    assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
+    print('ok: reinstall without current backs up existing evidence')
+
+    # Failed recovery IO must never short-circuit the attempt to restart old.
+    for fault in ('move', 'copy', 'switch'):
+        h = home()
+        # Reuse the earlier retained version as a fixture of an old install.
+        prefix = h / '.local/share/hyperthymesia'
+        shutil.copytree(Path(old).parent, prefix, symlinks=True)
+        current = prefix / 'current'
+        current.unlink()
+        current.symlink_to(prefix / '0.1.0')
+        (prefix / '.last-version').write_text(str(prefix / '0.1.0') + '\n')
+        state = h / '.local/state/hyperthymesia'
+        state.mkdir(parents=True, mode=0o700)
+        (prefix / '.state-dir').write_text(str(state) + '\n')
+        for name in ('core.sqlite', 'agent.sqlite', 'server.env', 'server.log'):
+            (state / name).write_text('' if name != 'core.sqlite' else 'saved')
+            (state / name).chmod(0o600)
+        if fault == 'move':
+            stub('mv', 'case "$*" in *failed-*) exit 1;; esac\nexec /bin/mv "$@"\n')
+        if fault == 'copy':
+            stub('cp', 'case "$*" in *failed-*/server.env*) exit 1;; esac\nexec /bin/cp "$@"\n')
+        log = root / 'commands'
+        log.write_text('')
+        os.environ['TEST_FAIL_STEP'] = 'post-doctor'
+        os.environ['TEST_ROLLBACK_FAIL'] = fault
+        result = run(h, '--server-only')
+        os.environ.pop('TEST_FAIL_STEP')
+        os.environ.pop('TEST_ROLLBACK_FAIL')
+        for command in ('mv', 'cp'):
+            if (stubs / command).exists(): (stubs / command).unlink()
+        assert result.returncode != 0
+        assert log.read_text().count('enable --now hyperthymesia.service') == 2, result.stderr
+        if fault == 'switch':
+            assert os.readlink(prefix / 'current') == str(prefix / '0.1.0'), 'restart must target the old version even if atomic switch fails'
+        assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
+    print('ok: recovery IO failures still attempt old-service restart and report damage')
 PY

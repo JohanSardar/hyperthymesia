@@ -123,12 +123,22 @@ pub async fn doctor(config: &Config) -> Result<()> {
             metadata.is_file(),
             "fx login must be a regular file, not a symlink"
         );
+        // HOME may itself be reached through /var or a user-directory alias.
+        // Reject redirection below that boundary, including .fx and explicit
+        // credential parents; do not reject ordinary HOME ancestry.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
         for parent in config
             .credential
             .ancestors()
             .skip(1)
             .filter(|p| !p.as_os_str().is_empty())
         {
+            if home
+                .as_deref()
+                .is_some_and(|home| parent == home || home.starts_with(parent))
+            {
+                break;
+            }
             ensure!(
                 !std::fs::symlink_metadata(parent)?.file_type().is_symlink(),
                 "fx login parent must not be a symlink"
