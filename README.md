@@ -16,7 +16,7 @@ Connectors ────────┘   T3 Code · Codex · Claude Code · git 
                                                                     REST API · dashboard · (MCP)
 ```
 
-- **Devices stay thin.** They capture focus, input activity, accessibility text, low-bitrate screen video and sparse stills, then upload. All processing, OCR included, happens on the server.
+- **Devices stay thin.** They capture focus, input activity, accessibility text, low-bitrate screen video and sparse stills, then upload. Processing happens on the server. OCR uses Apple Vision on a Mac server with a resolvable helper; otherwise the Mac app performs OCR and uploads the result.
 - **Instrument the app, not the pixels.** Agent sessions, the browser, the editor, the shell and git carry most of the meaning. Screen capture is evidence and fallback.
 - **Honesty over false precision.** Device state, input, foreground exposure, inferred engagement and coverage are kept separate. Gaps are `unknown`, never "idle".
 - **Modular.** The core knows one envelope format ([schema/](schema/)) and a small set of observation kinds. Every source is a connector.
@@ -29,7 +29,7 @@ Connectors ────────┘   T3 Code · Codex · Claude Code · git 
 | `crates/hx-macos-sys`, `hx-agent`, `hx-agent-app` | macOS capture agent and menu-bar app |
 | `crates/hx-store`, `hx-jobs`, `hx-server` | Server: SQLite store, job queue, API, dashboard |
 | `crates/hx-compile` | Deterministic timeline compiler |
-| `crates/hx-interpret`, `hx-visual` | LLM interpreter with claim checks; server OCR |
+| `crates/hx-interpret`, `hx-visual` | LLM interpreter with claim checks; shared Vision OCR |
 | `crates/hx-connector-sdk`, `connectors/*` | Connectors for agent sessions, git, Apple Bridge |
 | `companions/*` | Browser extension, shell hook, editor extension |
 | `docs/` | Design, review debate, build playbook |
@@ -57,6 +57,11 @@ per UTC day, with a seven-day cooldown for unchanged failed or deferred input.
 Generation changes preserve paid retry budgets; explicit `hx interpret` requests
 remain available. All providers skip an already recorded input generation, prompt,
 model, and disclosure policy.
+
+Device OCR becomes citable server evidence under the source still's disclosure policy.
+Servers without Vision do not OCR or backfill existing unprocessed stills moved from
+a Mac server; those stills remain stored without text. Connector-only installations
+need no Mac and have no OCR queue.
 
 Requires Rust 1.99 (pinned in `rust-toolchain.toml`), and macOS for the capture agent.
 

@@ -415,6 +415,16 @@ async fn exercise(url: &str) -> Result<()> {
         .fetch_one(&store.pool)
         .await?;
     ensure!(evidence == 2 && ocr_jobs == 1, "moved stills were re-OCRed");
+    // Moved jobs are server-run: a device-mode server keeps citing, never re-mints.
+    let scoped: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM ocr_jobs WHERE scope<>'')+(SELECT count(*) FROM ocr_evidence WHERE scope<>'')")
+        .fetch_one(&store.pool)
+        .await?;
+    ensure!(scoped == 0, "moved OCR must keep the server-run scope");
+    store.publish_device_ocr_lineage().await?;
+    let evidence: i64 = sqlx::query_scalar("SELECT count(*) FROM ocr_evidence")
+        .fetch_one(&store.pool)
+        .await?;
+    ensure!(evidence == 2, "device lineage duplicated moved evidence");
     ensure!(
         store
             .upload_blob(&waiting_sha, b"late synthetic bytes")
