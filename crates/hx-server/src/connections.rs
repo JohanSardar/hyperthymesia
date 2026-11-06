@@ -151,7 +151,7 @@ pub async fn page(
                             p class="hint" {"Optional read-only request checked without AI before setup. Change the executable here and in the description when using a custom CLI path. A failed check pauses setup until you reconnect."}
                             textarea name="probe_json" aria-label="Connection check JSON" {(probe)}
                         }
-                        p class="hint" {"Window summaries and allowed source content go to the configured cloud model. Connecting starts a paid setup run; later day-page runs can also use this source."}
+                        p class="hint" {"The configured cloud model can receive captured window titles, URLs, accessibility text, screenshot OCR, fuller saved evidence from broker lookups, and source responses during setup and live lookups. Connecting starts a paid setup run; later day-page runs can also use this source."}
                         button type="submit" {"Connect and turn on"}
                     }
                 }
@@ -160,7 +160,7 @@ pub async fn page(
                     p {"The agent has full bash on this server, with its real HOME and extended PATH. There is no sandbox. Commands can read or change files, use existing CLI logins, install software and contact the network."}
                     p {"Code blocks common literal catastrophic commands, including disk erasure, shutdown, fork bombs and forced recursive deletion of root or home. It also blocks literal access to Hyperthymesia's state folder. This is an accident guard, not a security boundary: scripts, variables, symlinks, obfuscated commands and other destructive operations can bypass it."}
                     p {"Keys are kept in private, mode-0600 files on this server, outside SQLite and backups. Each call receives only its own source's key. Known keys and common encodings are scrubbed before prompts, tool logs and saved answers. Full host bash can still read keys and other host credentials or send them elsewhere; keys are not hidden from the agent, and scrubbing cannot stop every encoding or deliberate exfiltration."}
-                    p {"Allowed source content and your summaries go to the configured cloud model. Retrieved text is treated as untrusted data. Live answers are saved for citations, but old records and current lookups are context, not proof of activity at another time."}
+                    p {"Retrieved text is treated as untrusted data. Live answers are saved for citations, but old records and current lookups are context, not proof of activity at another time."}
                     p {"Connecting starts one bounded setup job with at most two attempts. Pulls then run every four hours without AI. Switching sources starts no model run. An off source cannot be called or re-enabled through the agent's broker tools."}
                 }
             }
