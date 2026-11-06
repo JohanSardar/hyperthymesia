@@ -111,6 +111,59 @@ It is not a claim of compatibility with an independently published older release
   exact device prefixes intentionally reserves that identity too; the repeat
   used a fresh synthetic device identity rather than weakening that protection.
 
+## PR #77 review follow-up: post-service-start interruption
+
+Repeated in a new throwaway Ubuntu 24.04 aarch64 container with separate fresh
+users for reviewed head `756a446` and the fix. Both installed local release
+archives through `HX_RELEASE_BASE`, with a running schema-3 baseline and a
+candidate containing the real migration 4. No existing container, host state,
+real account, paid model call or Mac service was used. No tests were added.
+
+The candidate artifact explicitly paused its post-start state doctor, **after**
+`service_start` and successful `/healthz`, but before the installer committed.
+This is a different kill window from the earlier post-`migrate` check. A paired
+synthetic Mac had already uploaded history and its read token/citation were in
+the pre-upgrade backup. An existing interpretation job was made eligible using a
+synthetic login file and a stand-in that records `ask` then immediately refuses
+it without networking. The check killed the installer, guard and lifecycle group,
+confirmed the exclusive lock was released, and did not directly kill the managed
+candidate.
+
+- **Reviewed head reproduced the bug:** the post-start upload received an
+  acknowledgement and the fake fx recorded a dispatch. The next service restart
+  restored the old snapshot and the acknowledged upload disappeared from active
+  history. The retained failed generation still contained it.
+- **Fixed candidate:** the same upload received 503 (or connection refusal during
+  shutdown), and the fake fx dispatch count stayed zero despite an eligible job
+  and no exclusive installer lock. HTTP admission, scheduler/interpret claims and
+  OCR startup all remain fenced by `pending-upgrade`, not just the OS lock.
+- With the pending record still present, the candidate exited rather than opening
+  admission or restoring beneath live SQLite pools. The existing manager restart
+  policy ran its wrapper automatically; it restored the old version/schema 3
+  before admitting work. The pre-upgrade acknowledged evidence/citation remained
+  byte-identical. No `ask` was dispatched during this sequence.
+- The Mac then retried the rejected batch: it received exactly one acknowledgement.
+  Both that event and the pre-upgrade event survived another start and opened as
+  evidence. The extra rapid verification restarts hit systemd's start-rate limit;
+  resetting only the scratch unit's failed state completed this last persistence
+  check. Production service rate limits were not changed.
+
+The descendant check separately reproduced the second finding: a direct fx child
+exited 37 while its detached-stdio descendant remained alive. The fixed watcher
+stays armed until the entire group is killed; a private status file preserves the
+direct child's POSIX shell status. Direct exit 0, exit 37, and SIGKILL/137 all
+retained their status and left the TERM-ignoring descendant killed and reaped.
+Through the fixed Rust `doctor` path, a successful version-only child that forked
+a bounded, detached-stdio descendant still returned success and left no descendant.
+Existing cancellation/shutdown checks also passed.
+
+A combined command containing a long-waiting stand-in and container network
+disconnection was held by the safety reviewer and did not execute. This follow-up
+instead used the disclosed immediate-refusal stand-in; the container's network
+configuration was not changed. That stand-in contains no network/model operation,
+and no real credentials or real model invocation were used. No required check
+remained blocked.
+
 ## Existing checks and limits
 
 All commands below passed with exit code 0 (existing ignored tests remain

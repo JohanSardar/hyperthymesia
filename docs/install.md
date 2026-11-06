@@ -144,7 +144,10 @@ An upgrade:
 3. Switches `current`, explicitly migrates, starts and requires `/healthz`,
    state doctor to pass. Provider doctor only warns with the missing setup step;
    missing login never prevents a healthy upgrade. Workers stay idle and other HTTP
-   requests return 503 until verification ends; agents retain retryable uploads.
+   requests return 503 while either the guard lock or durable `pending-upgrade`
+   record blocks admission; agents retain retryable uploads. If the installer dies
+   after the candidate starts, the candidate shuts down without admitting work.
+   Its manager restarts through recovery before reopening state or accepting uploads.
 4. Keeps the previous version and backup. A failed step after stop restores
    both databases and blobs, preserves `server.env`, switches back and restarts.
    Failed-generation state stays beside the active directory as `<state>.failed-*`
