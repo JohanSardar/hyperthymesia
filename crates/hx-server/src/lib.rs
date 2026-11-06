@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod ocr;
 pub mod processing;
 pub mod pull;
+pub mod sources;
 use axum::{
     Extension, Json, Router,
     body::Bytes,
@@ -81,6 +82,7 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/v1/pair", post(pair).layer(DefaultBodyLimit::max(4096)))
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
+        .merge(sources::router())
         .route("/v1/events", post(events))
         .route("/v1/device", get(device))
         .route(
@@ -354,17 +356,25 @@ pub async fn timeline_value(
     let rows = store
         .canonical_revisions(w.start, w.end, &token.prefixes)
         .await?;
-    // Sensitive egress controls model transport, not the API reader's access.
+    let mut policy = policy.clone();
+    policy.source_grants = store.source_grants().await?;
     let mut revisions = vec![];
     let mut interpreted = None;
     for row in rows {
+        if row
+            .input_namespaces
+            .iter()
+            .any(|namespace| !token.allows(namespace))
+        {
+            continue;
+        }
         let interpretation: Value = row.interpretation;
         if !token.has("read_raw")
-            && !mcp::owner_allowed_ids(
+            && !disclosure::revision_disclosable(
                 store,
-                policy,
-                processing::SensitiveEgress::Full,
-                &mcp::revision_evidence(&interpretation),
+                &interpretation,
+                &policy,
+                processing::SensitiveEgress::from_env(),
             )
             .await?
         {

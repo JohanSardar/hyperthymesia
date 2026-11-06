@@ -509,7 +509,21 @@ impl Store {
         namespaces: &[String],
     ) -> Result<(i64, bool)> {
         retry_busy("publish revision", |_| {
-            self.publish_revision_attempt(w, generation, &value, output_key, namespaces)
+            self.publish_revision_attempt(w, generation, &value, output_key, namespaces, false)
+        })
+        .await
+    }
+    /// Window publication, fenced against an owner disabling any source the run used.
+    pub async fn publish_disclosed_revision_manifest(
+        &self,
+        w: Interval,
+        generation: i64,
+        value: Value,
+        output_key: &str,
+        namespaces: &[String],
+    ) -> Result<(i64, bool)> {
+        retry_busy("publish disclosed revision", |_| {
+            self.publish_revision_attempt(w, generation, &value, output_key, namespaces, true)
         })
         .await
     }
@@ -520,6 +534,7 @@ impl Store {
         value: &Value,
         output_key: &str,
         namespaces: &[String],
+        check_sources: bool,
     ) -> Result<(i64, bool)> {
         let mut content = value.clone();
         let agent_run = content.as_object_mut().and_then(|v| v.remove("agent_run"));
@@ -527,6 +542,19 @@ impl Store {
         let content = stored_json(content);
         let agent_run = agent_run.map(stored_json);
         let mut tx = self.begin_write().await?;
+        if check_sources {
+            for namespace in namespaces.iter().filter(|ns| ns.starts_with("source:")) {
+                let enabled: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM sources WHERE connector_instance=$1 AND enabled)",
+                )
+                .bind(namespace)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !enabled {
+                    return Err(sources::SourceAccessChanged.into());
+                }
+            }
+        }
         let window =
             sqlx::query("SELECT generation,canonical_revision FROM windows WHERE start_at=$1")
                 .bind(Ts::from(w.start))
