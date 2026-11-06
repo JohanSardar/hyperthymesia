@@ -1,5 +1,10 @@
 #![cfg(unix)]
-use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::Query,
+    http::{HeaderMap, StatusCode},
+    routing::get,
+};
 use chrono::{Duration, Utc};
 use hx_sources::{keys::KeyStore, recipe::Recipe};
 use hx_store::{Store, Ts};
@@ -12,6 +17,8 @@ struct Fixture {
     source: String,
     recipe: String,
     requests: Arc<Mutex<Vec<String>>>,
+    auth: Arc<Mutex<Vec<String>>>,
+    pages: Arc<Mutex<Vec<Value>>>,
     api: tokio::task::JoinHandle<()>,
     switch: Arc<Mutex<Option<(Store, String, bool)>>>,
 }
@@ -24,6 +31,10 @@ impl Fixture {
     async fn new(pages: Vec<Value>) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let reads = requests.clone();
+        let pages = Arc::new(Mutex::new(pages));
+        let api_pages = pages.clone();
+        let auth: Arc<Mutex<Vec<String>>> = Arc::default();
+        let api_auth = auth.clone();
         let switch: Arc<Mutex<Option<(Store, String, bool)>>> = Arc::default();
         let api_switch = switch.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -34,13 +45,23 @@ impl Fixture {
         let app = Router::new().route(
             "/",
             get(
-                move |Query(q): Query<std::collections::HashMap<String, String>>| {
+                move |Query(q): Query<std::collections::HashMap<String, String>>,
+                      headers: HeaderMap| {
                     let reads = reads.clone();
-                    let pages = pages.clone();
+                    let pages = api_pages.clone();
+                    let auth = api_auth.clone();
                     let switch = api_switch.clone();
                     async move {
                         let cursor = q.get("cursor").cloned().unwrap_or_default();
                         reads.lock().unwrap().push(cursor.clone());
+                        auth.lock().unwrap().push(
+                            headers
+                                .get("authorization")
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_owned(),
+                        );
                         let index: usize = cursor.parse().unwrap_or(0);
                         let change = switch.lock().unwrap().take();
                         if let Some((store, id, source)) = change {
@@ -50,7 +71,12 @@ impl Fixture {
                                 store.set_recipe_enabled(&id, false).await.unwrap();
                             }
                         }
-                        let page = pages.get(index).cloned().unwrap_or(json!({"items":[]}));
+                        let page = pages
+                            .lock()
+                            .unwrap()
+                            .get(index)
+                            .cloned()
+                            .unwrap_or(json!({"items":[]}));
                         let status = page
                             .get("status")
                             .and_then(Value::as_u64)
@@ -93,6 +119,8 @@ impl Fixture {
             source: source.id,
             recipe: recipe.id,
             requests,
+            auth,
+            pages,
             api,
             switch,
         }
@@ -482,4 +510,168 @@ async fn cli_dispatch_and_reconnect_codes_and_mcp_transport_are_honest() {
         Some("MCP transport is not implemented (P16)")
     );
     assert!(f.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn review_all_source_secrets_scrub_events_and_pending_checkpoint() {
+    const OTHER_KEY: &str = "synthetic-other-source-credential";
+    let mut items: Vec<_> = (0..1001).map(item).collect();
+    for item in &mut items {
+        item["body"] = json!(OTHER_KEY);
+    }
+    let f = Fixture::new(vec![json!({"items":items})]).await;
+    let other = f
+        .store
+        .connect_source("other fake source", "fake only", 1)
+        .await
+        .unwrap();
+    KeyStore::new(&f.store.data_dir)
+        .unwrap()
+        .write(&other.id, OTHER_KEY)
+        .unwrap();
+    // Off controls requests and grants; saved credentials still need redaction.
+    f.store.set_source_enabled(&other.id, false).await.unwrap();
+    let report = f.run().await.unwrap();
+    assert_eq!(report.accepted, 1000);
+    assert!(report.error.is_none());
+    let events: Vec<String> = sqlx::query_scalar("SELECT envelope FROM events")
+        .fetch_all(&f.store.pool)
+        .await
+        .unwrap();
+    let checkpoint = f
+        .store
+        .recipe_state(&f.recipe)
+        .await
+        .unwrap()
+        .cursor
+        .unwrap();
+    assert!(
+        checkpoint["pending"].is_object(),
+        "exercise durable partial-page storage"
+    );
+    assert!(
+        events.iter().all(|v| !v.contains(OTHER_KEY)),
+        "another source's credential leaked into events"
+    );
+    assert!(
+        !checkpoint.to_string().contains(OTHER_KEY),
+        "another source's credential leaked into the checkpoint"
+    );
+    assert_eq!(*f.auth.lock().unwrap(), ["Bearer planted-fake-secret"]);
+    assert!(events.iter().all(|v| v.contains("[REDACTED]")));
+}
+
+#[tokio::test]
+async fn review_unreadable_source_secret_fails_without_narrowing_scrub() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new(vec![json!({"items":[item(1)]})]).await;
+    let other = f
+        .store
+        .connect_source("other fake source", "fake only", 1)
+        .await
+        .unwrap();
+    let keys = KeyStore::new(&f.store.data_dir).unwrap();
+    keys.write(&other.id, "synthetic-other-source-credential")
+        .unwrap();
+    let path = f.store.data_dir.join(format!("secrets/{}.key", other.id));
+    let target = f.store.data_dir.join("synthetic-key-target");
+    std::fs::rename(&path, &target).unwrap();
+    symlink(target, &path).unwrap();
+    let report = f.run().await.unwrap();
+    assert!(
+        report.error.is_some(),
+        "an unreadable configured secret must fail the pull"
+    );
+    assert!(f.requests.lock().unwrap().is_empty());
+    assert_eq!(f.count("events").await, 0);
+    let state = f.store.recipe_state(&f.recipe).await.unwrap();
+    assert!(state.cursor.is_none());
+    assert_eq!(state.last_error, report.error);
+    assert!(state.next_run_at > Utc::now());
+}
+
+#[tokio::test]
+async fn review_snapshot_traversals_restart_and_old_checkpoints_still_load() {
+    let f = Fixture::new(vec![
+        json!({"items":[item(1)],"next":"1"}),
+        json!({"items":[item(2)]}),
+    ])
+    .await;
+    let mut recipe = f.store.recipe(&f.recipe).await.unwrap().unwrap().recipe.0;
+    recipe.cursor = None;
+    f.store.save_recipe(&f.source, &recipe).await.unwrap();
+    f.run().await.unwrap();
+    assert_eq!(*f.requests.lock().unwrap(), ["", "1"]);
+    f.pages.lock().unwrap()[0]["items"]
+        .as_array_mut()
+        .unwrap()
+        .push(item(3));
+    f.due().await;
+    f.run().await.unwrap();
+    assert_eq!(
+        *f.requests.lock().unwrap(),
+        ["", "1", "", "1"],
+        "a completed snapshot must start at page one next cycle"
+    );
+    assert_eq!(f.count("events").await, 3);
+    // The old format cannot distinguish a terminal page token from an unfinished
+    // traversal. Replaying a snapshot from its start is safe and loses no data.
+    let mut state = f.store.recipe_state(&f.recipe).await.unwrap();
+    state.cursor =
+        Some(json!({"pull_checkpoint_v1":true,"cursor":"1","pending":null,"pulled_at":null}));
+    state.next_run_at = Utc::now() - Duration::hours(4);
+    f.store.save_recipe_state(&state).await.unwrap();
+    f.pages.lock().unwrap()[0] = json!({"items":[item(4)],"next":"1"});
+    f.run().await.unwrap();
+    assert_eq!(&f.requests.lock().unwrap()[4..], ["", "1"]);
+    assert_eq!(f.count("events").await, 4);
+    let mut state = f.store.recipe_state(&f.recipe).await.unwrap();
+    state.cursor = Some(
+        json!({"pull_checkpoint_v1":true,"cursor":"1","pending":{"items":[item(5)]},"pulled_at":Utc::now()}),
+    );
+    state.next_run_at = Utc::now() - Duration::hours(4);
+    f.store.save_recipe_state(&state).await.unwrap();
+    f.run().await.unwrap();
+    assert_eq!(
+        f.requests.lock().unwrap().len(),
+        6,
+        "an old cached remainder must not be refetched"
+    );
+    assert_eq!(f.count("events").await, 5);
+    f.due().await;
+    f.run().await.unwrap();
+    assert_eq!(&f.requests.lock().unwrap()[6..], ["", "1"]);
+
+    let f = Fixture::new(vec![
+        json!({"items":[item(1)],"next":"1"}),
+        json!({"items":[item(2)]}),
+    ])
+    .await;
+    let mut recipe = f.store.recipe(&f.recipe).await.unwrap().unwrap().recipe.0;
+    recipe.cursor = None;
+    recipe.pages.as_mut().unwrap().max = 1;
+    f.store.save_recipe(&f.source, &recipe).await.unwrap();
+    for _ in 0..3 {
+        f.due().await;
+        f.run().await.unwrap();
+    }
+    assert_eq!(*f.requests.lock().unwrap(), ["", "1", ""]);
+    assert_eq!(f.count("events").await, 2);
+}
+
+#[tokio::test]
+async fn review_pagination_preserves_incremental_watermarks_across_pages() {
+    let f = Fixture::new(vec![
+        json!({"items":[item(1)],"next":"1","watermark":"100"}),
+        json!({"items":[item(2)],"watermark":"200"}),
+    ])
+    .await;
+    let mut recipe = f.store.recipe(&f.recipe).await.unwrap().unwrap().recipe.0;
+    recipe.cursor.as_mut().unwrap().pointer = "/watermark".into();
+    f.store.save_recipe(&f.source, &recipe).await.unwrap();
+    f.run().await.unwrap();
+    f.due().await;
+    f.run().await.unwrap();
+    assert_eq!(*f.requests.lock().unwrap(), ["", "1", "200"]);
+    assert_eq!(f.count("events").await, 2);
 }
