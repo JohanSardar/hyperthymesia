@@ -17,7 +17,8 @@ fuller saved evidence from broker lookups, and source responses during setup and
 live lookups. Model use can cost money.
 
 The agent has full bash on the server, with access to files, existing CLI logins,
-credentials and the network. It is not sandboxed. Source keys are stored in
+credentials and the network. It is not sandboxed. Setting `HX_HOST_BASH=off` removes
+its bash tool, but commands a source names still run on the server under your account. Source keys are stored in
 private files, but they are **not hidden from the agent**. “Keep it local” in a
 source description is an instruction, not an isolation boundary. Run this only
 on a host and with source credentials you are willing to give that access.

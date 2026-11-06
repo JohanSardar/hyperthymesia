@@ -136,7 +136,7 @@ pub async fn page(
                         label for="source-description" {"What is it?"}
                         textarea id="source-description" name="description" required maxlength="16384" placeholder="My messages at https://mail.example/api. Read my recent conversations." {(description)}
                         p class="hint" {"Include the API or MCP server's address. For a CLI, include its command in backticks, like `my-cli`. The agent works out how to call it. Only owner-described destinations receive the key in direct requests."}
-                        p class="hint" {"“Keep it local” in this description is an instruction to the agent, not a wall. The agent has full host bash, can read files and credentials, and can contact the network."}
+                        p class="hint" {"“Keep it local” in this description is an instruction to the agent, not a wall. " (host_bash_note()) " It can read files and credentials and can contact the network."}
                         label for="source-key" {"Key or credential"}
                         input id="source-key" name="key" type="password" autocomplete="new-password" spellcheck="false" autocapitalize="none" maxlength="16384" placeholder="Paste a key (optional for a signed-in CLI)";
                         p class="hint" {"Use a read-only, narrowly scoped key where possible. It is never shown back here."}
@@ -157,7 +157,7 @@ pub async fn page(
                 }
                 aside class="disclosure" aria-label="Before you connect" {
                     h2 {"Before you connect"}
-                    p {"The agent has full bash on this server, with its real HOME and extended PATH. There is no sandbox. Commands can read or change files, use existing CLI logins, install software and contact the network."}
+                    p {(host_bash_note()) " It runs with its real HOME and extended PATH. There is no sandbox. Commands can read or change files, use existing CLI logins, install software and contact the network."}
                     p {"Code blocks common literal catastrophic commands, including disk erasure, shutdown, fork bombs and forced recursive deletion of root or home. It also blocks literal access to Hyperthymesia's state folder. This is an accident guard, not a security boundary: scripts, variables, symlinks, obfuscated commands and other destructive operations can bypass it."}
                     p {"Keys are kept in private, mode-0600 files on this server, outside SQLite and backups. Each call receives only its own source's key. Known keys and common encodings are scrubbed before prompts, tool logs and saved answers. Full host bash can still read keys and other host credentials or send them elsewhere; keys are not hidden from the agent, and scrubbing cannot stop every encoding or deliberate exfiltration."}
                     p {"Retrieved text is treated as untrusted data. Live answers are saved for citations, but old records and current lookups are context, not proof of activity at another time."}
@@ -255,7 +255,7 @@ pub async fn agent_setup(State(store): State<Store>, headers: HeaderMap) -> ApiR
             h1 {"What your agent set up"}
             p {"Your agent discovers a source once. Plain code then pulls every four hours, resumes from a cursor, and catches up once after missed cycles. Pulls use no AI. A later day-page run can use and cite the captured data."}
             p {b {"Your switches stay yours."} " Switching a pull off stops requests, including queued pulls. Setup cannot turn it back on. Only you can re-enable it."}
-            aside {p {b {"“Keep it local” is an instruction to the agent, not a wall."} " The agent has full host bash. Add-on prompts cannot enforce isolation or change core rules and citation checks. Allowed content may reach the configured cloud model."}}
+            aside {p {b {"“Keep it local” is an instruction to the agent, not a wall."} " " (host_bash_note()) " Add-on prompts cannot enforce isolation or change core rules and citation checks. Allowed content may reach the configured cloud model."}}
             @if configured.as_array().is_none_or(Vec::is_empty) {p {"Nothing set up yet. " a href="/connect" {"Connect a source"}}}
             @for source in configured.as_array().into_iter().flatten() {
                 section {
@@ -363,4 +363,12 @@ pub async fn reconnect(
     }
     sources::reconnect_source(&store, &id, key.as_deref()).await?;
     Ok(Redirect::to("/connect").into_response())
+}
+
+fn host_bash_note() -> &'static str {
+    if crate::mcp::host_bash_enabled() {
+        "The agent has full bash on this server."
+    } else {
+        "Host bash is off (HX_HOST_BASH=off), but commands a source names still run on this server under your account."
+    }
 }
