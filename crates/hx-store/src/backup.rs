@@ -12,6 +12,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -53,6 +54,8 @@ fn backup_blocking(source: &Path, to: &Path) -> Result<()> {
     let source = source.canonicalize()?;
     fs::create_dir_all(to)?;
     directory(to)?;
+    // A backup is the owner's whole record, wherever --to happens to point.
+    fs::set_permissions(to, fs::Permissions::from_mode(0o700))?;
     let to = to.canonicalize()?;
     ensure!(
         !to.starts_with(&source) && !source.starts_with(&to),
@@ -145,6 +148,7 @@ fn backup_blocking(source: &Path, to: &Path) -> Result<()> {
     for name in DATABASES {
         let snapshot = stage.path().join(name);
         let digest = hash_file(&snapshot)?;
+        fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600))?;
         File::open(&snapshot)?.sync_all()?;
         // Only unfinished backups can reach here. Never replace a symlink.
         let dest = to.join(name);
