@@ -35,15 +35,32 @@ pub struct PullReport {
 #[serde(deny_unknown_fields)]
 struct Checkpoint {
     pull_checkpoint_v1: bool,
+    /// Incremental high-water mark, independent of a paginated traversal.
     cursor: Option<Value>,
+    /// Present in new checkpoints, including JSON null when traversal is done.
+    #[serde(default)]
+    page_cursor: Option<Value>,
     pending: Option<Value>,
     pulled_at: Option<DateTime<Utc>>,
 }
 impl Checkpoint {
-    fn load(cursor: Option<Value>) -> Result<Self, &'static str> {
+    fn load(cursor: Option<Value>, recipe: &Recipe) -> Result<Self, &'static str> {
         match cursor {
             Some(value) if value.get("pull_checkpoint_v1").is_some() => {
-                serde_json::from_value(value).map_err(|_| "invalid pull checkpoint")
+                let legacy = value.get("page_cursor").is_none();
+                let mut checkpoint: Self =
+                    serde_json::from_value(value).map_err(|_| "invalid pull checkpoint")?;
+                if legacy && recipe.cursor.is_none() {
+                    // Legacy snapshots conflated page and incremental tokens.
+                    // Retain an already-fetched remainder; otherwise replay
+                    // from the start rather than risk missing page-one edits.
+                    if checkpoint.pending.is_some() {
+                        checkpoint.page_cursor = checkpoint.cursor.take();
+                    } else {
+                        checkpoint.cursor = None;
+                    }
+                }
+                Ok(checkpoint)
             }
             cursor => Ok(Self {
                 cursor,
@@ -86,7 +103,7 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
         return Ok(report);
     }
     let recipe = &stored.recipe.0;
-    let mut checkpoint = match Checkpoint::load(state.cursor.clone()) {
+    let mut checkpoint = match Checkpoint::load(state.cursor.clone(), recipe) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
             return failed(store, &source.id, &mut state, now, report, error, false).await;
@@ -127,8 +144,29 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
             report.stopped = true;
             break;
         }
-        let key = match KeyStore::new(&store.data_dir).and_then(|keys| keys.read(&source.id)) {
-            Ok(key) => key,
+        let sources = store.sources().await?;
+        if !unchanged(store, id, recipe).await? {
+            report.stopped = true;
+            break;
+        }
+        let loaded = (|| {
+            let keys = KeyStore::new(&store.data_dir)?;
+            let mut request_key = None;
+            let mut secrets = Vec::new();
+            // Disabled sources must not be called, but their saved credentials
+            // can still occur in other sources' responses and need redaction.
+            for configured in &sources {
+                if let Some(secret) = keys.read(&configured.id)? {
+                    if configured.id == source.id {
+                        request_key = Some(secret.clone());
+                    }
+                    secrets.push(secret);
+                }
+            }
+            Ok::<_, hx_sources::keys::KeyError>((request_key, secrets))
+        })();
+        let (key, secrets) = match loaded {
+            Ok(loaded) => loaded,
             Err(error) => {
                 report.counts = mapper.counts();
                 return failed(
@@ -143,7 +181,7 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
                 .await;
             }
         };
-        let scrubber = match Scrubber::new(key.iter()) {
+        let scrubber = match Scrubber::new(&secrets) {
             Ok(scrubber) => scrubber,
             Err(error) => {
                 report.counts = mapper.counts();
@@ -159,7 +197,12 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
                 .await;
             }
         };
-        let cursor = match cursor_text(checkpoint.cursor.as_ref()) {
+        let cursor = match cursor_text(
+            checkpoint
+                .page_cursor
+                .as_ref()
+                .or(checkpoint.cursor.as_ref()),
+        ) {
             Ok(cursor) => cursor,
             Err(error) => {
                 report.counts = mapper.counts();
@@ -238,7 +281,12 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
             checkpoint.pending = Some(response);
             checkpoint.pulled_at = Some(pulled_at);
         } else {
-            checkpoint.cursor = next.clone().or(mapped.cursor).or(checkpoint.cursor);
+            checkpoint.page_cursor = next;
+            checkpoint.cursor = if recipe.cursor.is_some() {
+                mapped.cursor.or(checkpoint.cursor)
+            } else {
+                None
+            };
             checkpoint.pulled_at = None;
         }
         checkpoint.pull_checkpoint_v1 = true;
