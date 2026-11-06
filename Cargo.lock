@@ -1197,6 +1197,7 @@ dependencies = [
  "hx-interpret",
  "hx-jobs",
  "hx-schema",
+ "hx-sources",
  "hx-store",
  "hx-visual",
  "image",
