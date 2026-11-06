@@ -2,7 +2,9 @@
 -- so one device's result can never reach another device's copy of the same hash.
 -- The empty scope is a job the server ran itself; connector instances are non-empty.
 -- Dependent objects go first: RENAME validates every trigger and view in the schema.
+-- DROP TABLE also removes triggers ON these tables without warning; all are recreated.
 DROP TRIGGER events_id_collision;
+DROP TRIGGER live_snapshots_id_collision;
 DROP VIEW ocr_derived;
 DROP TRIGGER ocr_reset;
 
@@ -61,4 +63,16 @@ END;
 CREATE TRIGGER ocr_evidence_id_collision BEFORE INSERT ON ocr_evidence
 WHEN EXISTS(SELECT 1 FROM events WHERE id=NEW.id) BEGIN
  SELECT RAISE(ABORT,'evidence ID already exists in events');
+END;
+CREATE TRIGGER live_snapshots_id_collision BEFORE INSERT ON live_snapshots BEGIN
+ SELECT RAISE(ABORT,'evidence ID already exists in events') WHERE EXISTS(SELECT 1 FROM events WHERE id=NEW.id);
+ SELECT RAISE(ABORT,'evidence ID already exists in ocr_evidence') WHERE EXISTS(SELECT 1 FROM ocr_evidence WHERE id=NEW.id);
+END;
+CREATE TRIGGER ocr_live_id_collision BEFORE INSERT ON ocr_evidence
+WHEN EXISTS(SELECT 1 FROM live_snapshots WHERE id=NEW.id) BEGIN
+ SELECT RAISE(ABORT,'evidence ID already exists in live_snapshots');
+END;
+CREATE TRIGGER ocr_live_id_update_collision BEFORE UPDATE OF id ON ocr_evidence
+WHEN EXISTS(SELECT 1 FROM live_snapshots WHERE id=NEW.id) BEGIN
+ SELECT RAISE(ABORT,'evidence ID already exists in live_snapshots');
 END;

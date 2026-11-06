@@ -4039,3 +4039,57 @@ async fn device_ocr_sampled_from_must_be_a_done_still_of_the_same_token() {
     assert_eq!(f.store.sampled_ocr_count().await.unwrap(), 1);
     f.close().await;
 }
+
+#[tokio::test]
+async fn device_ocr_bounds_engine_identity_and_clamps_roundoff() {
+    let f = Fixture::new().await;
+    let own = secret(&f.store).await;
+    let bytes = synthetic_png(30);
+    let sha = hx_store::hash(&bytes);
+    ingest(
+        &f.store,
+        vec![still("overshoot", 0, Sensitivity::Normal, &bytes)],
+    )
+    .await;
+    for engine in [
+        format!("vision:{}", "a".repeat(122)),
+        "vision:bad\0id".into(),
+        "vision:".into(),
+        "vision:bad id".into(),
+        "other:engine".into(),
+    ] {
+        let mut invalid = device_ocr_body(&bytes);
+        invalid["engine_version"] = json!(engine);
+        assert_eq!(
+            put_ocr_value(&f.store, &own, &sha, &invalid).await,
+            StatusCode::BAD_REQUEST,
+            "{engine}"
+        );
+    }
+    for coordinate in [json!(-0.1), json!(2), json!("NaN"), json!("Infinity")] {
+        let mut invalid = device_ocr_body(&bytes);
+        invalid["result"]["lines"][0]["bbox"]["x"] = coordinate;
+        assert_eq!(
+            put_ocr_value(&f.store, &own, &sha, &invalid).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(f.store.ocr_evidence_count().await.unwrap(), 0);
+    // The longest accepted identity, with rounding overshoot on every edge: a
+    // refusal here would make the client discard this still's text.
+    let mut body = device_ocr_body(&bytes);
+    body["engine_version"] = json!(format!("vision:{}", "a".repeat(121)));
+    body["result"]["lines"][0]["bbox"] =
+        json!({"x":-0.001,"y":1.0001,"width":1.0001,"height":-0.001});
+    assert_eq!(
+        put_ocr_value(&f.store, &own, &sha, &body).await,
+        StatusCode::OK
+    );
+    f.store.publish_device_ocr_lineage().await.unwrap();
+    let rows = f.store.derived_ocr_records().await.unwrap();
+    assert_eq!(
+        rows[0].get::<Value, _>("envelope")["payload"]["ocr"]["lines"][0]["bbox"],
+        json!({"x":0.0,"y":1.0,"width":1.0,"height":0.0})
+    );
+    f.close().await;
+}
