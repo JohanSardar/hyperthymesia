@@ -49,18 +49,8 @@ pub struct TextLines {
     pub separator: String,
 }
 
-fn text_lines(stdout: &[u8], separator: &str) -> Result<Value, RequestError> {
-    let text = std::str::from_utf8(stdout).map_err(|_| RequestError::CliJson)?;
-    let lines: Vec<Value> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let fields: Vec<&str> = line.split(separator).collect();
-            serde_json::json!({"line": line, "fields": fields})
-        })
-        .collect();
-    Ok(serde_json::json!({"lines": lines}))
-}
+/// Separators that can't cut a credential into pieces the scrubber would miss.
+const TEXT_SEPARATORS: [&str; 6] = ["\t", ",", ";", "|", " ", "\u{1f}"];
 
 /// Owner configuration, never supplied by a recipe or a source response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +213,28 @@ impl RequestGate for Unrestricted {
 }
 
 impl Request {
+    /// Split scrubbed CLI text into `{"lines":[{"line","fields"}]}`.
+    pub(crate) fn split_text(&self, value: Value) -> Value {
+        let (
+            Self::Cli {
+                text: Some(text), ..
+            },
+            Value::String(stdout),
+        ) = (self, &value)
+        else {
+            return value;
+        };
+        let lines: Vec<Value> = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let fields: Vec<&str> = line.split(text.separator.as_str()).collect();
+                serde_json::json!({"line": line, "fields": fields})
+            })
+            .collect();
+        serde_json::json!({"lines": lines})
+    }
+
     /// A recipe may supply credential values, but cannot select a different
     /// login, executable search path, runtime loader or credential directory.
     pub fn validate_cli(&self) -> Result<(), RequestError> {
@@ -230,7 +242,7 @@ impl Request {
             Self::Cli { argv, env, text } => {
                 if text
                     .as_ref()
-                    .is_some_and(|t| t.separator.is_empty() || t.separator.len() > 8)
+                    .is_some_and(|t| !TEXT_SEPARATORS.contains(&t.separator.as_str()))
                 {
                     return Err(RequestError::CliInvalid);
                 }
@@ -459,12 +471,13 @@ impl Request {
                         None => RequestError::Signal,
                     });
                 }
-                match text {
-                    Some(text) => text_lines(&output.stdout, &text.separator),
-                    None => {
-                        serde_json::from_slice(&output.stdout).map_err(|_| RequestError::CliJson)
-                    }
+                // Text stays whole here so secrets are scrubbed before it's split.
+                if text.is_some() {
+                    return String::from_utf8(output.stdout)
+                        .map(Value::String)
+                        .map_err(|_| RequestError::CliJson);
                 }
+                serde_json::from_slice(&output.stdout).map_err(|_| RequestError::CliJson)
             }
         }
     }
