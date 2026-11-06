@@ -12,7 +12,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -73,6 +73,7 @@ fn backup_blocking(source: &Path, to: &Path) -> Result<()> {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(lock_path)?;
     lock.try_lock()
         .context("another backup is using this destination")?;
@@ -206,10 +207,20 @@ fn restore_blocking(from: &Path, target: &Path) -> Result<()> {
     let stage = tempfile::Builder::new()
         .prefix(".hx-restoring-")
         .tempdir_in(parent)?;
+    // tempfile's directory mode follows umask too. Make the empty root private
+    // before it receives any history; rename must publish that same 0700 inode.
+    fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o700))?;
     for (name, expected) in &manifest.files {
         let dest = stage.path().join(name);
-        fs::create_dir_all(dest.parent().context("restore file parent")?)?;
-        let actual = copy_hash(&checked_path(&from, name)?, &mut File::create_new(&dest)?)?;
+        private_directory(dest.parent().context("restore file parent")?)?;
+        // Set privacy at creation, not after copying a person's history. Restore
+        // is also used directly from a shell whose umask may be permissive.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&dest)?;
+        let actual = copy_hash(&checked_path(&from, name)?, &mut file)?;
         ensure!(actual == *expected, "backup hash mismatch: {name}");
     }
     for name in DATABASES {
@@ -227,8 +238,8 @@ fn restore_blocking(from: &Path, target: &Path) -> Result<()> {
             "manifest is missing a published blob"
         );
     }
-    fs::create_dir_all(stage.path().join("blobs"))?;
-    fs::create_dir(stage.path().join("locks"))?;
+    private_directory(&stage.path().join("blobs"))?;
+    private_directory(&stage.path().join("locks"))?;
     sync_tree(stage.path())?;
     empty_target(&target)?;
     // rename refuses a target directory populated meanwhile. No target files
@@ -326,8 +337,15 @@ fn directory(path: &Path) -> Result<()> {
     );
     Ok(())
 }
+fn private_directory(path: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    Ok(())
+}
 fn make_directory(path: &Path) -> Result<()> {
-    match fs::create_dir(path) {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => directory(path),
         Err(e) => Err(e.into()),

@@ -149,18 +149,26 @@ An upgrade:
    both databases and blobs, preserves `server.env`, switches back and restarts.
    Failed-generation state stays beside the active directory as `<state>.failed-*`
    (`server.failed-*` for the default macOS state).
+   A private `<prefix>/.upgrade.*` recovery directory is published before stopping.
+   Its non-executable guard anchor stays beside state on the same filesystem;
+   the recovery executable stays in the prefix, including with a `noexec` data volume.
+   The outer guard recovers even if the lifecycle shell receives SIGKILL, killing
+   its remaining migration/copy processes before restoring. The lifecycle inherits
+   the guard lock, so killing an installer ancestor cannot admit worker jobs.
+   Wrapper/unit refreshes and path records use atomic replacement, including
+   same-version reruns.
    Filesystem recovery errors do not skip the old-service restart attempt; the
-   installer reports incomplete recovery and the retained paths. If atomic
-   link replacement fails during recovery, it attempts a portable unlink/link
-   while stopped. A hard interruption there can require a manual restart.
+   installer reports incomplete recovery and retains the recovery program. If
+   atomic link replacement fails, it attempts a portable unlink/link while stopped.
 
 `migrate` applies every missing version, including a lower number arriving later.
 It rejects newer/unknown, dirty or changed checksums before writable access.
 Missing migrations commit together; failed DDL rolls them back. `serve` never
 migrates. For manual migration stop, back up, migrate, then start the service.
 Rollback requires restoring a pre-upgrade backup into an absent/empty directory;
-pointing an older binary at a newer schema is insufficient. Backups omit
-`server.env`; keep that file separately and private.
+pointing an older binary at a newer schema is insufficient. Restore creates the
+root and all nested directories as 0700 and files as 0600, independently of the
+caller's umask. Backups omit `server.env`; keep that file separately and private.
 
 A registered install whose core disappears refuses before changing anything,
 including when a custom volume is unmounted. Reconnect the volume first. Look
@@ -179,9 +187,14 @@ and use `--start-fresh` with an absent or empty target. This never adopts an
 unmanaged installation and never deletes retained evidence. Keep backups and
 failed copies until recovery is verified; `status` reports their paths/sizes.
 
-A hard interruption can leave the service stopped; retained binaries, state
-and backup remain available for recovery. Diagnose before retrying and keep
-backups/failed state until verified. Versions/backups are not pruned automatically.
+If the entire installer process tree or machine stops, start the managed user
+service again. Its wrapper completes any pending rollback before loading the
+state environment or opening history; rerunning the installer also resumes it.
+Do not delete `pending-upgrade`, its private `.upgrade.*` directory or the
+`.hx-upgrade-lock-*` anchor beside state while recovery
+is pending. Retained binaries, backups and failed state are never pruned automatically.
+A server SIGKILL also closes fx's lifetime pipe: an independent watcher kills its
+process group, including descendants, without relying on service-manager cleanup.
 `--uninstall` stops/disables the managed user service and unlinks entry points;
 it never deletes state, credentials, backups or retained versions.
 
@@ -204,3 +217,9 @@ with foreign keys enabled, matching `Store::create`. The smoke does not prove
 a schema-changing upgrade on a running real service, cross-version binary
 compatibility, real provider login or paid execution. Real reboot, headless login and app permissions
 still need owner VPS/second-user checks.
+
+A separate, manual Linux container run for #35 exercises a real schema-changing
+installed upgrade, failed and killed upgrades, pairing/device OCR citations,
+permissive-umask restore, and SIGKILL orphan cleanup. See the
+[recorded end-to-end evidence](install-e2e.md). No real login or paid model call
+is needed for that check.
