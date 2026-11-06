@@ -170,7 +170,16 @@ impl Store {
 
     /// Readiness without creating state, changing journals or reading secrets.
     pub async fn check_state(state_dir: impl AsRef<Path>) -> Result<()> {
-        let dir = state_dir.as_ref();
+        Self::check_state_schema(state_dir.as_ref(), true).await
+    }
+
+    /// Installer preflight: same privacy/integrity checks, permitting only
+    /// missing embedded migrations. No writes or provider checks.
+    pub async fn check_upgrade_state(state_dir: impl AsRef<Path>) -> Result<()> {
+        Self::check_state_schema(state_dir.as_ref(), false).await
+    }
+
+    async fn check_state_schema(dir: &Path, exact: bool) -> Result<()> {
         let metadata = std::fs::symlink_metadata(dir)?;
         ensure!(
             metadata.is_dir() && metadata.permissions().mode() & 0o7777 == 0o700,
@@ -190,7 +199,7 @@ impl Store {
             );
         }
         let mut conn = readonly(&dir.join("core.sqlite")).await?;
-        validate_schema(&mut conn, &MIGRATOR, true).await?;
+        validate_schema(&mut conn, &MIGRATOR, exact).await?;
         let checks: Vec<String> = sqlx::query_scalar("PRAGMA quick_check")
             .fetch_all(&mut conn)
             .await?;
@@ -421,9 +430,9 @@ mod upgrade_tests {
                             Cow::Owned(format!("test {v}")),
                             MigrationType::Simple,
                             sqlx::SqlStr::from_static(match v {
-                                1 => "CREATE TABLE test_1(value TEXT);",
-                                2 => "CREATE TABLE test_2(value TEXT);",
-                                3 => "CREATE TABLE test_3(value TEXT);",
+                                1 => "CREATE TABLE test_1(value TEXT PRIMARY KEY);",
+                                2 => "CREATE TABLE rebuilt(value TEXT REFERENCES test_1(value), extra TEXT); INSERT INTO rebuilt(value) SELECT value FROM test_3; DROP TABLE test_3; ALTER TABLE rebuilt RENAME TO test_3;",
+                                3 => "CREATE TABLE test_3(value TEXT REFERENCES test_1(value));",
                                 _ => "CREATE TABLE test_4(value TEXT);",
                             }),
                             false,
@@ -443,6 +452,9 @@ mod upgrade_tests {
         let store = Store::connect(&file, SqliteJournalMode::Delete).await?;
         let mut tx = store.begin_write().await?;
         migrations(&[1, 3]).run(&mut *tx).await?;
+        sqlx::query("INSERT INTO test_1 VALUES('synthetic evidence')")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("INSERT INTO test_3 VALUES('synthetic evidence')")
             .execute(&mut *tx)
             .await?;
@@ -472,11 +484,31 @@ mod upgrade_tests {
             .fetch_one(&store.pool)
             .await?;
         assert_eq!(value, "synthetic evidence");
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&store.pool)
+            .await?;
+        assert_eq!(foreign_keys, 1);
+        assert!(
+            sqlx::query("INSERT INTO test_3(value) VALUES('orphan')")
+                .execute(&store.pool)
+                .await
+                .is_err()
+        );
+        let violations = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&store.pool)
+            .await?;
+        assert!(violations.is_empty());
         let versions: Vec<i64> =
             sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
                 .fetch_all(&store.pool)
                 .await?;
-        assert_eq!(versions, [1, 2, 3]);
+        assert_eq!(
+            versions,
+            migrations(&[1, 2, 3])
+                .iter()
+                .map(|m| m.version)
+                .collect::<Vec<_>>()
+        );
         store.pool.close().await;
         let before = std::fs::read(&file)?;
         assert!(
@@ -499,6 +531,155 @@ mod upgrade_tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&file)?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_sources_migration_upgrades_1_3_without_changing_evidence_or_pairing() -> Result<()>
+    {
+        use crate::{Token, UploadBatch};
+        use hx_schema::Envelope;
+        let dir = tempfile::tempdir()?;
+        for name in ["core.sqlite", "agent.sqlite"] {
+            private_file(&dir.path().join(name))?;
+        }
+        rusqlite::Connection::open(dir.path().join("agent.sqlite"))?.execute_batch("VACUUM;")?;
+        for name in ["blobs", "locks"] {
+            std::fs::create_dir(dir.path().join(name))?;
+        }
+        // Reconstruct the actual pre-#66 core, not a synthetic migration 0002.
+        let previous = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|m| matches!(m.version, 1 | 3))
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        assert_eq!(
+            previous.iter().map(|m| m.version).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 2)
+                .unwrap()
+                .sql
+                .as_str(),
+            include_str!("../../migrations-sqlite/0002_sources.sql")
+        );
+        let store =
+            Store::connect(&dir.path().join("core.sqlite"), SqliteJournalMode::Delete).await?;
+        let mut tx = store.begin_write().await?;
+        previous.run(&mut *tx).await?;
+        tx.commit().await?;
+        let event: Envelope = serde_json::from_value(serde_json::json!({
+            "envelope_version": 1, "observation_id": "01J00000000000000000000001",
+            "connector_instance": "test:upgrade", "source_key": "synthetic", "revision": "1",
+            "operation": "observe", "kind": "web.visit", "schema_version": 1,
+            "time": {"observed_at": "2026-01-01T00:00:00Z", "resolution_ms": 1000},
+            "sensitivity": "normal", "payload": {"url": "https://example.invalid", "title": "Synthetic upgrade evidence"}
+        }))?;
+        let token = Token {
+            prefixes: vec!["test:upgrade".into()],
+            scopes: vec!["ingest".into()],
+        };
+        let batch = || UploadBatch {
+            batch_id: ulid::Ulid::generate(),
+            envelopes: vec![event.clone()],
+        };
+        assert_eq!(store.ingest(batch(), &token).await?.accepted, 1);
+        let code = store.create_pair_code("synthetic upgrade device").await?;
+        let before: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id,envelope FROM events ORDER BY id")
+                .fetch_all(&store.pool)
+                .await?;
+        let checksums: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version,checksum FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&store.pool)
+                .await?;
+        assert_eq!(
+            checksums.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        // Seed the OCR parent/child pair too: a later embedded table rebuild
+        // must preserve existing rows, not merely succeed on empty tables.
+        sqlx::query("INSERT INTO blobs(sha256,bytes,created_at) VALUES($1,0,0)")
+            .bind("a".repeat(64))
+            .execute(&store.pool)
+            .await?;
+        let event_id = before[0].0;
+        sqlx::query("INSERT INTO ocr_jobs(sha256,engine_version,source_event_id,available_at,status,result) VALUES($1,'test-upgrade',$2,0,'complete','{}')")
+            .bind("a".repeat(64)).bind(event_id).execute(&store.pool).await?;
+        let mut tx = store.begin_write().await?;
+        let ocr_id = tx.insert_evidence(sqlx::query_scalar("INSERT INTO ocr_evidence(id,observation_id,source_event_id,sha256,engine_version) VALUES((SELECT next_id FROM evidence_seq),'synthetic-ocr',$1,$2,'test-upgrade') RETURNING id")
+            .bind(event_id).bind("a".repeat(64))).await?.unwrap();
+        tx.commit().await?;
+        store.pool.close().await;
+        assert!(
+            Store::open(dir.path()).await.is_err(),
+            "serve must not migrate"
+        );
+        assert_eq!(Store::status(dir.path()).await?, 0);
+        let store = Store::migrate(dir.path()).await?;
+        let fresh = tempfile::tempdir()?;
+        let fresh_store = Store::create(fresh.path()).await?;
+        let upgraded_fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&store.pool)
+            .await?;
+        let created_fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&fresh_store.pool)
+            .await?;
+        assert_eq!(upgraded_fk, created_fk);
+        assert_eq!(upgraded_fk, 1);
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(&store.pool)
+                .await?
+                .is_empty()
+        );
+        fresh_store.pool.close().await;
+        let versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&store.pool)
+                .await?;
+        assert_eq!(
+            versions,
+            MIGRATOR.iter().map(|m| m.version).collect::<Vec<_>>()
+        );
+        let after: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id,envelope FROM events ORDER BY id")
+                .fetch_all(&store.pool)
+                .await?;
+        assert_eq!(after, before);
+        let ocr: (i64, String, String) = sqlx::query_as("SELECT e.id,e.observation_id,j.result FROM ocr_evidence e JOIN ocr_jobs j USING(sha256,engine_version) WHERE e.id=$1")
+            .bind(ocr_id).fetch_one(&store.pool).await?;
+        assert_eq!(ocr, (ocr_id, "synthetic-ocr".into(), "{}".into()));
+        let old_checksums: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT version,checksum FROM _sqlx_migrations WHERE version IN (1,3) ORDER BY version",
+        )
+        .fetch_all(&store.pool)
+        .await?;
+        assert_eq!(old_checksums, checksums);
+        let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('sources','recipes','live_snapshots')").fetch_one(&store.pool).await?;
+        assert_eq!(tables, 3);
+        let retry = store.ingest(batch(), &token).await?;
+        assert_eq!(
+            (retry.accepted, retry.duplicates, retry.rejected.len()),
+            (0, 1, 0)
+        );
+        assert!(
+            store
+                .redeem_pair_code(&code, "synthetic-upgrade")
+                .await?
+                .is_some()
+        );
+        store.pool.close().await;
+        let store = Store::migrate(dir.path()).await?;
+        store.pool.close().await;
         Ok(())
     }
 

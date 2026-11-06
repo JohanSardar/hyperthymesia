@@ -162,7 +162,6 @@ jobs:
 
   install-smoke:
     name: install-smoke (${{ matrix.platform }})
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     needs: build
     strategy:
       fail-fast: false
@@ -194,7 +193,7 @@ jobs:
   assemble:
     name: Assemble verified assets
     needs: [build, clean-linux, install-smoke]
-    if: always() && needs.build.result == 'success' && needs.clean-linux.result == 'success' && (needs.install-smoke.result == 'success' || needs.install-smoke.result == 'skipped')
+    if: always() && needs.build.result == 'success' && needs.clean-linux.result == 'success' && needs.install-smoke.result == 'success'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
@@ -235,7 +234,7 @@ jobs:
 
   publish:
     name: Publish owner-tagged release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: success() && needs.assemble.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: assemble
     permissions:
       contents: write
