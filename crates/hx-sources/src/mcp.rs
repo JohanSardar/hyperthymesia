@@ -38,15 +38,56 @@ fn lookup(tool: &str, arguments: Value) -> Value {
     }
 }
 fn result(value: Value, id: u64) -> Result<Value, RequestError> {
-    if value["jsonrpc"] != "2.0"
-        || value["id"] != id
-        || value.get("error").is_some()
-        || value.get("result").is_none()
-        || value["result"]["isError"] == true
-    {
+    if value["jsonrpc"] != "2.0" || value["id"] != id {
+        return Err(RequestError::McpUnavailable);
+    }
+    if let Some(error) = value.get("error") {
+        return Err(mcp_error(error));
+    }
+    if value["result"]["isError"] == true {
+        return Err(mcp_error(&value["result"]["structuredContent"]["error"]));
+    }
+    if value.get("result").is_none() {
         return Err(RequestError::McpUnavailable);
     }
     Ok(value["result"].clone())
+}
+
+/// MCP peers may return auth failures in JSON-RPC or tool-level errors at HTTP
+/// 200. Classify fixed codes/prefixes without ever returning provider prose.
+fn mcp_error(error: &Value) -> RequestError {
+    let login = matches!(error["code"].as_u64(), Some(401 | 403))
+        || error["code"].as_str().is_some_and(|code| {
+            matches!(
+                code,
+                "unauthorized"
+                    | "unauthenticated"
+                    | "forbidden"
+                    | "invalid_token"
+                    | "token_expired"
+            )
+        })
+        || error["message"].as_str().is_some_and(|message| {
+            let prefix: String = message
+                .chars()
+                .take(64)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            [
+                "unauthorized:",
+                "unauthenticated:",
+                "authentication required",
+                "credential expired",
+                "token expired",
+            ]
+            .iter()
+            .any(|p| prefix.starts_with(p))
+        });
+    if login {
+        RequestError::Login
+    } else {
+        RequestError::McpUnavailable
+    }
 }
 
 pub(crate) async fn execute(
@@ -130,7 +171,7 @@ async fn http(
         .await
         .map_err(|_| RequestError::Transport)?;
     if !notified.status().is_success() {
-        return Err(RequestError::Status(notified.status().as_u16()));
+        return Err(crate::request::http_failure(notified).await);
     }
     gate.check().await?;
     let response = client
@@ -145,7 +186,7 @@ async fn http(
 
 async fn http_result(mut response: reqwest::Response, id: u64) -> Result<Value, RequestError> {
     if !response.status().is_success() {
-        return Err(RequestError::Status(response.status().as_u16()));
+        return Err(crate::request::http_failure(response).await);
     }
     let sse = response
         .headers()

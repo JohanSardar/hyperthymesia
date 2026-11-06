@@ -67,7 +67,7 @@ pub(crate) async fn scrubber(store: &Store, extra: Option<&str>) -> ApiResult<Sc
         )
     })?;
     if let Some(key) = extra {
-        secrets.push(key.to_owned());
+        secrets.extend(hx_sources::oauth::redaction_values(key));
     }
     Scrubber::new(secrets).map_err(|error| match error {
         hx_sources::scrub::ScrubError::KeyTooShort => {
@@ -85,11 +85,17 @@ async fn safe(store: &Store, value: Value) -> ApiResult<Json<Value>> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connect {
-    name: String,
-    description: String,
-    key: Option<String>,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) key: Option<String>,
+    #[serde(default)]
+    probe: Option<hx_sources::request::Request>,
+    #[serde(default)]
+    probe_json: Option<String>,
+    #[serde(default)]
+    cli_home: Option<String>,
     #[serde(default = "history_default")]
-    history_days: u8,
+    pub(crate) history_days: u8,
 }
 fn history_default() -> u8 {
     1
@@ -114,21 +120,105 @@ pub async fn connect(
     if scrubber.contains_secret(&request.description) || scrubber.contains_secret(&request.name) {
         return Err(bad("name and description must not contain source keys"));
     }
+    if let Some(json) = request.probe_json.filter(|s| !s.is_empty()) {
+        request.probe =
+            Some(serde_json::from_str(&json).map_err(|_| bad("Invalid connection check"))?);
+    }
+    if let Some(home) = request.cli_home.filter(|h| !h.is_empty()) {
+        if !std::path::Path::new(&home).is_absolute()
+            || home.chars().any(char::is_control)
+            || scrubber.contains_secret(&home)
+        {
+            return Err(bad("CLI HOME must be an absolute non-secret path"));
+        }
+        if let Some(hx_sources::request::Request::Cli { env, .. }) = &mut request.probe {
+            env.insert("HOME".into(), home.clone());
+        }
+        request.description.push_str(&format!(
+            " Use HOME {home} for all CLI requests (env HOME in recipes)."
+        ));
+    }
+    if let Some(probe) = &request.probe {
+        probe
+            .authorize(&request.description)
+            .map_err(|_| bad("Connection check destination is not authorized"))?;
+        if scrubber.scrub_json(&serde_json::to_value(probe).map_err(anyhow::Error::from)?)
+            != serde_json::to_value(probe).map_err(anyhow::Error::from)?
+        {
+            return Err(bad("Connection check must not contain credentials"));
+        }
+    }
+    let error = if let Some(probe) = &request.probe {
+        check_connection(&store, probe, request.key.as_deref())
+            .await
+            .err()
+            .map(|e| e.to_string())
+    } else {
+        None
+    };
     let source = store
-        .connect_source_with_key(
+        .connect_source_checked(
             &request.name,
             &request.description,
             request.history_days,
             request.key.as_deref(),
+            request.probe.as_ref(),
+            error.as_deref(),
         )
         .await?;
     Ok((
         StatusCode::CREATED,
         Json(
-            json!({"id":source.id,"connector_instance":source.connector_instance,"enabled":true,"status":"setting_up"}),
+            json!({"id":source.id,"connector_instance":source.connector_instance,"enabled":true,"status":if error.is_some() {"needs_reconnect"} else {"setting_up"}}),
         ),
     ))
 }
+async fn check_connection(
+    store: &Store,
+    request: &hx_sources::request::Request,
+    key: Option<&str>,
+) -> Result<(), hx_sources::request::RequestError> {
+    let work = tempfile::tempdir().map_err(|_| hx_sources::request::RequestError::HostIo)?;
+    let host =
+        hx_sources::host::HostRunner::from_env(store.data_dir.clone(), work.path().to_owned());
+    request
+        .execute(
+            hx_sources::request::Placeholders { key, cursor: None },
+            std::time::Duration::from_secs(30),
+            &host,
+        )
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn reconnect_source(store: &Store, id: &str, key: Option<&str>) -> ApiResult<()> {
+    let source = source(store, id).await?;
+    if !source.enabled {
+        return Err(bad("Turn this source on before reconnecting"));
+    }
+    if let Some(probe) = store.source_check(id).await? {
+        probe
+            .authorize(&source.description)
+            .map_err(|_| bad("Connection check destination is not authorized"))?;
+        let saved = keys(store)?
+            .read(id)
+            .map_err(|_| bad("Source key unavailable"))?;
+        if let Err(error) = check_connection(store, &probe, key.or(saved.as_deref())).await {
+            store
+                .record_source_pull(id, chrono::Utc::now(), true, Some(&error.to_string()))
+                .await?;
+            return Err(bad(
+                "Login still unavailable. Sign in to the CLI on the server with the configured HOME, then reconnect.",
+            ));
+        }
+    }
+    if let Some(key) = key {
+        store.patch_source(id, None, Some(key)).await?;
+    }
+    store.resume_source(id).await?;
+    Ok(())
+}
+
 pub async fn list(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     owner(&store, &headers).await?;
     let keys = keys(&store)?;
@@ -145,6 +235,14 @@ pub async fn list(State(store): State<Store>, headers: HeaderMap) -> ApiResult<J
             .is_some();
         let mut value = serde_json::to_value(&source).map_err(anyhow::Error::from)?;
         value["has_key"] = json!(has_key);
+        value["oauth"] = json!(
+            keys.read(&source.id)
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(|v| hx_sources::oauth::Credential::parse(v).ok().flatten())
+                .is_some()
+        );
         values.push(value);
     }
     safe(&store, json!(values)).await

@@ -90,20 +90,104 @@ impl Store {
         history_days: u8,
         key: Option<&str>,
     ) -> Result<Source> {
+        self.connect_source_checked(name, description, history_days, key, None, None)
+            .await
+    }
+
+    /// A deterministic failed preflight publishes a reconnectable source without
+    /// a setup job. Authentication is fixed before any paid work is purchased.
+    pub async fn connect_source_checked(
+        &self,
+        name: &str,
+        description: &str,
+        history_days: u8,
+        key: Option<&str>,
+        probe: Option<&hx_sources::request::Request>,
+        error: Option<&str>,
+    ) -> Result<Source> {
         ensure!(!name.trim().is_empty(), "source name required");
         ensure!(history_days <= 30, "history_days must be in 0..=30");
         let id = new_id();
         let connector = format!("source:{id}");
         let now = Ts::now();
         let mut tx = self.begin_write().await?;
-        let source = sqlx::query_as("INSERT INTO sources(id,connector_instance,name,description,history_days,connected_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING *")
+        let mut source: Source = sqlx::query_as("INSERT INTO sources(id,connector_instance,name,description,history_days,connected_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING *")
             .bind(&id).bind(connector).bind(name).bind(description).bind(i64::from(history_days)).bind(now).fetch_one(&mut *tx).await?;
-        enqueue_setup(&mut tx, &id, 1, now).await?;
+        if let Some(probe) = probe {
+            sqlx::query("INSERT INTO source_checks(source_id,request) VALUES($1,$2)")
+                .bind(&id)
+                .bind(serde_json::to_value(probe)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(error) = error {
+            sqlx::query("UPDATE sources SET status='needs_reconnect',last_error=$2 WHERE id=$1")
+                .bind(&id)
+                .bind(error)
+                .execute(&mut *tx)
+                .await?;
+            source.status = "needs_reconnect".to_owned();
+            source.last_error = Some(error.to_owned());
+        } else {
+            enqueue_setup(&mut tx, &id, 1, now).await?;
+        }
         if let Some(key) = key {
             hx_sources::keys::KeyStore::new(&self.data_dir)?.write(&id, key)?;
         }
         tx.commit().await?;
         Ok(source)
+    }
+
+    pub async fn source_check(&self, id: &str) -> Result<Option<hx_sources::request::Request>> {
+        let value: Option<sqlx::types::Json<hx_sources::request::Request>> =
+            sqlx::query_scalar("SELECT request FROM source_checks WHERE source_id=$1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(value.map(|v| v.0))
+    }
+
+    /// Successful owner reconnect resumes recipes or the unused part of the
+    /// current setup budget. Never reset attempts or create a new generation.
+    pub async fn resume_source(&self, id: &str) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let source: Source = sqlx::query_as("SELECT * FROM sources WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        ensure!(source.enabled, "source is off");
+        let setup: Option<(String, String, i64, i64)> = sqlx::query_as("SELECT r.status,j.state,j.attempts,j.max_attempts FROM setup_runs r JOIN jobs j ON j.output_key='setup:' || r.source_id || ':' || r.generation WHERE r.source_id=$1 AND r.generation=$2")
+            .bind(id).bind(source.setup_generation).fetch_optional(&mut *tx).await?;
+        let (status, error) = match setup {
+            None => {
+                enqueue_setup(&mut tx, id, source.setup_generation, Ts::now()).await?;
+                ("setting_up", None)
+            }
+            Some((status, _, _, _)) if status == "succeeded" => ("ready", None),
+            Some((_, state, attempts, limit)) if attempts < limit => {
+                if matches!(state.as_str(), "done" | "failed") {
+                    sqlx::query("UPDATE jobs SET state='ready',available_at=$2,last_error=NULL,request_version=request_version+1 WHERE output_key=$1")
+                        .bind(format!("setup:{id}:{}", source.setup_generation)).bind(Ts::now()).execute(&mut *tx).await?;
+                }
+                sqlx::query("UPDATE setup_runs SET status='pending',result=NULL,last_error=NULL,finished_at=NULL WHERE source_id=$1 AND generation=$2")
+                    .bind(id).bind(source.setup_generation).execute(&mut *tx).await?;
+                ("setting_up", None)
+            }
+            Some(_) => (
+                "needs_attention",
+                Some(
+                    "Login restored. Setup's two attempts were used. Review the connection and use Run setup again on Agent setup.",
+                ),
+            ),
+        };
+        sqlx::query("UPDATE sources SET status=$2,last_error=$3 WHERE id=$1")
+            .bind(id)
+            .bind(status)
+            .bind(error)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE recipe_state SET next_run_at=$2,last_error=NULL WHERE recipe_id IN (SELECT id FROM recipes WHERE source_id=$1)").bind(id).bind(Ts::now()).execute(&mut *tx).await?;
+        tx.commit().await
     }
 
     pub async fn sources(&self) -> Result<Vec<Source>> {

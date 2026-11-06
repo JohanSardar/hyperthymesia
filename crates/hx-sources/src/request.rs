@@ -56,12 +56,16 @@ pub enum RequestError {
     Unsupported,
     #[error("invalid HTTP request")]
     Invalid,
+    #[error("Login expired or missing. Reconnect this source on Connect sources.")]
+    Login,
     #[error("request requires a source key")]
     MissingKey,
     #[error("HTTP request failed or timed out")]
     Transport,
     #[error("HTTP status {0}")]
     Status(u16),
+    #[error("Source rate limited. Automatic pulls will retry after {0} seconds.")]
+    RateLimited(u64),
     #[error("HTTP response exceeds size limit")]
     TooLarge,
     #[error("HTTP response is not JSON")]
@@ -90,11 +94,17 @@ pub enum RequestError {
 
 impl RequestError {
     pub fn needs_reconnect(&self) -> bool {
-        matches!(self, Self::Status(401 | 403))
+        matches!(
+            self,
+            Self::Login | Self::MissingKey | Self::Status(401 | 403)
+        )
     }
 
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Transport | Self::Status(408 | 429 | 500..=599))
+        matches!(
+            self,
+            Self::Transport | Self::RateLimited(_) | Self::Status(408 | 429 | 500..=599)
+        )
     }
 }
 
@@ -172,6 +182,50 @@ impl Request {
         }
     }
 
+    /// Bind non-secret data without evaluating it. HTTP values are always encoded
+    /// as URL components; the authority is pinned by the original template.
+    pub fn bind(&self, name: &str, value: &str) -> Result<Self, RequestError> {
+        fn replace(value: &mut Value, needle: &str, replacement: &str) {
+            match value {
+                Value::String(s) => *s = s.replace(needle, replacement),
+                Value::Array(a) => {
+                    for v in a {
+                        replace(v, needle, replacement);
+                    }
+                }
+                Value::Object(o) => {
+                    for v in o.values_mut() {
+                        replace(v, needle, replacement);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let needle = format!("{{{{{name}}}}}");
+        let mut json = serde_json::to_value(self).map_err(|_| RequestError::Invalid)?;
+        if let Some(url) = json.get_mut("url") {
+            let template = url.as_str().ok_or(RequestError::Invalid)?;
+            let authority = template
+                .split_once("://")
+                .ok_or(RequestError::Invalid)?
+                .1
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            if authority.contains("{{") {
+                return Err(RequestError::Invalid);
+            }
+            *url = Value::String(template.replace(&needle, &encode_url_value(value)));
+        }
+        // Do not substitute a second time inside the already encoded URL.
+        let url = json.as_object_mut().and_then(|o| o.remove("url"));
+        replace(&mut json, &needle, value);
+        if let Some(url) = url {
+            json["url"] = url;
+        }
+        serde_json::from_value(json).map_err(|_| RequestError::Invalid)
+    }
+
     /// No retries and no model. CLI argv remain literal arguments, including
     /// response-controlled cursors; no substituted text is evaluated as shell.
     #[cfg(unix)]
@@ -214,6 +268,14 @@ impl Request {
                     .collect::<Result<BTreeMap<_, _>, RequestError>>()?;
                 if let Some(key) = values.key {
                     env.insert("SOURCE_KEY".into(), key.into());
+                }
+                let mut host = host.clone();
+                if let Some(home) = env.remove("HOME") {
+                    let home = std::path::PathBuf::from(home);
+                    if !home.is_absolute() {
+                        return Err(RequestError::CliInvalid);
+                    }
+                    host.home = home;
                 }
                 let command = argv
                     .iter()
@@ -303,7 +365,7 @@ impl Request {
             .await
             .map_err(|_| RequestError::Transport)?;
         if !response.status().is_success() {
-            return Err(RequestError::Status(response.status().as_u16()));
+            return Err(http_failure(response).await);
         }
         if response
             .content_length()
@@ -323,6 +385,74 @@ impl Request {
             bytes.extend_from_slice(&chunk);
         }
         serde_json::from_slice(&bytes).map_err(|_| RequestError::Json)
+    }
+}
+
+/// Honor a bounded Retry-After without spinning or sleeping inside a worker.
+pub(crate) fn http_status(response: &reqwest::Response) -> RequestError {
+    let status = response.status().as_u16();
+    if matches!(status, 403 | 429 | 503) {
+        let delay = response
+            .headers()
+            .get("retry-after")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|text| {
+                text.parse::<u64>().ok().or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(text).ok().map(|at| {
+                        (at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                            .num_seconds()
+                            .max(1) as u64
+                    })
+                })
+            });
+        if let Some(delay) = delay {
+            return RequestError::RateLimited(delay.clamp(1, 86400));
+        }
+    }
+    RequestError::Status(status)
+}
+
+/// Some APIs report quota exhaustion as 403. Inspect only bounded structured
+/// codes, never provider prose, and never expose the error body to callers.
+pub(crate) async fn http_failure(mut response: reqwest::Response) -> RequestError {
+    let error = http_status(&response);
+    if error != RequestError::Status(403) {
+        return error;
+    }
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if bytes.len() + chunk.len() > 64 * 1024 {
+            return error;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return error;
+    };
+    let limited = |value: &Value| {
+        value.as_str().is_some_and(|code| {
+            matches!(
+                code,
+                "RESOURCE_EXHAUSTED"
+                    | "rateLimitExceeded"
+                    | "userRateLimitExceeded"
+                    | "dailyLimitExceeded"
+                    | "quotaExceeded"
+                    | "rate_limit_exceeded"
+                    | "too_many_requests"
+            )
+        })
+    };
+    if limited(&value["error"]["status"])
+        || limited(&value["error"]["code"])
+        || limited(&value["error"]["type"])
+        || value["error"]["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|e| limited(&e["reason"])))
+    {
+        RequestError::RateLimited(3600)
+    } else {
+        error
     }
 }
 

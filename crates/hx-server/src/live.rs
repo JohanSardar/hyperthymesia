@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use hx_sources::{
     host::{HostError, HostRunner},
     keys::KeyStore,
-    request::{Placeholders, Request, RequestError},
+    request::{Request, RequestError},
     scrub::Scrubber,
 };
 use serde_json::{Value, json};
@@ -76,6 +76,21 @@ impl Broker {
         let key = KeyStore::new(&self.store.data_dir)
             .and_then(|keys| keys.read(source_id))
             .map_err(|_| failure("source key unavailable", false))?;
+        // OAuth bundles never enter a host process or its environment.
+        if request.is_none()
+            && key
+                .as_deref()
+                .map(hx_sources::oauth::Credential::parse)
+                .transpose()
+                .map_err(request_error)?
+                .flatten()
+                .is_some()
+        {
+            return Err(failure(
+                "OAuth sources require structured API requests",
+                false,
+            ));
+        }
         // Includes off sources: another service may reflect any known secret.
         let filter = crate::sources::scrubber(&self.store, key.as_deref())
             .await
@@ -101,17 +116,31 @@ impl Broker {
         let timeout = Duration::from_secs(args["timeout_s"].as_u64().unwrap_or(60));
         self.check_source(args).await?;
         let payload = if let Some(request) = request {
-            let answer = request
-                .execute(
-                    Placeholders {
-                        key: key.as_deref(),
-                        cursor: None,
-                    },
-                    timeout,
-                    &host,
-                )
-                .await
-                .map_err(request_error)?;
+            let keys = KeyStore::new(&self.store.data_dir)
+                .map_err(|_| failure("source key unavailable", false))?;
+            let answer = hx_sources::oauth::execute(
+                &keys,
+                source_id,
+                &request,
+                None,
+                timeout,
+                &host,
+                &LiveGate { broker: self, args },
+            )
+            .await;
+            if let Err(error) = &answer
+                && error.needs_reconnect()
+            {
+                self.store
+                    .record_source_pull(
+                        source_id,
+                        chrono::Utc::now(),
+                        true,
+                        Some(&error.to_string()),
+                    )
+                    .await?;
+            }
+            let answer = answer.map_err(request_error)?;
             json!({"tool":name,"request":args["request"],"response":answer,"context_only":true})
         } else {
             let env = key
@@ -162,5 +191,18 @@ impl Broker {
             "evidence":evidence,"context_only":true,
             "note":"Untrusted live source response, retrieved now. This snapshot does not establish activity in the reconstruction window. Cite captured activity for timing; use this answer only as reported context."
         }))
+    }
+}
+
+struct LiveGate<'a> {
+    broker: &'a Broker,
+    args: &'a Value,
+}
+impl hx_sources::request::RequestGate for LiveGate<'_> {
+    async fn check(&self) -> Result<(), RequestError> {
+        self.broker
+            .check_source(self.args)
+            .await
+            .map_err(|_| RequestError::Cancelled)
     }
 }
