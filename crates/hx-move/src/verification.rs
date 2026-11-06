@@ -1,49 +1,53 @@
 use crate::postgres::Snapshot;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use futures_util::TryStreamExt;
 use hx_store::Store;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, io::Read, path::Path};
 
-fn citations(value: &Value, ids: &mut BTreeSet<i64>) {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object {
-                if matches!(
-                    key.as_str(),
-                    "evidence" | "outcome_evidence" | "evidence_ids"
-                ) {
-                    if let Some(items) = value.as_array() {
-                        for item in items {
-                            if let Some(id) = item
-                                .as_i64()
-                                .or_else(|| item.get("id").and_then(Value::as_i64))
-                            {
-                                ids.insert(id);
-                            }
-                        }
-                    } else if let Some(id) = value.as_i64() {
-                        ids.insert(id);
-                    }
-                }
-                citations(value, ids);
+// Only the published interpretation's episode/claim fields are citations.
+// agent_run, input_manifest, prior-context responses and rejected check_failures
+// are immutable audit records, and may contain failed or hallucinated lookups.
+fn citations(value: &Value, ids: &mut BTreeSet<i64>) -> Result<()> {
+    fn add(value: Option<&Value>, ids: &mut BTreeSet<i64>) -> Result<()> {
+        if let Some(value) = value {
+            for id in value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("invalid published citation list"))?
+            {
+                ids.insert(
+                    id.as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("invalid published citation ID"))?,
+                );
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                citations(item, ids);
-            }
-        }
-        _ => {}
+        Ok(())
     }
+    for episode in value
+        .get("episodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        add(episode.get("evidence"), ids)?;
+        for claim in episode
+            .get("claims")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            add(claim.get("evidence"), ids)?;
+            add(claim.get("outcome_evidence"), ids)?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn evidence(source: &mut Snapshot, store: &Store) -> Result<(u64, u64, u64)> {
     let mut citations_checked = 0;
     for sql in [
         "SELECT interpretation FROM revisions ORDER BY id",
-        "SELECT agent_run FROM revisions WHERE agent_run IS NOT NULL ORDER BY id",
         "SELECT evidence FROM entity_assertions ORDER BY id",
     ] {
         let mut stream = sqlx::query_scalar::<_, String>(sql).fetch(&store.pool);
@@ -58,7 +62,7 @@ pub async fn evidence(source: &mut Snapshot, store: &Store) -> Result<(u64, u64,
                     );
                 }
             } else {
-                citations(&value, &mut ids);
+                citations(&value, &mut ids)?;
             }
             for id in ids {
                 ensure!(store.evidence(id).await?.is_some(), "unresolved citation");
@@ -91,15 +95,22 @@ pub async fn evidence(source: &mut Snapshot, store: &Store) -> Result<(u64, u64,
             cursor = id;
         }
     }
-    // Sample individual index lexemes (not application-limited search results)
-    // so frequent terms do not falsely fail because their row is beyond LIMIT 100.
-    let searches: Vec<(i64,String)> = sqlx::query_as("SELECT event_id,(tsvector_to_array(search_vector))[1] FROM normalized WHERE search_vector<>''::tsvector ORDER BY md5(event_id::text || ':hx-move-search-v1') LIMIT 1000")
+    // Probe only whole whitespace-delimited ASCII words from the original
+    // search text. Never reparse PG lexemes: URL paths and Unicode case folding
+    // differ between these tokenizers. FTS rank=1 integrity covers skipped rows.
+    let searches: Vec<(i64,String)> = sqlx::query_as("SELECT event_id,search_text FROM normalized ORDER BY md5(event_id::text || ':hx-move-search-v1') LIMIT 1000")
         .fetch_all(&mut source.conn).await?;
     let mut search_checked = 0;
-    for (id, term) in searches {
-        let pg: bool = sqlx::query_scalar("SELECT search_vector @@ plainto_tsquery('simple',$2) FROM normalized WHERE event_id=$1").bind(id).bind(&term).fetch_one(&mut source.conn).await?;
-        let sqlite: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM normalized_fts WHERE rowid=$1 AND normalized_fts MATCH $2)").bind(id).bind(hx_store::sqlite::search_query(&term)).fetch_one(&store.pool).await?;
-        ensure!(pg && sqlite, "search sample did not resolve");
+    for (id, text) in searches {
+        let Some(term) = text
+            .split_whitespace()
+            .find(|word| word.bytes().all(|b| b.is_ascii_alphabetic()))
+        else {
+            continue;
+        };
+        let pg: bool = sqlx::query_scalar("SELECT search_vector @@ plainto_tsquery('simple',$2) FROM normalized WHERE event_id=$1").bind(id).bind(term).fetch_one(&mut source.conn).await?;
+        let sqlite: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM normalized_fts WHERE rowid=$1 AND normalized_fts MATCH $2)").bind(id).bind(hx_store::sqlite::search_query(term)).fetch_one(&store.pool).await?;
+        ensure!(pg && sqlite, "search sample did not resolve for event {id}");
         search_checked += 1;
     }
     Ok((citations_checked, evidence_checked, search_checked))
@@ -138,56 +149,77 @@ async fn compare_evidence(source: &mut Snapshot, store: &Store, id: i64) -> Resu
     Ok(())
 }
 
-pub async fn blobs(store: &Store, old_dir: &Path, all: bool) -> Result<(u64, u64)> {
+pub async fn blobs(store: &Store, old_dir: &Path, _all: bool) -> Result<(u64, u64)> {
     let mut stream = sqlx::query_as::<_, (String, Option<i64>)>(
         "SELECT sha256,bytes FROM blobs WHERE published ORDER BY sha256",
     )
     .fetch(&store.pool);
     let mut checked = 0;
-    let mut rehashed = 0;
+    let mut problems = Vec::new();
     while let Some((sha, bytes)) = stream.try_next().await? {
         ensure!(hx_store::valid_hash(&sha), "invalid blob identity");
-        let old = old_dir.join("blobs").join(&sha[..2]).join(&sha);
-        let destination = store.blob_path(&sha)?;
-        let metadata = std::fs::symlink_metadata(&old)?;
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "blob must be a regular file"
-        );
-        ensure!(
-            bytes.is_some_and(|b| b >= 0 && b as u64 == metadata.len()),
-            "published blob size differs"
-        );
-        std::fs::create_dir_all(destination.parent().expect("blob parent"))?;
-        match std::fs::hard_link(&old, &destination) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(18) => {
-                std::fs::copy(&old, &destination)?;
-            }
-            Err(error) => return Err(error.into()),
+        if let Err(error) = copy_verify_blob(store, old_dir, &sha, bytes) {
+            problems.push(format!(
+                "{sha}: {}",
+                crate::diagnostics::diagnostic(&error, "")
+            ));
         }
-        let copied = std::fs::metadata(&destination)?;
-        ensure!(copied.len() == metadata.len(), "copied blob size differs");
-        // The first blob and a deterministic ~1/64 sample. --verify-all-blobs
-        // makes the owner choose full byte verification when timing permits.
-        if all || checked == 0 || u8::from_str_radix(&sha[..2], 16)? < 4 {
-            let mut file = std::fs::File::open(&destination)?;
-            let mut hash = Sha256::new();
-            let mut buffer = [0; 65536];
-            loop {
-                let n = file.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                hash.update(&buffer[..n]);
-            }
-            ensure!(hex::encode(hash.finalize()) == sha, "blob hash differs");
-            rehashed += 1;
-        }
-        std::fs::File::open(&destination)?.sync_all()?;
-        std::fs::File::open(destination.parent().expect("blob parent"))?.sync_all()?;
         checked += 1;
     }
+    ensure!(
+        problems.is_empty(),
+        "published blob verification failed ({} problem(s)): {}",
+        problems.len(),
+        problems.join("; ")
+    );
     std::fs::File::open(store.data_dir.join("blobs"))?.sync_all()?;
-    Ok((checked, rehashed))
+    // Every published blob is now rehashed, including without the legacy flag:
+    // the owner must get the complete list of missing/size/hash failures at once.
+    Ok((checked, checked))
+}
+fn copy_verify_blob(store: &Store, old_dir: &Path, sha: &str, bytes: Option<i64>) -> Result<()> {
+    let old = old_dir.join("blobs").join(&sha[..2]).join(sha);
+    let destination = store.blob_path(sha)?;
+    let metadata = std::fs::symlink_metadata(&old).context("published blob file unavailable")?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "blob must be a regular file"
+    );
+    ensure!(
+        bytes.is_some_and(|b| b >= 0 && b as u64 == metadata.len()),
+        "size mismatch (recorded {:?}, found {})",
+        bytes,
+        metadata.len()
+    );
+    std::fs::create_dir_all(destination.parent().expect("blob parent"))
+        .context("create destination blob directory")?;
+    match std::fs::hard_link(&old, &destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            std::fs::copy(&old, &destination).context("copy blob across volumes")?;
+        }
+        Err(error) => return Err(error).context("link blob"),
+    }
+    ensure!(
+        std::fs::metadata(&destination)?.len() == metadata.len(),
+        "copied blob size mismatch"
+    );
+    let mut file = std::fs::File::open(&destination).context("open blob for hashing")?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let n = file.read(&mut buffer).context("read blob for hashing")?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    ensure!(hex::encode(hash.finalize()) == sha, "SHA-256 mismatch");
+    std::fs::File::open(&destination)?
+        .sync_all()
+        .context("sync blob")?;
+    std::fs::File::open(destination.parent().expect("blob parent"))?
+        .sync_all()
+        .context("sync blob directory")?;
+    Ok(())
 }
