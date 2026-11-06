@@ -122,8 +122,9 @@ pub async fn mode() -> Result<hx_schema::protocol::OcrMode> {
 
 /// Validate both the protocol envelope and the helper payload. The shared
 /// OcrResult accepts extensions for other callers; the device boundary is strict
-/// at every level, so a nested producer-supplied class is also rejected.
-pub(crate) fn valid_device_request(request: &hx_schema::protocol::OcrRequest) -> bool {
+/// at every level, so a nested producer-supplied class is also rejected. Rounding
+/// overshoot in a bounding box is clamped: a refusal costs the whole still's text.
+pub(crate) fn normalize_device_request(request: &mut hx_schema::protocol::OcrRequest) -> bool {
     use hx_schema::protocol::OcrStatus;
     fn fields(value: &serde_json::Value, allowed: &[&str]) -> bool {
         value
@@ -133,36 +134,57 @@ pub(crate) fn valid_device_request(request: &hx_schema::protocol::OcrRequest) ->
     fn unit(value: &serde_json::Value) -> bool {
         value.as_f64().is_some_and(|v| (0.0..=1.0).contains(&v))
     }
+    fn box_edge(value: &mut serde_json::Value) -> bool {
+        const OVERSHOOT: f64 = 0.05;
+        let Some(edge) = value.as_f64() else {
+            return false;
+        };
+        if !(0.0..=1.0).contains(&edge) && (-OVERSHOOT..=1.0 + OVERSHOOT).contains(&edge) {
+            *value = json!(edge.clamp(0.0, 1.0));
+        }
+        unit(value)
+    }
+    // Long enough for the real `vision:<sha256>:<OS build>`; it appears in derived text.
+    fn engine_identity(version: &str) -> bool {
+        version.len() <= 128
+            && version.strip_prefix("vision:").is_some_and(|id| {
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+            })
+    }
     let hash_valid = request
         .perceptual_hash
         .as_ref()
         .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()));
-    if !request.engine_version.starts_with("vision:") {
+    if !engine_identity(&request.engine_version) {
         return false;
     }
     match request.status {
         OcrStatus::Complete => {
-            let Some(value) = &request.result else {
+            let sampled_from = request.sampled_from.is_none();
+            let Some(value) = &mut request.result else {
                 return false;
             };
             let Ok(result) = serde_json::from_value::<OcrResult>(value.clone()) else {
                 return false;
             };
             hash_valid
-                && request.sampled_from.is_none()
+                && sampled_from
                 && result.coverage == "partial"
                 && fields(
                     value,
                     &["lines", "engine_name", "engine_version", "coverage"],
                 )
-                && value["lines"].as_array().is_some_and(|lines| {
-                    lines.iter().all(|line| {
+                && value["lines"].as_array_mut().is_some_and(|lines| {
+                    lines.iter_mut().all(|line| {
                         fields(line, &["text", "confidence", "bbox"])
                             && unit(&line["confidence"])
                             && fields(&line["bbox"], &["x", "y", "width", "height"])
                             && ["x", "y", "width", "height"]
                                 .iter()
-                                .all(|k| unit(&line["bbox"][k]))
+                                .all(|k| box_edge(&mut line["bbox"][k]))
                     })
                 })
         }
