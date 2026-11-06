@@ -71,6 +71,7 @@ pub async fn redeem(link: &str, replace: bool, dir: &Path) -> Result<()> {
         replace || config.token.is_empty(),
         "already paired; use --replace to send the outbox to a new server"
     );
+    config.device_id = crate::config::pairing_device_id(&config.device_id);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -84,8 +85,12 @@ pub async fn redeem(link: &str, replace: bool, dir: &Path) -> Result<()> {
         .send()
         .await?;
     ensure!(
+        response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "pairing server is temporarily unavailable; try again with the same link"
+    );
+    ensure!(
         response.status() != reqwest::StatusCode::GONE,
-        "pairing code expired or already used; mint a new link"
+        "pairing refused: code expired, revoked or already used, or device already paired; revoke the previous device token before re-pairing"
     );
     ensure!(
         response.status().is_success(),

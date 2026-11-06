@@ -78,6 +78,7 @@ pub async fn auth(store: &Store, headers: &HeaderMap, scope: &str) -> ApiResult<
 pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
+        .route("/v1/pair", post(pair).layer(DefaultBodyLimit::max(4096)))
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
         .route("/v1/events", post(events))
         .route("/v1/device", get(device))
@@ -110,6 +111,37 @@ async fn ocr_mode(mode: Option<Extension<OcrMode>>) -> ApiResult<OcrMode> {
         Some(Extension(mode)) => Ok(mode),
         None => Ok(ocr::mode().await?),
     }
+}
+
+async fn pair(
+    State(store): State<Store>,
+    request: Result<
+        Json<hx_schema::protocol::PairRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> ApiResult<Response> {
+    // Refusals are uniform. Internal errors carry no body or credential detail
+    // and invite a retry instead of telling the client its code is dead.
+    let gone = || {
+        ApiError(
+            StatusCode::GONE,
+            "pairing code expired or already used".into(),
+        )
+    };
+    let Json(request) = request.map_err(|_| gone())?;
+    let token = match store
+        .redeem_pair_code(&request.code, &request.device_id)
+        .await
+    {
+        Ok(Some(token)) => token,
+        Ok(None) => return Err(gone()),
+        Err(_) => return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    };
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(hx_schema::protocol::PairResponse { token }),
+    )
+        .into_response())
 }
 async fn device(
     State(store): State<Store>,

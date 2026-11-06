@@ -33,6 +33,7 @@ hex.workspace = true
 base64 = "0.22"
 tempfile.workspace = true
 ulid.workspace = true
+url = "2"
 
 [dev-dependencies]
 hx-jobs = { workspace = true, features = ["test-support"] }
