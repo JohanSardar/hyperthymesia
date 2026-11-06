@@ -343,16 +343,11 @@ async fn authorized_run(
     ))?;
     let namespaces: Vec<String> = row.input_namespaces;
     let interpretation: serde_json::Value = row.interpretation;
-    let broker = crate::mcp::Broker::new(
-        store.clone(),
-        crate::disclosure::DisclosurePolicy::from_env()?,
-        crate::processing::SensitiveEgress::from_env(),
-        hx_store::window_at(Utc::now()),
-    );
+    let policy = crate::disclosure::DisclosurePolicy::from_env()?;
+    let sensitive = crate::processing::SensitiveEgress::from_env();
     if namespaces.iter().any(|ns| !token.allows(ns))
-        || interpretation["input_manifest"]["disclosure_policy"]["digest"] != broker.policy.digest()
-        || interpretation["input_manifest"]["sensitive_egress"]
-            != serde_json::json!(broker.sensitive)
+        || interpretation["input_manifest"]["disclosure_policy"]["digest"] != policy.digest()
+        || interpretation["input_manifest"]["sensitive_egress"] != serde_json::json!(sensitive)
     {
         return Err(crate::ApiError(
             axum::http::StatusCode::NOT_FOUND,
@@ -366,7 +361,7 @@ async fn authorized_run(
         .flat_map(|v| v.keys())
         .filter_map(|s| s.parse::<i64>().ok())
     {
-        if !broker.allowed_id(id).await? {
+        if !crate::mcp::owner_allowed_ids(store, &policy, sensitive, &[id]).await? {
             return Err(crate::ApiError(
                 axum::http::StatusCode::NOT_FOUND,
                 "run unavailable under current policy".into(),

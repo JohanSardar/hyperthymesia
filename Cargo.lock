@@ -1168,6 +1168,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hx-move"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures-util",
+ "hex",
+ "hx-compile",
+ "hx-schema",
+ "hx-server",
+ "hx-store",
+ "md-5",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "hx-schema"
 version = "0.1.0"
 dependencies = [
@@ -1247,6 +1271,7 @@ dependencies = [
  "hex",
  "hx-compile",
  "hx-schema",
+ "hx-sources",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1256,6 +1281,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "url",
 ]
 
 [[package]]
