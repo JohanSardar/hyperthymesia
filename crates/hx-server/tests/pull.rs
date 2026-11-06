@@ -92,7 +92,14 @@ impl Fixture {
         });
         let dir = tempfile::tempdir().unwrap();
         let store = Store::create(dir.path()).await.unwrap();
-        let source = store.connect_source("fake", "fake only", 1).await.unwrap();
+        let source = store
+            .connect_source(
+                "fake",
+                &format!("Fake API at {url}. Fixture commands `/usr/bin/printf`, `/bin/sh -c`."),
+                1,
+            )
+            .await
+            .unwrap();
         let recipe: Recipe = serde_json::from_value(json!({
             "source":source.id,"name":"mail","request":{"kind":"http","method":"GET","url":url,
             "headers":{"Authorization":"Bearer {{key}}"}},

@@ -17,6 +17,7 @@ pub const MAX_ITEMS_PER_PULL: usize = 1_000;
 
 /// The `recipe_save` / `recipe_test` argument shape. Persistence owns the recipe ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub source: String,
     pub name: String,
@@ -36,6 +37,7 @@ pub struct Recipe {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldMap {
     pub id: Option<String>,
     pub start: Option<String>,
@@ -52,6 +54,7 @@ pub enum TimeFormat {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cursor {
     pub from: CursorFrom,
     pub pointer: String,
@@ -65,6 +68,7 @@ pub enum CursorFrom {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pages {
     pub next: String,
     pub max: usize,

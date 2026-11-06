@@ -2,19 +2,8 @@
 //! later day-page entry cites that source's data. Everything runs through the real
 //! `hx-server` binary and its scheduler, with a scripted stand-in for fx.
 //!
-//! Connecting does not exist yet, so the test proposes the smallest contract for it.
-//! Issue #34 may change this contract; change the test with it:
-//!
-//!     POST /v1/sources
-//!     Authorization: Bearer <owner token>
-//!     {"name": "...", "key": "...", "description": "what it is, in the person's words"}
-//!     -> 201
-//!
-//! Data pulled from a connected source lands under a connector instance beginning
-//! `source:`, which is what the owner token below is scoped to read.
-//!
-//! When issue #36 adds the agent's setup run, the stand-in fx must also answer that run
-//! with the recipe that pulls from the fake source.
+//! The scripted fx answers setup by saving a tested recipe, a table and an add-on,
+//! then answers window runs from real pulled evidence. No model calls are made.
 #![cfg(unix)]
 
 use axum::{Json, Router, http::HeaderMap, http::StatusCode, routing::get};
@@ -38,7 +27,6 @@ const SOURCE_KEY: &str = "synthetic-source-key";
 const SUBJECT: &str = "Synthetic invoice for the orchid greenhouse";
 
 #[tokio::test]
-#[ignore = "the product goal: connecting a source does not exist until issue #37"]
 async fn connecting_a_source_is_enough_for_a_cited_day_page_entry() {
     scenario().await;
 }
@@ -172,17 +160,36 @@ fn write_scripted_fx(dir: &Path) -> std::path::PathBuf {
 import json,os,pathlib,re,sys,urllib.request
 if '--version' in sys.argv:
  print('FX_VERSION');sys.exit(0)
-start,end=re.search(r'window (\S+) to (\S+) \(UTC\)',sys.stdin.read()).groups()
+instruction=sys.stdin.read()
 server=json.loads((pathlib.Path(os.environ['HOME'])/'.fx/mcp.json').read_text())['mcpServers']['hyperthymesia']
 def rpc(method,params):
  req=urllib.request.Request(server['url'],data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['HX_MCP_TOKEN']})
  return json.load(urllib.request.urlopen(req))['result']
 rpc('initialize',{})
-overview=json.loads(rpc('tools/call',{'name':'window_overview','arguments':{'from':start,'to':end}})['content'][0]['text'])
-answer={'episodes':[],'tasks':[],'summary':''}
-for e in overview['evidence']:
- if 'SUBJECT' in e['text']:
-  answer['episodes'].append({'id':'synthetic-email','intervals':[{'start':e['at'],'end':e['at']}],'title':'Received the synthetic invoice email','description':'','claims':[{'actor':'owner','action':'received','object':'synthetic invoice email','outcome':'unknown','basis':'observed','evidence':[e['id']],'outcome_evidence':[]}],'evidence':[e['id']],'confidence':0.8})
+def call(name,args):
+ result=rpc('tools/call',{'name':name,'arguments':args})
+ value=json.loads(result['content'][0]['text'])
+ if result.get('isError'): raise RuntimeError(value)
+ return value
+if instruction.startswith('Set up connected source '):
+ source=re.search(r'Set up connected source ([a-z0-9]+)',instruction).group(1)
+ info=call('source_info',{'source':source})
+ url=re.search(r'http://[^\s]+/messages',info['source']['description']).group(0)
+ recipe={'source':source,'name':'Recent messages','request':{'kind':'http','method':'GET','url':url+'?after={{cursor}}','headers':{'Authorization':'Bearer {{key}}'}},'items':'/messages','kind':'source.email','map':{'id':'/id','start':'/sent_at','title':'/subject'},'time_format':'rfc3339','cursor':{'from':'response','pointer':'/next'}}
+ if not any(r['owner_off'] for r in info['recipes']): call('recipe_test',recipe)
+ call('recipe_save',recipe)
+ table='s_'+source+'_actors'
+ call('agent_sql',{'source':source,'sql':'CREATE TABLE IF NOT EXISTS '+table+' (id TEXT PRIMARY KEY, label TEXT NOT NULL)','params':[]})
+ call('agent_sql',{'source':source,'sql':'INSERT INTO '+table+' VALUES (?,?) ON CONFLICT(id) DO UPDATE SET label=excluded.label','params':['owner','Synthetic owner']})
+ call('addon_save',{'source':source,'name':'Message timing','text':'sent_at is the time the message was sent, not the retrieval time. Actor labels are in '+table+'.'})
+ answer={'summary':'Set up recent messages, actor labels and a timing hint.','no_pull':None}
+else:
+ start,end=re.search(r'window (\S+) to (\S+) \(UTC\)',instruction).groups()
+ overview=json.loads(rpc('tools/call',{'name':'window_overview','arguments':{'from':start,'to':end}})['content'][0]['text'])
+ answer={'episodes':[],'tasks':[],'summary':''}
+ for e in overview['evidence']:
+  if 'SUBJECT' in e['text']:
+   answer['episodes'].append({'id':'synthetic-email','intervals':[{'start':e['at'],'end':e['at']}],'title':'Received the synthetic invoice email','description':'','claims':[{'actor':'owner','action':'received','object':'synthetic invoice email','outcome':'unknown','basis':'observed','evidence':[e['id']],'outcome_evidence':[]}],'evidence':[e['id']],'confidence':0.8})
 print(json.dumps({'exit_code':0,'model':'FX_MODEL','steps':2,'final_output':json.dumps(answer),'tool_calls':[{'name':'mcp_hyperthymesia_window_overview','status':'success'}]}))
 "#;
     let binary = dir.join("scripted-fx");

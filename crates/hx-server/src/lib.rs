@@ -1,4 +1,5 @@
 //! Authenticated ingest, evidence API, and a local, escaped day view.
+mod agent_sql;
 mod connections;
 pub mod dashboard;
 pub mod disclosure;
@@ -8,6 +9,7 @@ pub mod mcp;
 pub mod ocr;
 pub mod processing;
 pub mod pull;
+mod setup;
 pub mod sources;
 use axum::{
     Extension, Json, Router,
@@ -95,6 +97,12 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
             post(connections::switch).layer(DefaultBodyLimit::max(32 * 1024)),
         )
         .merge(sources::router())
+        .route("/agent-setup", get(connections::agent_setup))
+        .route(
+            "/agent-setup/{kind}/{id}",
+            post(connections::configuration_switch),
+        )
+        .route("/agent-setup/{id}/retry", post(connections::retry_setup))
         .route("/v1/events", post(events))
         .route("/v1/device", get(device))
         .route(
