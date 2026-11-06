@@ -569,7 +569,13 @@ fn normalized_path(address: &str) -> Result<String> {
             at += 1;
         }
     }
-    Ok(out)
+    // `/m/` and `/m` are the same pull to an owner who switched it off.
+    let trimmed = out.trim_end_matches('/');
+    Ok(if trimmed.is_empty() {
+        "/".into()
+    } else {
+        trimmed.to_owned()
+    })
 }
 
 fn recipe_identity(recipe: &Recipe) -> Result<String> {
