@@ -10,7 +10,7 @@ use hx_schema::Interval;
 use hx_store::Store;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::PathBuf, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 pub const PROMPT_VERSION: &str = "hx-replica/v9";
 pub const PROMPT: &str = include_str!("../prompts/replica-v9.txt");
@@ -280,27 +280,69 @@ impl Drop for Server {
     }
 }
 
-/// Captures bounded streams while waiting. Dropping on timeout kills the child.
+/// A pipe, rather than a Rust destructor, owns the whole fx process group.
+/// SIGKILL closes the server's write end too. A separate watcher then kills fx
+/// and its descendants on both Linux and macOS, even if fx ignores stdin/TERM.
+/// Start the watcher and fx in the same new group; no spawn/notify-PID race.
+const FX_GUARD: &str = r#"
+input=$1
+status=$2
+shift 2
+# POSIX shells may replace background stdin with /dev/null. Save the pipe
+# before backgrounding, and do not let fx inherit the watcher's descriptor.
+exec 3<&0
+( IFS= read -r _ <&3 || :; /bin/kill -KILL -- "-$$" ) &
+"$@" < "$input" 3<&- &
+child=$!
+result=0
+wait "$child" || result=$?
+# Preserve the direct child's shell exit status before killing our whole group,
+# including descendants that closed stdio or ignore TERM. Keep the life watcher
+# armed until that cleanup; cancellation must still reach those descendants.
+printf '%s\n' "$result" > "$status"
+/bin/kill -KILL -- "-$$"
+"#;
+
+/// Captures bounded streams while waiting. Cancellation closes the life pipe.
 async fn output(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     input: &str,
     timeout: Duration,
 ) -> Result<std::process::Output> {
-    command
+    use std::io::Write;
+    let mut prompt = tempfile::NamedTempFile::new()?;
+    let exit_status = tempfile::NamedTempFile::new()?;
+    prompt.write_all(input.as_bytes())?;
+    prompt.flush()?;
+    let original = command.as_std();
+    let mut guard = tokio::process::Command::new("/bin/sh");
+    guard
+        .env_clear()
+        .envs(
+            original
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .args(["-c", FX_GUARD, "hx-fx-guard"])
+        .arg(prompt.path())
+        .arg(exit_status.path())
+        .arg(original.get_program())
+        .args(original.get_args())
+        .process_group(0)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command.spawn().context("start fx")?;
-    let mut stdin = child.stdin.take().context("fx stdin")?;
+    if let Some(dir) = original.get_current_dir() {
+        guard.current_dir(dir);
+    }
+    let mut child = guard.spawn().context("start fx")?;
+    // Keep this open until the future finishes or is dropped. Never pass it to
+    // fx: its stdin is the private prompt file, not the watcher's life pipe.
+    let _liveness = child.stdin.take().context("fx life pipe")?;
     let stdout = child.stdout.take().context("fx stdout")?;
     let stderr = child.stderr.take().context("fx stderr")?;
     tokio::time::timeout(timeout, async {
-        let send = async move {
-            stdin.write_all(input.as_bytes()).await?;
-            drop(stdin);
-            Ok::<_, std::io::Error>(())
-        };
         let read = |stream: Box<dyn tokio::io::AsyncRead + Unpin + Send>| async move {
             let mut bytes = vec![];
             stream
@@ -335,13 +377,20 @@ async fn output(
                 }
             }
         };
-        let (_, stdout, stderr) = tokio::try_join!(
-            async { send.await.map_err(anyhow::Error::from) },
-            read(Box::new(stdout)),
-            watch
-        )?;
+        let (stdout, stderr) = tokio::try_join!(read(Box::new(stdout)), watch)?;
+        let guard_status = child.wait().await?;
+        let saved = std::fs::read_to_string(exit_status.path())?;
+        let status = if saved.is_empty() {
+            // The lifetime watcher killed the group before fx completed.
+            guard_status
+        } else {
+            use std::os::unix::process::ExitStatusExt;
+            let code: u8 = saved.trim().parse().context("fx child exit status")?;
+            // POSIX shell wait/exit semantics, including 128+signal, as before.
+            std::process::ExitStatus::from_raw(i32::from(code) << 8)
+        };
         Ok::<_, anyhow::Error>(std::process::Output {
-            status: child.wait().await?,
+            status,
             stdout,
             stderr,
         })

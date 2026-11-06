@@ -133,6 +133,22 @@ if exists "$state"; then
     done
 fi
 
+# Recover a killed lifecycle before checking for a missing registered core: a
+# rollback may have been interrupted between moving state aside and publishing
+# the verified restore. Only installer-owned, durable scratch is executable here.
+if exists "$prefix/pending-upgrade"; then
+    [ -L "$prefix/pending-upgrade" ] || owner "$prefix/pending-upgrade"
+    recovery=$(readlink "$prefix/pending-upgrade")
+    case "$recovery" in "$prefix"/.upgrade.*) ;; *) owner "$prefix/pending-upgrade" ;; esac
+    recovery_name=${recovery#"$prefix/"}
+    case "$recovery_name" in */*) owner "$prefix/pending-upgrade" ;; esac
+    [ -f "$recovery/lifecycle" ] && [ -x "$recovery/payload/hx-server" ] || die 'incomplete upgrade recovery record; retained state has not been changed'
+    if [ "$dry_run" = false ]; then
+        "$recovery/payload/hx-server" --state-dir "$state" upgrade-recover --lifecycle "$recovery/lifecycle" || die 'interrupted upgrade recovery failed; retained copies kept'
+        ! exists "$prefix/pending-upgrade" || die 'another upgrade is still running; no changes made'
+    fi
+fi
+
 # The path record is a promise of history, even after uninstall or an unmount.
 # Refuse before downloads, manager commands or any destination mutation.
 if [ "$uninstall" = false ] && [ "$app_only" = false ] && [ -f "$prefix/.state-dir" ] && [ ! -f "$state/core.sqlite" ]; then
@@ -164,7 +180,12 @@ service_stop() {
                     sleep 1
                 done
             fi ;;
-        linux-*) systemctl --user stop hyperthymesia.service ;;
+        linux-*)
+            systemctl --user stop hyperthymesia.service || {
+                # Exit 5 means not installed, as after a managed uninstall.
+                # No other manager failure may be mistaken for a stopped unit.
+                [ "$?" -eq 5 ]
+            } ;;
     esac
 }
 service_start() {
@@ -206,7 +227,24 @@ else
     die 'requires sha256sum or shasum'
 fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/hx-install.XXXXXXXX")
-trap 'rm -rf "$work"' 0
+cleanup() {
+    # Never erase the only recovery program after an incomplete rollback.
+    if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then
+        printf 'Retained interrupted-upgrade recovery: %s\n' "$work" >&2
+    else
+        # The guard link resolves to a private, non-executable sibling of state
+        # on the same filesystem. Remove only our exact anchor, never state's
+        # own lock inode or an unexpected link outside that parent.
+        if [ -L "$work/guard.lock" ]; then
+            anchor=$(readlink "$work/guard.lock")
+            if [ "$(dirname "$anchor")" = "$(dirname "$state")" ]; then
+                case "${anchor##*/}" in .hx-upgrade-lock-*) [ -L "$anchor" ] || rm -f "$anchor" ;; esac
+            fi
+        fi
+        rm -rf "$work"
+    fi
+}
+trap cleanup 0
 trap 'exit 1' HUP INT TERM
 fetch() { curl -fsSL "$1" -o "$2" || die "download failed: $1"; }
 verify() { [ "$(sha256 "$1")" = "$2" ] || die "SHA-256 mismatch: $1"; }
@@ -308,12 +346,15 @@ cat > "$work/payload/hx-run" <<EOF
 # hyperthymesia installer N4
 set -eu
 umask 077
+export HOME=$(shell_quote "$HOME")
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+if [ -L $(shell_quote "$prefix/pending-upgrade") ]; then
+    HX_INSTALL_STARTUP_RECOVERY=1 $(shell_quote "$prefix/pending-upgrade/payload/hx-server") --state-dir $(shell_quote "$state") upgrade-recover --lifecycle $(shell_quote "$prefix/pending-upgrade/lifecycle")
+fi
 exec >> $(shell_quote "$state/server.log") 2>&1
 set -a
 . $(shell_quote "$state/server.env")
 set +a
-export HOME=$(shell_quote "$HOME")
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 exec $(shell_quote "$prefix/current/hx-server") --state-dir $(shell_quote "$state") serve --listen 127.0.0.1:7377
 EOF
 chmod 755 "$work/payload/hx-run"
@@ -406,8 +447,15 @@ if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
     "$work/payload/hx-server" --state-dir "$state" status --require-idle || die 'upgrade refused; old service left running'
 fi
 
-# Keep lifecycle code in a private temporary script; the guard holds its lock
-# across this process, including service stop, backup, migration and rollback.
+# Keep upgrade recovery outside /tmp and outside mutable state. A reboot or a
+# killed shell must not erase its progress, backup path or recovery executable.
+if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
+    durable=$(mktemp -d "$prefix/.upgrade.XXXXXXXX")
+    cp -R "$work/." "$durable/"
+    rm -rf "$work"
+    work=$durable
+fi
+# The guard holds its lock across stop, backup, migration and rollback.
 setting() { printf '%s=%s\n' "$1" "$(shell_quote "$2")"; }
 {
     printf '#!/bin/sh\nset -eu\numask 077\n'
@@ -446,7 +494,12 @@ service_stop() {
                     sleep 1
                 done
             fi ;;
-        linux-*) systemctl --user stop hyperthymesia.service ;;
+        linux-*)
+            systemctl --user stop hyperthymesia.service || {
+                # Exit 5 means not installed, as after a managed uninstall.
+                # No other manager failure may be mistaken for a stopped unit.
+                [ "$?" -eq 5 ]
+            } ;;
     esac
 }
 service_start() {
@@ -483,22 +536,45 @@ healthy() {
 }
 stopped=false
 backup=
-failed_state=
+failed_state=$state.failed-$(date +%s)-$$
 migration_started=false
+committed=false
+recovering=false
 backup_server=$work/payload/hx-server
 if [ -n "$old" ]; then backup_server=$old/hx-server; fi
+save_progress() {
+    {
+        printf 'stopped=%s\nmigration_started=%s\ncommitted=%s\n' "$stopped" "$migration_started" "$committed"
+        printf 'backup='; quote "$backup"; printf '\nfailed_state='; quote "$failed_state"; printf '\n'
+    } > "$work/progress.next"
+    mv "$work/progress.next" "$work/progress"
+}
+if [ "${1:-}" = --recover ]; then
+    recovering=true
+    . "$work/progress"
+    if [ "$committed" = true ]; then
+        rm -f "$prefix/pending-upgrade"
+        exit 0
+    fi
+fi
 rollback() {
     result=$?
     trap - 0 HUP INT TERM
     # Recovery must attempt every step, even when storage itself is failing.
     set +e
+    # The durable commit is the boundary: a cleanup error after it must not
+    # roll back a version that the recovery program already considers committed.
+    if [ "$committed" = true ]; then exit "$result"; fi
     if [ "$result" -ne 0 ] && [ "$stopped" = true ]; then
-        service_stop || printf 'Could not stop candidate service during recovery.\n' >&2
+        if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" != 1 ]; then
+            service_stop || printf 'Could not stop candidate service during recovery.\n' >&2
+        fi
         restored=true
         if [ -n "$backup" ] && [ -f "$backup/manifest.json" ] && [ "$migration_started" = true ]; then
-            failed_state=$state.failed-$(date +%s)-$$
-            if mv "$state" "$failed_state"; then
-                if "$backup_server" --state-dir "$state" restore --from "$backup"; then
+            # The original failed generation is never moved twice. Restore
+            # publishes atomically, so a killed recovery can resume after rename.
+            if [ -d "$failed_state" ] || mv "$state" "$failed_state"; then
+                if [ -f "$state/core.sqlite" ] || "$backup_server" --state-dir "$state" restore --from "$backup"; then
                     cp "$failed_state/server.env" "$state/server.env" || restored=false
                     chmod 700 "$state" || restored=false
                     chmod 600 "$state/server.env" || restored=false
@@ -532,12 +608,17 @@ rollback() {
                     fi
                 fi
             fi
+            if [ "$restored" = true ]; then
+                # Startup recovery calls us from the service wrapper itself;
+                # that wrapper will exec the restored binary when we return.
+                rm -f "$prefix/pending-upgrade" || restored=false
+            fi
             # Always try the old service after link restoration, including after
             # a failed copy/rename. Its exact-schema open refuses unsafe state.
             mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
             [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
             [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"
-            if service_start && healthy; then
+            if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" = 1 ] || { service_start && healthy; }; then
                 if [ "$restored" = true ]; then
                     printf 'Previous service restarted.\n' >&2
                 else
@@ -548,17 +629,27 @@ rollback() {
             fi
         fi
     fi
+    if [ "$stopped" = false ]; then
+        restored=true
+        if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then rm -f "$prefix/pending-upgrade" || restored=false; fi
+    fi
+    if [ "$recovering" = true ] && [ "${restored:-false}" = true ]; then exit 0; fi
     exit "$result"
 }
 trap rollback 0
 trap 'exit 1' HUP INT TERM
+if [ "$recovering" = true ]; then exit 1; fi
 if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
+    save_progress
+    ln -s "$work" "$prefix/pending-upgrade"
     # Reject paid work before stopping. The enclosing guard closes the race.
     "$work/payload/hx-server" --state-dir "$state" status --require-idle
     stopped=true
+    save_progress
     service_stop
     mkdir -p "$prefix/backups"
     backup=$(mktemp -d "$prefix/backups/pre-upgrade.XXXXXXXX")
+    save_progress
     "$backup_server" --state-dir "$state" backup --to "$backup"
 elif [ "$app_only" = false ] && [ -n "$old" ]; then
     stopped=true
@@ -578,15 +669,19 @@ if [ ! -e "$version_dir" ]; then
     cp -R "$work/payload/." "$stage/"
     mv "$stage" "$version_dir"
 fi
-# Refresh service rendering on a same-version re-run (including N4 layouts).
-cp "$work/payload/hx-run" "$version_dir/hx-run"
-cp "$work/payload/$service_name" "$version_dir/$service_name"
+# Refresh rendering atomically even on a same-version rerun. A killed copy must
+# never truncate the wrapper or unit that the previous service needs to restart.
+cp "$work/payload/hx-run" "$version_dir/.hx-run.next"
+mv "$version_dir/.hx-run.next" "$version_dir/hx-run"
+cp "$work/payload/$service_name" "$version_dir/.service.next"
+mv "$version_dir/.service.next" "$version_dir/$service_name"
 cp "$work/fx/fx" "$prefix/tools/fx-0.0.16/.fx.staging"
 chmod 755 "$prefix/tools/fx-0.0.16/.fx.staging"
 mv "$prefix/tools/fx-0.0.16/.fx.staging" "$prefix/tools/fx-0.0.16/fx"
 switch_current "$version_dir"
 if [ "$app_only" = false ]; then
-    printf '%s\n' "$state" > "$prefix/.state-dir"
+    printf '%s\n' "$state" > "$prefix/.state-dir.next"
+    mv "$prefix/.state-dir.next" "$prefix/.state-dir"
     mkdir -p "$state"
     chmod 700 "$state"
     new_env=false
@@ -610,6 +705,7 @@ if [ "$app_only" = false ]; then
     : >> "$state/server.log"
     chmod 600 "$state/server.log"
     migration_started=true
+    save_progress
     server migrate
     printf '%s\n' "$prefix" > "$state/.install-prefix"
     mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
@@ -626,7 +722,11 @@ if [ "$install_app" = true ]; then
     mkdir -p "$HOME/Applications"
     [ -L "$app" ] || ln -s "$prefix/current/Hyperthymesia.app" "$app"
 fi
-printf '%s\n' "$version_dir" > "$prefix/.last-version"
+printf '%s\n' "$version_dir" > "$prefix/.last-version.next"
+mv "$prefix/.last-version.next" "$prefix/.last-version"
+committed=true
+save_progress
+if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then rm -f "$prefix/pending-upgrade"; fi
 stopped=false
 trap - 0 HUP INT TERM
 printf 'Installed. State: %s\n' "$state"
@@ -648,7 +748,7 @@ if [ "$app_only" = false ]; then
 fi
 LIFECYCLE
 if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
-    "$work/payload/hx-server" --state-dir "$state" upgrade-guard /bin/sh "$work/lifecycle"
+    HX_INSTALL_RECOVERY="$work/lifecycle" "$work/payload/hx-server" --state-dir "$state" upgrade-guard /bin/sh "$work/lifecycle"
 else
     /bin/sh "$work/lifecycle"
 fi
