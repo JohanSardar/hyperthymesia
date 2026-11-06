@@ -355,38 +355,41 @@ async fn main() -> Result<()> {
                 store: store.clone(),
                 provider: processing::coordinator_provider(provider),
             };
-            let ocr_worker = if cfg!(target_os = "macos") {
-                let store = store.clone();
-                let dir = dir.clone();
-                Some(tokio::spawn(async move {
-                    // A newly started service must not publish derived state
-                    // during the installer's verification/rollback window.
-                    let Ok(lock) = worker_lock(&dir) else {
-                        return;
-                    };
-                    loop {
-                        match lock.try_lock_shared() {
-                            Ok(()) => break,
-                            Err(std::fs::TryLockError::WouldBlock) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(200)).await
-                            }
-                            Err(e) => {
-                                tracing::error!("OCR startup lock failed: {e}");
-                                return;
-                            }
+            let ocr_mode = hx_server::ocr::mode().await?;
+            if cfg!(target_os = "macos") && ocr_mode == hx_schema::protocol::OcrMode::Device {
+                // Error level: the default filter hides anything lower.
+                tracing::error!(
+                    "Vision helper not found on this Mac: this server will not run OCR and accepts device results instead"
+                );
+            }
+            let ocr_store = store.clone();
+            let ocr_dir = dir.clone();
+            let ocr_worker = tokio::spawn(async move {
+                // A newly started service must not publish derived state
+                // during the installer's verification/rollback window.
+                let Ok(lock) = worker_lock(&ocr_dir) else {
+                    return;
+                };
+                loop {
+                    match lock.try_lock_shared() {
+                        Ok(()) => break,
+                        Err(std::fs::TryLockError::WouldBlock) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await
+                        }
+                        Err(e) => {
+                            tracing::error!("OCR startup lock failed: {e}");
+                            return;
                         }
                     }
-                    drop(lock);
-                    if hx_server::ocr::worker(store).await.is_err() {
-                        tracing::error!("OCR worker unavailable");
-                    }
-                }))
-            } else {
-                tracing::warn!(
-                    "OCR requires a macOS server; pending stills are retained for backfill"
-                );
-                None
-            };
+                }
+                drop(lock);
+                if hx_server::ocr::worker_in_mode(ocr_store, ocr_mode)
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("OCR worker unavailable");
+                }
+            });
             let worker_lock = worker_lock(&dir)?;
             let worker = tokio::spawn(async move {
                 let mut next_schedule = tokio::time::Instant::now();
@@ -425,27 +428,26 @@ async fn main() -> Result<()> {
                 }
             });
             let stop_worker = worker.abort_handle();
-            let stop_ocr = ocr_worker.as_ref().map(|worker| worker.abort_handle());
-            let router = hx_server::router(store, policy).layer(
-                axum::middleware::from_fn_with_state(dir.clone(), maintenance_gate),
-            );
+            let stop_ocr = ocr_worker.abort_handle();
+            let router = hx_server::router(store, policy)
+                .layer(axum::Extension(ocr_mode))
+                .layer(axum::middleware::from_fn_with_state(
+                    dir.clone(),
+                    maintenance_gate,
+                ));
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     shutdown.await;
                     // Cancel provider work before waiting for HTTP connections
                     // to drain. Dropping fx's output future kills its child.
                     stop_worker.abort();
-                    if let Some(worker) = stop_ocr {
-                        worker.abort();
-                    }
+                    stop_ocr.abort();
                 })
                 .await;
             worker.abort();
             let _ = worker.await;
-            if let Some(worker) = ocr_worker {
-                worker.abort();
-                let _ = worker.await;
-            }
+            ocr_worker.abort();
+            let _ = ocr_worker.await;
             result?;
         }
     }
