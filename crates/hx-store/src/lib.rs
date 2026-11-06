@@ -253,6 +253,7 @@ impl Store {
                     e.payload["title"].as_str().unwrap_or(""),
                     e.payload["url"].as_str().unwrap_or("")
                 ),
+                kind if kind.starts_with("source.") => sources::search_text(&e.payload),
                 _ => String::new(),
             };
             normalized.push(json!({"event_id":id,"payload":e.payload,"search_text":text}));
@@ -732,7 +733,7 @@ impl Store {
             value["derived_evidence"] = json!(derived);
             return Ok(Some(value));
         }
-        Ok(sqlx::query_scalar("SELECT json_object('id',d.id,'envelope',json(d.envelope),'sensitivity',d.sensitivity,'source_event_id',d.source_event_id,'blobs',json_array(json_object('sha256',b.sha256,'evidence_expired',json(CASE WHEN b.evidence_expired THEN 'true' ELSE 'false' END)))) FROM ocr_derived d JOIN blobs b USING(sha256) WHERE d.id=$1")
+        Ok(sqlx::query_scalar("SELECT json_object('id',d.id,'envelope',json(d.envelope),'sensitivity',d.sensitivity,'source_event_id',d.source_event_id,'blobs',json_array(json_object('sha256',b.sha256,'evidence_expired',json(CASE WHEN b.evidence_expired THEN 'true' ELSE 'false' END)))) FROM ocr_derived d JOIN blobs b USING(sha256) WHERE d.id=$1 UNION ALL SELECT json_object('id',id,'envelope',json(envelope),'sensitivity',sensitivity,'blobs',json_array(),'context_only',json('true')) FROM live_snapshots WHERE id=$1")
             .bind(id).fetch_optional(&self.pool).await?)
     }
 }
@@ -778,6 +779,8 @@ pub mod test_support;
 
 #[cfg(test)]
 mod concurrency_tests;
+
+pub mod sources;
 
 mod reads;
 pub use reads::*;

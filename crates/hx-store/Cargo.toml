@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 hx-schema.workspace = true
+hx-sources = { path = "../hx-sources" }
 hx-compile.workspace = true
 anyhow.workspace = true
 serde.workspace = true
