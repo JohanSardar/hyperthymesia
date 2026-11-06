@@ -284,20 +284,18 @@ pub async fn timeline_value(
         .canonical_revisions(w.start, w.end, &token.prefixes)
         .await?;
     // Sensitive egress controls model transport, not the API reader's access.
-    let broker = mcp::Broker::new(
-        store.clone(),
-        policy.clone(),
-        processing::SensitiveEgress::Full,
-        w,
-    );
     let mut revisions = vec![];
     let mut interpreted = None;
     for row in rows {
         let interpretation: Value = row.interpretation;
         if !token.has("read_raw")
-            && !broker
-                .allowed_ids(&mcp::revision_evidence(&interpretation))
-                .await?
+            && !mcp::owner_allowed_ids(
+                store,
+                policy,
+                processing::SensitiveEgress::Full,
+                &mcp::revision_evidence(&interpretation),
+            )
+            .await?
         {
             continue;
         }

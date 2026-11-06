@@ -166,11 +166,11 @@ async fn resaving_under_new_name_and_setup_cannot_undo_owner_off() -> Result<()>
     assert!(!saved.enabled);
     assert_eq!(store.recipe_state(&first.id).await?.cursor, state.cursor);
     let addon = store
-        .save_addon(&source.id, "Synthetic instructions")
+        .save_addon(&source.id, "instructions", "Synthetic instructions")
         .await?;
     store.set_addon_enabled(&addon.id, false).await?;
     let saved_addon = store
-        .save_addon(&source.id, "Synthetic instructions")
+        .save_addon(&source.id, "instructions", "Synthetic instructions")
         .await?;
     assert_eq!(saved_addon.id, addon.id);
     assert!(saved_addon.owner_off);
@@ -184,7 +184,7 @@ async fn resaving_under_new_name_and_setup_cannot_undo_owner_off() -> Result<()>
         "stale setup must not activate"
     );
     assert!(
-        store
+        !store
             .finish_source_setup(&source.id, generation, json!({"status":"ready"}), None)
             .await?
     );
@@ -277,5 +277,135 @@ async fn source_search_text_is_bounded_utf8_and_includes_nested_strings() -> Res
     .fetch_one(&store.pool)
     .await?;
     assert_eq!(hits, 1);
+    Ok(())
+}
+
+fn review_recipe() -> hx_sources::recipe::Recipe {
+    serde_json::from_value(json!({
+        "source":"synthetic", "name":"mail",
+        "request":{"kind":"http", "method":"GET", "url":"https://synthetic.invalid/m"},
+        "items":"/messages", "kind":"source.email", "map":{"id":"/id"},
+        "time_format":"rfc3339"
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn query_and_headers_cannot_replace_an_owner_disabled_pull() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::create(dir.path()).await?;
+    let source = store.connect_source("Synthetic", "Fake only", 1).await?;
+    let mut recipe = review_recipe();
+    let original = store.save_recipe(&source.id, &recipe).await?;
+    store.set_recipe_enabled(&original.id, false).await?;
+    for url in [
+        "https://synthetic.invalid/m?",
+        "https://synthetic.invalid/m?page=2",
+        "https://synthetic.invalid/a/../%6d?new=1",
+    ] {
+        recipe.request = serde_json::from_value(
+            json!({"kind":"http", "method":"get", "url":url, "headers":{"Accept":"application/json"}}),
+        )?;
+        let saved = store.save_recipe(&source.id, &recipe).await?;
+        assert_eq!(
+            saved.id, original.id,
+            "method/path identity must ignore query and headers"
+        );
+        assert!(saved.owner_off && !saved.enabled);
+    }
+    store
+        .finish_source_setup(&source.id, 1, json!({}), None)
+        .await?;
+    let row = store.recipes(Some(&source.id)).await?.remove(0);
+    assert!(row.owner_off && !row.enabled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_completion_on_off_source_cannot_activate_pending_configuration() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::create(dir.path()).await?;
+    let source = store.connect_source("Synthetic", "Fake only", 1).await?;
+    store.save_recipe(&source.id, &review_recipe()).await?;
+    store
+        .save_addon(&source.id, "note", "Synthetic note")
+        .await?;
+    store.set_source_enabled(&source.id, false).await?;
+    assert!(
+        !store
+            .finish_source_setup(&source.id, 1, json!({}), None)
+            .await?
+    );
+    assert_ne!(store.source(&source.id).await?.unwrap().status, "ready");
+    assert!(!store.recipes(Some(&source.id)).await?[0].enabled);
+    assert!(!store.addons(Some(&source.id)).await?[0].enabled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_live_payload_is_rejected_before_waiting_for_writer_or_allocating() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let store = Store::create(dir.path()).await?;
+    let source = store.connect_source("Synthetic", "Fake only", 1).await?;
+    let before: i64 = sqlx::query_scalar("SELECT next_id FROM evidence_seq")
+        .fetch_one(&store.pool)
+        .await?;
+    let writer = store.begin_write().await?;
+    let oversized = json!("x".repeat(hx_sources::request::MAX_HTTP_RESPONSE_BYTES - 1));
+    let rejected = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.save_live_snapshot(ulid::Ulid::generate(), &source.id, oversized),
+    )
+    .await;
+    assert!(
+        matches!(rejected, Ok(Err(_))),
+        "oversize must be refused before acquiring a transaction"
+    );
+    writer.rollback().await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_id FROM evidence_seq")
+            .fetch_one(&store.pool)
+            .await?,
+        before
+    );
+    let exact = json!("x".repeat(hx_sources::request::MAX_HTTP_RESPONSE_BYTES - 2));
+    assert_eq!(
+        serde_json::to_vec(&exact)?.len(),
+        hx_sources::request::MAX_HTTP_RESPONSE_BYTES
+    );
+    assert_eq!(
+        store
+            .save_live_snapshot(ulid::Ulid::generate(), &source.id, exact)
+            .await?,
+        before
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rewritten_addon_keeps_the_owner_switch() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::create(dir.path()).await?;
+    let source = store.connect_source("Synthetic", "Fake only", 1).await?;
+    let first = store.save_addon(&source.id, "context", "Note").await?;
+    store.set_addon_enabled(&first.id, false).await?;
+    let rewritten = store.save_addon(&source.id, " context ", "Note ").await?;
+    assert_eq!(
+        rewritten.id, first.id,
+        "rewriting a named add-on must not create a new switch"
+    );
+    assert!(rewritten.owner_off && !rewritten.enabled);
+    let changed = store
+        .save_addon(&source.id, "context", "Completely rewritten note")
+        .await?;
+    assert_eq!(changed.id, first.id);
+    assert_eq!(changed.text, "Completely rewritten note");
+    assert!(changed.owner_off && !changed.enabled);
+    store
+        .finish_source_setup(&source.id, 1, json!({}), None)
+        .await?;
+    assert!(store.addons(Some(&source.id)).await?[0].owner_off);
+    assert!(!store.addons(Some(&source.id)).await?[0].enabled);
     Ok(())
 }

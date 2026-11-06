@@ -726,7 +726,20 @@ impl Store {
         tx.commit().await?;
         Ok(id)
     }
+    /// Owner-facing historical access. Agent tools must use evidence_for_run.
     pub async fn evidence(&self, id: i64) -> Result<Option<Value>> {
+        self.evidence_with_live_run(id, None).await
+    }
+    /// Events/OCR remain context across runs; live evidence requires this run's
+    /// server-issued token. Filter in SQL, not a racy check followed by a read.
+    pub async fn evidence_for_run(&self, id: i64, run_token: ulid::Ulid) -> Result<Option<Value>> {
+        self.evidence_with_live_run(id, Some(run_token)).await
+    }
+    async fn evidence_with_live_run(
+        &self,
+        id: i64,
+        run_token: Option<ulid::Ulid>,
+    ) -> Result<Option<Value>> {
         let value:Option<Value>=sqlx::query_scalar("SELECT json_object('id',e.id,'envelope',json(e.envelope),'sensitivity',e.sensitivity,'blobs',coalesce((SELECT json_group_array(json_object('sha256',b.sha256,'evidence_expired',json(CASE WHEN b.evidence_expired THEN 'true' ELSE 'false' END))) FROM event_blobs eb JOIN blobs b USING(sha256) WHERE eb.event_id=e.id),'[]')) FROM events e WHERE id=$1").bind(id).fetch_optional(&self.pool).await?;
         if let Some(mut value) = value {
             let derived: Vec<Value> = sqlx::query_scalar("SELECT json_object('id',id,'envelope',json(envelope),'sensitivity',sensitivity) FROM ocr_derived WHERE source_event_id=$1 ORDER BY id")
@@ -734,8 +747,8 @@ impl Store {
             value["derived_evidence"] = json!(derived);
             return Ok(Some(value));
         }
-        Ok(sqlx::query_scalar("SELECT json_object('id',d.id,'envelope',json(d.envelope),'sensitivity',d.sensitivity,'source_event_id',d.source_event_id,'blobs',json_array(json_object('sha256',b.sha256,'evidence_expired',json(CASE WHEN b.evidence_expired THEN 'true' ELSE 'false' END)))) FROM ocr_derived d JOIN blobs b USING(sha256) WHERE d.id=$1 UNION ALL SELECT json_object('id',id,'envelope',json(envelope),'sensitivity',sensitivity,'blobs',json_array(),'context_only',json('true')) FROM live_snapshots WHERE id=$1")
-            .bind(id).fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT json_object('id',d.id,'envelope',json(d.envelope),'sensitivity',d.sensitivity,'source_event_id',d.source_event_id,'blobs',json_array(json_object('sha256',b.sha256,'evidence_expired',json(CASE WHEN b.evidence_expired THEN 'true' ELSE 'false' END)))) FROM ocr_derived d JOIN blobs b USING(sha256) WHERE d.id=$1 UNION ALL SELECT json_object('id',id,'envelope',json(envelope),'sensitivity',sensitivity,'blobs',json_array(),'context_only',json('true')) FROM live_snapshots WHERE id=$1 AND ($2 IS NULL OR run_token=$2)")
+            .bind(id).bind(run_token.map(|token| token.to_string())).fetch_optional(&self.pool).await?)
     }
 }
 

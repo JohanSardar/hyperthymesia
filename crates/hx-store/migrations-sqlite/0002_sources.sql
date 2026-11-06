@@ -13,11 +13,11 @@ CREATE TABLE sources (
 
 CREATE TABLE recipes (
  id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES sources(id),
- name TEXT NOT NULL, request_hash TEXT NOT NULL,
+ name TEXT NOT NULL, identity_hash TEXT NOT NULL,
  recipe TEXT NOT NULL CHECK(json_valid(recipe)),
  enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
  owner_off INTEGER NOT NULL DEFAULT 0 CHECK(owner_off IN (0,1)),
- CHECK(NOT owner_off OR NOT enabled), UNIQUE(source_id,request_hash)
+ CHECK(NOT owner_off OR NOT enabled), UNIQUE(source_id,identity_hash)
 ) STRICT;
 CREATE TABLE recipe_state (
  recipe_id TEXT PRIMARY KEY REFERENCES recipes(id), cursor TEXT CHECK(cursor IS NULL OR json_valid(cursor)),
@@ -26,10 +26,10 @@ CREATE TABLE recipe_state (
 CREATE INDEX recipe_state_due ON recipe_state(next_run_at);
 CREATE TABLE addons (
  id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES sources(id),
- text_hash TEXT NOT NULL, text TEXT NOT NULL CHECK(length(CAST(text AS BLOB)) BETWEEN 1 AND 1000),
+ name TEXT NOT NULL, text TEXT NOT NULL CHECK(length(CAST(text AS BLOB)) BETWEEN 1 AND 1000),
  enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
  owner_off INTEGER NOT NULL DEFAULT 0 CHECK(owner_off IN (0,1)),
- CHECK(NOT owner_off OR NOT enabled), UNIQUE(source_id,text_hash)
+ CHECK(NOT owner_off OR NOT enabled), UNIQUE(source_id,name)
 ) STRICT;
 CREATE TABLE switch_log (
  id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -31,6 +31,7 @@ pub struct Broker {
     pub audit: Arc<Mutex<Audit>>,
     /// Lookups answered before the broker asks the model to finish from what it has.
     pub lookup_limit: usize,
+    run_token: ulid::Ulid,
     outside_generation: Option<i64>,
     input_changed: watch::Sender<bool>,
 }
@@ -69,9 +70,15 @@ impl Broker {
             window,
             audit: Arc::default(),
             lookup_limit: MAX_CALLS,
+            run_token: ulid::Ulid::generate(),
             outside_generation: None,
             input_changed: watch::channel(false).0,
         }
+    }
+    /// Issued by the server at construction, shared by clones of this run only.
+    /// Live tools save snapshots with this token; tool arguments cannot set it.
+    pub fn run_token(&self) -> ulid::Ulid {
+        self.run_token
     }
     /// Fence only durable outside input. Future live snapshots belong in a
     /// run-local sidecar: they must not ingest events or advance this generation.
@@ -222,13 +229,13 @@ impl Broker {
         Ok(digest.text)
     }
     pub fn visible(&self, e: &Envelope) -> bool {
-        self.policy.effective_class(e) != Sensitivity::Restricted
-            && !(self.sensitive == SensitiveEgress::Redact
-                && self.policy.effective_class(e) == Sensitivity::Sensitive)
-            && !matches!(e.kind.as_str(), "policy.gap" | "media.chunk")
+        visible(&self.policy, self.sensitive, e)
     }
     pub async fn allowed_id(&self, id: i64) -> Result<bool> {
-        let source: Option<Value> = self.store.source_envelope(id).await?;
+        let source: Option<Value> = self
+            .store
+            .source_envelope_for_run(id, self.run_token)
+            .await?;
         Ok(source
             .and_then(|v| serde_json::from_value::<Envelope>(v).ok())
             .is_some_and(|e| self.visible(&e)))
@@ -474,7 +481,10 @@ impl Broker {
         let mut ids = std::collections::BTreeSet::new();
         collect_provenance(&result, &mut ids);
         for id in ids {
-            let namespace: Option<String> = self.store.source_namespace(id).await?;
+            let namespace: Option<String> = self
+                .store
+                .source_namespace_for_run(id, self.run_token)
+                .await?;
             if let Some(namespace) = namespace {
                 audit.input_namespaces.insert(namespace);
             }
@@ -507,13 +517,13 @@ impl Broker {
                 ensure!(self.allowed_id(id).await?, "evidence unavailable");
                 let value = self
                     .store
-                    .evidence(id)
+                    .evidence_for_run(id, self.run_token)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("missing evidence"))?;
                 if let Some(source) = value["source_event_id"].as_i64() {
                     let v = self
                         .store
-                        .evidence(source)
+                        .evidence_for_run(source, self.run_token)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("missing source"))?;
                     let e = serde_json::from_value(v["envelope"].clone())?;
@@ -748,4 +758,37 @@ async fn rpc(
         _ => return axum::Json(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32601,"message":"method not found"}})).into_response(),
     };
     axum::Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+}
+
+// Owner revision views may inspect historical snapshots, while broker tools and
+// citation admission always require the current run token. Never use this for
+// an agent tool or for admission of a new interpretation's citations.
+pub(crate) async fn owner_allowed_ids(
+    store: &Store,
+    policy: &DisclosurePolicy,
+    sensitive: SensitiveEgress,
+    ids: &[i64],
+) -> Result<bool> {
+    if ids.is_empty() || ids.len() > 2000 {
+        return Ok(false);
+    }
+    for id in ids {
+        let Some(value) = store.source_envelope(*id).await? else {
+            return Ok(false);
+        };
+        let Ok(envelope) = serde_json::from_value::<Envelope>(value) else {
+            return Ok(false);
+        };
+        if !visible(policy, sensitive, &envelope) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn visible(policy: &DisclosurePolicy, sensitive: SensitiveEgress, e: &Envelope) -> bool {
+    policy.effective_class(e) != Sensitivity::Restricted
+        && !(sensitive == SensitiveEgress::Redact
+            && policy.effective_class(e) == Sensitivity::Sensitive)
+        && !matches!(e.kind.as_str(), "policy.gap" | "media.chunk")
 }
