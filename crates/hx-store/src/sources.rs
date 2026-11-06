@@ -162,7 +162,11 @@ impl Store {
                 .await?;
             log_switch(&mut tx, "source", id, enabled).await?;
         }
-        tx.commit().await
+        tx.commit().await?;
+        if enabled == Some(false) {
+            self.cancel_source_exchanges(id, None).await;
+        }
+        Ok(())
     }
     pub async fn recipe_exists(&self, id: &str) -> Result<bool> {
         Ok(
@@ -214,7 +218,7 @@ impl Store {
     ) -> Result<bool> {
         let result = stored_json(result);
         let mut tx = self.begin_write().await?;
-        let updated = sqlx::query("UPDATE setup_runs SET status=$3,result=$4,last_error=$5,finished_at=$6 WHERE source_id=$1 AND generation=$2 AND status='pending' AND EXISTS(SELECT 1 FROM sources WHERE id=$1 AND setup_generation=$2 AND enabled)")
+        let updated = sqlx::query("UPDATE setup_runs SET status=$3,result=$4,last_error=$5,finished_at=$6 WHERE source_id=$1 AND generation=$2 AND status='pending' AND EXISTS(SELECT 1 FROM sources WHERE id=$1 AND setup_generation=$2 AND (enabled OR $5 IS NOT NULL))")
             .bind(source).bind(generation).bind(if error.is_some() { "failed" } else { "succeeded" }).bind(result).bind(error).bind(Ts::now()).execute(&mut *tx).await?;
         if updated.rows_affected() == 0 {
             tx.rollback().await?;
@@ -250,18 +254,41 @@ impl Store {
 
     /// Setup-only save. HTTP identity is source + method + normalized URL path;
     /// query, headers, body and display name do not create a new owner switch.
-    /// A genuinely different path (or CLI name / MCP tool) is a different
+    /// A genuinely different path (or CLI argv / MCP tool) is a different
     /// pull. This is an identity boundary, not a detector for equivalent APIs.
     /// A re-save never writes enabled or owner_off, or resets the pull cursor.
     pub async fn save_recipe(&self, source: &str, recipe: &Recipe) -> Result<StoredRecipe> {
+        self.save_recipe_for_setup(source, recipe, None).await
+    }
+    pub async fn save_recipe_for_setup(
+        &self,
+        source: &str,
+        recipe: &Recipe,
+        generation: Option<i64>,
+    ) -> Result<StoredRecipe> {
         recipe.validate()?;
         let mut recipe = recipe.clone();
         recipe.source = source.to_owned();
-        let identity_hash = recipe_identity(&recipe)?;
+        let mut identity_hash = recipe_identity(&recipe)?;
         let value = stored_json(serde_json::to_value(&recipe)?);
         let id = new_id();
         let mut tx = self.begin_write().await?;
         ensure_source_on(&mut tx, source).await?;
+        ensure_setup_generation(&mut tx, source, generation).await?;
+        // Older CLI rows used their display name in the hash. Compare the saved
+        // requests under the current rules, retaining the row, switch and cursor.
+        // If older code already made duplicates, an owner-off row wins.
+        let existing: Vec<StoredRecipe> =
+            sqlx::query_as("SELECT * FROM recipes WHERE source_id=$1 ORDER BY owner_off DESC,id")
+                .bind(source)
+                .fetch_all(&mut *tx)
+                .await?;
+        for saved in existing {
+            if recipe_identity(&saved.recipe.0)? == identity_hash {
+                identity_hash = saved.identity_hash;
+                break;
+            }
+        }
         let row: StoredRecipe = sqlx::query_as("INSERT INTO recipes(id,source_id,name,identity_hash,recipe) VALUES($1,$2,$3,$4,$5) ON CONFLICT(source_id,identity_hash) DO UPDATE SET name=EXCLUDED.name,recipe=EXCLUDED.recipe RETURNING *")
             .bind(id).bind(source).bind(&recipe.name).bind(identity_hash).bind(value).fetch_one(&mut *tx).await?;
         sqlx::query(
@@ -363,6 +390,15 @@ impl Store {
     /// A genuinely different name is a separate add-on; we do not detect prose
     /// equivalence. Surrounding whitespace in the name is not significant.
     pub async fn save_addon(&self, source: &str, name: &str, text: &str) -> Result<Addon> {
+        self.save_addon_for_setup(source, name, text, None).await
+    }
+    pub async fn save_addon_for_setup(
+        &self,
+        source: &str,
+        name: &str,
+        text: &str,
+        generation: Option<i64>,
+    ) -> Result<Addon> {
         let name = name.trim();
         ensure!(!name.is_empty(), "add-on name required");
         ensure!(
@@ -372,6 +408,7 @@ impl Store {
         let id = new_id();
         let mut tx = self.begin_write().await?;
         ensure_source_on(&mut tx, source).await?;
+        ensure_setup_generation(&mut tx, source, generation).await?;
         let existing: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM addons WHERE source_id=$1 AND name=$2)",
         )
@@ -413,6 +450,14 @@ impl Store {
             _ => bail!("unknown switch kind"),
         };
         let mut tx = self.begin_write().await?;
+        let recipe: Option<StoredRecipe> = if kind == "recipe" && !enabled {
+            sqlx::query_as("SELECT * FROM recipes WHERE id=$1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            None
+        };
         let updated = sqlx::query(sql)
             .bind(id)
             .bind(enabled)
@@ -420,7 +465,15 @@ impl Store {
             .await?;
         ensure!(updated.rows_affected() == 1, "unknown switch target");
         log_switch(&mut tx, kind, id, enabled).await?;
-        tx.commit().await
+        tx.commit().await?;
+        if let Some(recipe) = recipe {
+            self.cancel_source_exchanges(
+                &recipe.source_id,
+                Some((id, &recipe_identity(&recipe.recipe.0)?)),
+            )
+            .await;
+        }
+        Ok(())
     }
 
     /// Run-scoped context only. The broker issues the run ULID and scrubs the
@@ -671,7 +724,7 @@ fn normalized_path(address: &str) -> Result<String> {
     })
 }
 
-fn recipe_identity(recipe: &Recipe) -> Result<String> {
+pub fn recipe_identity(recipe: &Recipe) -> Result<String> {
     let executable = |argv: &[String]| -> Result<String> {
         Ok(argv
             .first()
@@ -688,9 +741,10 @@ fn recipe_identity(recipe: &Recipe) -> Result<String> {
                 normalized_path(url)?
             ])
         }
-        // CLI has no HTTP method/path. Its stable recipe name distinguishes
-        // pulls from the same executable; flags/env changes preserve the switch.
-        Request::Cli { argv, .. } => json!(["cli", executable(argv)?, recipe.name.trim()]),
+        // Environment changes, like HTTP headers/body, retain the switch.
+        // In particular ignored/overridden env vars must not bypass an off.
+        // The display name, mapping and cadence are never request identity.
+        Request::Cli { argv, .. } => json!(["cli", argv]),
         Request::Mcp {
             transport, tool, ..
         } => match transport {
@@ -709,3 +763,16 @@ impl std::fmt::Display for SourceAccessChanged {
     }
 }
 impl std::error::Error for SourceAccessChanged {}
+
+async fn ensure_setup_generation(
+    tx: &mut WriteTransaction,
+    source: &str,
+    generation: Option<i64>,
+) -> Result<()> {
+    if let Some(generation) = generation {
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources s JOIN setup_runs r ON r.source_id=s.id AND r.generation=s.setup_generation WHERE s.id=$1 AND s.setup_generation=$2 AND r.status='pending')")
+            .bind(source).bind(generation).fetch_one(&mut **tx).await?;
+        ensure!(valid, "setup superseded or finished");
+    }
+    Ok(())
+}

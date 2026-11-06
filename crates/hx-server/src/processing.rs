@@ -426,6 +426,7 @@ pub struct Runner<P> {
 impl<P: Provider> Handler for Runner<P> {
     async fn handle(&self, job: &Job) -> Result<()> {
         match job.kind.as_str() {
+            "setup" => crate::setup::run(&self.store, job).await?,
             "pull" => {
                 let recipe = job.payload["recipe"]
                     .as_str()
@@ -538,6 +539,7 @@ pub async fn schedule(store: &Store) -> Result<()> {
     // Retry bounded rounds after a cooldown, including interpretations whose
     // compilation is already clean or whose previous canonical view is stale.
     hx_jobs::revive_window_jobs(store).await?;
+    crate::setup::reconcile(store).await?;
     let current = hx_store::window_at(Utc::now() - Duration::hours(4));
     store.generation(current).await?;
     store.schedule_compilations().await?;

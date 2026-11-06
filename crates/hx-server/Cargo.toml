@@ -35,6 +35,7 @@ base64 = "0.22"
 tempfile.workspace = true
 ulid.workspace = true
 url = "2"
+rusqlite = { workspace = true, features = ["hooks", "limits"] }
 
 [dev-dependencies]
 hx-jobs = { workspace = true, features = ["test-support"] }

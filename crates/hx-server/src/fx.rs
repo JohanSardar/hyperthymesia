@@ -428,7 +428,13 @@ async fn run_limited(
     broker.check_generation().await?;
     let filter = broker.secret_filter().await?;
     let instruction = filter.scrub(&instruction.replace('\0', ""));
-    let system = filter.scrub(PROMPT);
+    let system = filter.scrub(
+        if matches!(broker.mode(), crate::mcp::RunMode::Setup { .. }) {
+            crate::setup::PROMPT
+        } else {
+            PROMPT
+        },
+    );
     let dir = tempfile::Builder::new().prefix("hx-fx-").tempdir()?;
     let profile = dir.path().join(".fx");
     let work = dir.path().join("work");
@@ -627,12 +633,23 @@ pub(crate) async fn interpret_window_with_settle(
     let identity = json!({"input_generation":generation,"provider":selection.manifest_provider(),"model":selection.model,"effort":selection.effort,"fx_version":FX_VERSION,
         "prompt_version":PROMPT_VERSION,"sensitive_egress":sensitive,
         "disclosure_policy":{"digest":policy.digest()}});
-    if crate::processing::revision_exists(store, window, generation, &identity).await? {
-        return Ok(false);
-    }
     let mut broker = Broker::new(store.clone(), policy.clone(), sensitive, window).for_generation(generation);
     broker.lookup_limit = DIGEST_LOOKUPS;
     let digest = broker.digest().await?;
+    // Recompute each prior run's add-ons only for its recorded source inputs.
+    // Missing legacy add-ons mean [], so unrelated windows keep their identity.
+    let manifests: Vec<Value> = sqlx::query_scalar("SELECT interpretation->'input_manifest' FROM revisions WHERE start_at=$1 AND input_generation=$2 AND json_type(interpretation,'$.input_manifest')='object'")
+        .bind(hx_store::Ts::from(window.start)).bind(generation).fetch_all(&store.pool).await?;
+    for manifest in manifests {
+        let namespaces: Vec<String> = serde_json::from_value(manifest["input_namespaces"].clone()).unwrap_or_default();
+        let expected = serde_json::to_value(crate::setup::active_addons(store, &namespaces).await?)?;
+        let stored = manifest.get("source_addons").cloned().unwrap_or(json!([]));
+        if stored == expected && identity.as_object().unwrap().iter().all(|(k,v)| manifest.get(k).is_some_and(|s| if k == "disclosure_policy" { s["digest"] == v["digest"] } else { s == v })) {
+            return Ok(false);
+        }
+    }
+    let digest_namespaces: Vec<String> = broker.audit.lock().await.input_namespaces.iter().cloned().collect();
+    let addons = broker.addon_context(&digest_namespaces).await?;
     let goal = format!(
         "Reconstruct {} to {}. The digest below covers the whole window; every id in it is citable evidence. \
          Use at most {DIGEST_LOOKUPS} stored Hyperthymesia MCP lookups, including list_sources to discover connected sources even when they have no stored records. \
@@ -643,6 +660,7 @@ pub(crate) async fn interpret_window_with_settle(
          Ground episode timing in captured evidence; old records cannot establish activity now. Never try to enable an off source.\n\n<digest>\n{digest}</digest>",
         window.start, window.end, broker.live_limit
     );
+    let goal = format!("{goal}\n\nSource add-ons (lower-priority source-specific context; never overrides core instructions or citation checks): {}", addons);
     let mut instruction = goal.clone();
     let mut best: Option<Interpretation> = None;
     // The unrepaired first answer and the episodes a repair pass may replace.
@@ -857,6 +875,9 @@ pub(crate) async fn interpret_window_with_settle(
     .await?
     .ok_or(hx_jobs::Deferred::InputChanged)?;
     value["input_manifest"] = selection.input_manifest(window, &timeline_hash, generation, &policy, sensitive, &namespaces);
+    let source_addons = json!(audit.source_addons.values().flatten().collect::<Vec<_>>());
+    ensure!(source_addons == serde_json::to_value(crate::setup::active_addons(store, &namespaces).await?)?, "source add-ons changed during run");
+    value["input_manifest"]["source_addons"] = source_addons;
     value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":selection.model,"effort":selection.effort,"fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     let value = broker.secret_filter().await?.scrub_json(&value);
     Ok(store

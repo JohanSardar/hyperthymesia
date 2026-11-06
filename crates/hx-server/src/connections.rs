@@ -42,7 +42,7 @@ pub async fn page(
                 h1 {"Connect your sources"}
                 p class="intro" {"Bring the rest of your work into your day. Paste a key and tell Hyperthymesia what it connects to. Your agent can use it live on later runs, with citations back to the answer it received."}
                 @if query.connected.as_deref() == Some("1") {
-                    p class="notice" role="status" {"Connected and on. No other setup is needed for live use. Your next scheduled run can use this source; connecting did not start a model run."}
+                    p class="notice" role="status" {"Connected. One bounded setup run is queued. Your agent will set up automatic pulls; you do not need to do anything else."}
                 }
                 section aria-label="Connected sources" {
                     h2 {"Your sources"}
@@ -100,14 +100,14 @@ pub async fn page(
                     p {"Code blocks common literal catastrophic commands, including disk erasure, shutdown, fork bombs and forced recursive deletion of root or home. It also blocks literal access to Hyperthymesia's state folder. This is an accident guard, not a security boundary: scripts, variables, symlinks, obfuscated commands and other destructive operations can bypass it."}
                     p {"Keys are kept in private, mode-0600 files on this server, outside SQLite and backups. Each call receives only its own source's key. Known keys and common encodings are scrubbed before prompts, tool logs and saved answers. Full host bash can still read keys and other host credentials or send them elsewhere; keys are not hidden from the agent, and scrubbing cannot stop every encoding or deliberate exfiltration."}
                     p {"Allowed source content and your summaries go to the configured cloud model. Retrieved text is treated as untrusted data. Live answers are saved for citations, but old records and current lookups are context, not proof of activity at another time."}
-                    p {"Connecting and switching sources do not start a model run. An off source cannot be called or re-enabled through the agent's broker tools."}
+                    p {"Connecting starts one bounded setup job with at most two attempts. Pulls then run every four hours without AI. Switching sources starts no model run. An off source cannot be called or re-enabled through the agent's broker tools."}
                 }
             }
         }),
     ).into_response())
 }
 
-fn same_origin(headers: &HeaderMap) -> ApiResult<()> {
+pub(crate) fn same_origin(headers: &HeaderMap) -> ApiResult<()> {
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -155,4 +155,120 @@ pub async fn switch(
         Redirect::to("/connect"),
     )
         .into_response())
+}
+
+pub async fn agent_setup(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Response> {
+    let Json(configured) = sources::list(State(store.clone()), headers.clone()).await?;
+    let Json(recipes) = sources::recipes(
+        State(store.clone()),
+        headers.clone(),
+        Query(sources::Filter { source: None }),
+    )
+    .await?;
+    let Json(addons) = sources::addons(
+        State(store.clone()),
+        headers.clone(),
+        Query(sources::Filter { source: None }),
+    )
+    .await?;
+    let Json(tables) = sources::agent_tables(
+        State(store.clone()),
+        headers.clone(),
+        Query(sources::Filter { source: None }),
+    )
+    .await?;
+    let mut runs = Vec::new();
+    for source in configured.as_array().into_iter().flatten() {
+        if let (Some(id), Some(generation)) =
+            (source["id"].as_str(), source["setup_generation"].as_i64())
+            && let Some(run) = store.setup_run(id, generation).await?
+        {
+            runs.push(serde_json::json!({"source":id,"result":run.result,"error":run.last_error}));
+        }
+    }
+    let runs = sources::scrubber(&store, None)
+        .await?
+        .scrub_json(&serde_json::json!(runs));
+    Ok(([(header::CACHE_CONTROL,"no-store")],shell("What your agent set up",html! {
+        main {
+            h1 {"What your agent set up"}
+            p {"Your agent discovers a source once. Plain code then pulls every four hours, resumes from a cursor, and catches up once after missed cycles. Pulls use no AI. A later day-page run can use and cite the captured data."}
+            p {b {"Your switches stay yours."} " Switching a pull off stops requests, including queued pulls. Setup cannot turn it back on. Only you can re-enable it."}
+            aside {p {b {"“Keep it local” is an instruction to the agent, not a wall."} " The agent has full host bash. Add-on prompts cannot enforce isolation or change core rules and citation checks. Allowed content may reach the configured cloud model."}}
+            @if configured.as_array().is_none_or(Vec::is_empty) {p {"Nothing set up yet. " a href="/connect" {"Connect a source"}}}
+            @for source in configured.as_array().into_iter().flatten() {
+                section {
+                    h2 {(source["name"].as_str().unwrap_or("Source"))}
+                    p {"Status: " (source["status"].as_str().unwrap_or("unknown")) @if source["enabled"] != true {" · Source off"}}
+                    @for run in runs.as_array().into_iter().flatten().filter(|r| r["source"]==source["id"]) {
+                        @if let Some(summary) = run["result"]["summary"].as_str() {p {(summary)}}
+                        @if let Some(reason) = run["result"]["no_pull"].as_str() {p {"No automatic pull: " (reason)}}
+                        @if let Some(error) = run["error"].as_str() {p {(error)}}
+                    }
+                    @if let Some(error) = source["last_error"].as_str() {p {(error)}}
+                    form method="post" action=(format!("/agent-setup/{}/retry",source["id"].as_str().unwrap_or(""))) {
+                        button type="submit" {"Run setup again"}
+                        small {" Starts one bounded paid setup job (at most two attempts). Your off switches stay off."}
+                    }
+                    h3 {"Automatic pulls"}
+                    @for recipe in recipes.as_array().into_iter().flatten().filter(|r| r["source_id"]==source["id"]) {
+                        article {
+                            h4 {(recipe["name"].as_str().unwrap_or("Pull"))}
+                            (configuration_form("recipe", recipe))
+                            p {"Next pull: " (recipe["next_run_at"].as_str().unwrap_or("")) " · Last success: " (recipe["last_ok_at"].as_str().unwrap_or("none"))}
+                            @if let Some(error) = recipe["last_error"].as_str() {p {(error)}}
+                            details {summary {"Pull recipe"} pre {(serde_json::to_string_pretty(&recipe["recipe"]).unwrap_or_default())}}
+                        }
+                    }
+                    h3 {"Add-on prompts"}
+                    @for addon in addons.as_array().into_iter().flatten().filter(|a| a["source_id"]==source["id"]) {
+                        h4 {(addon["name"].as_str().unwrap_or("Add-on"))} p {(addon["text"].as_str().unwrap_or(""))}
+                        (configuration_form("addon", addon))
+                    }
+                    h3 {"Agent tables"}
+                    @for table in tables.as_array().into_iter().flatten().filter(|t| t["name"].as_str().unwrap_or("").starts_with(&format!("s_{}_",source["id"].as_str().unwrap_or("")))) {
+                        p {code {(table["name"].as_str().unwrap_or(""))} " · " (table["row_count"]) " rows"}
+                    }
+                }
+            }
+        }
+    })).into_response())
+}
+fn configuration_form(kind: &str, value: &serde_json::Value) -> maud::Markup {
+    let on = value["enabled"] == true && value["owner_off"] != true;
+    html! {form method="post" action=(format!("/agent-setup/{kind}/{}",value["id"].as_str().unwrap_or(""))) {
+        input type="hidden" name="enabled" value=(if on {"false"} else {"true"});
+        button type="submit" role="switch" aria-checked=(if on {"true"} else {"false"}) aria-label=(format!("{} {}",if on {"Switch off"} else {"Switch on"}, value["name"].as_str().unwrap_or(kind))) {
+            @if on {"Switch off"} @else {"Switch on"}
+        }
+    }}
+}
+pub async fn configuration_switch(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, String)>,
+    Form(request): Form<sources::Switch>,
+) -> ApiResult<Response> {
+    same_origin(&headers)?;
+    match kind.as_str() {
+        "recipe" => {
+            let _ =
+                sources::recipe_switch(State(store), headers, Path(id), Ok(Json(request))).await?;
+        }
+        "addon" => {
+            let _ =
+                sources::addon_switch(State(store), headers, Path(id), Ok(Json(request))).await?;
+        }
+        _ => return Err(crate::bad("unknown configuration kind")),
+    }
+    Ok(Redirect::to("/agent-setup").into_response())
+}
+pub async fn retry_setup(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    same_origin(&headers)?;
+    let _ = sources::setup(State(store), headers, Path(id)).await?;
+    Ok(Redirect::to("/agent-setup").into_response())
 }

@@ -17,7 +17,7 @@ pub(crate) fn shell(title: &str, body: Markup) -> Html<String> {
         meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'";
         title {(title)}
         style {"body{font:16px system-ui;background:#10151e;color:#e8edf5;margin:2rem}a{color:#8fd3ff}.lane{margin:1rem 0}.entry{display:flex;gap:1rem;margin:.6rem 0}.when{font-variant-numeric:tabular-nums;color:#9fb0c8;min-width:7.5rem}.desc{margin:.2rem 0;color:#b9c6d8;font-size:14px}.summary{color:#cfd8e6}summary{cursor:pointer;margin:1rem 0}.track{height:2.5rem;background:#253143;position:relative;overflow:hidden}.bar{position:absolute;background:#255b87;height:100%;white-space:nowrap;overflow:hidden;font-size:12px;color:white}.axis{display:flex;justify-content:space-between}pre{white-space:pre-wrap;overflow-wrap:anywhere}.zoom:target .track{height:5rem}table{border-spacing:1rem .4rem}input{font:inherit}img{max-width:480px}"}
-    } body {nav {a href="/" {"Today"} " · " a href="#episodes" {"What you did"} " · " a href="#tasks" {"Tasks"} " · " a href="#lanes" {"Lanes"} " · " a href="/connect" {"Connect sources"}}
+    } body {nav {a href="/" {"Today"} " · " a href="#episodes" {"What you did"} " · " a href="#tasks" {"Tasks"} " · " a href="#lanes" {"Lanes"} " · " a href="/connect" {"Connect sources"} " · " a href="/agent-setup" {"What your agent set up"}}
         (body)
     }}}.into_string())
 }
