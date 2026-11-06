@@ -104,10 +104,30 @@ impl KeyStore {
                 .and_then(|value| value.to_str())
                 .ok_or(KeyError::InvalidId)?;
             if let Some(key) = self.read(id)? {
-                keys.push(key);
+                keys.extend(crate::oauth::redaction_values(&key));
             }
         }
         Ok(keys)
+    }
+
+    /// Remove consumed/expired OAuth handshakes without following symlinks.
+    pub fn remove(&self, id: &str) -> Result<(), KeyError> {
+        let path = self.path(id)?;
+        private_directory(&self.directory)?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub(crate) fn identity(&self, id: &str) -> Result<PathBuf, KeyError> {
+        let name = self
+            .path(id)?
+            .file_name()
+            .ok_or(KeyError::InvalidId)?
+            .to_owned();
+        Ok(fs::canonicalize(&self.directory)?.join(name))
     }
 
     fn path(&self, id: &str) -> Result<PathBuf, KeyError> {

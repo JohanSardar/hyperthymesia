@@ -172,7 +172,7 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
                     if configured.id == source.id {
                         request_key = Some(secret.clone());
                     }
-                    secrets.push(secret);
+                    secrets.extend(hx_sources::oauth::redaction_values(&secret));
                 }
             }
             Ok::<_, hx_sources::keys::KeyError>((request_key, secrets))
@@ -254,6 +254,9 @@ pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullRepo
                     break;
                 }
                 Err(error) => {
+                    if let RequestError::RateLimited(seconds) = &error {
+                        state.next_run_at = now + chrono::Duration::seconds(*seconds as i64);
+                    }
                     let reconnect = error.needs_reconnect()
                         || matches!(error, RequestError::Exit(code) if recipe.reconnect_exit_codes.contains(&code))
                         || matches!(error, RequestError::MissingKey);
@@ -370,7 +373,9 @@ async fn failed(
     // All error strings here come from fixed, secret-free transport/key/mapper
     // classifications. Never persist provider bodies, argv or underlying errors.
     state.last_error = Some(error.to_owned());
-    state.next_run_at = hx_store::window_at(now.max(Utc::now())).end;
+    state.next_run_at = state
+        .next_run_at
+        .max(hx_store::window_at(now.max(Utc::now())).end);
     store
         .finish_recipe_pull(source, state, now, reconnect)
         .await?;

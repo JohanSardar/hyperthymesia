@@ -39,6 +39,71 @@ pub enum McpTransport {
     Stdio { argv: Vec<String> },
 }
 
+/// Owner configuration, never supplied by a recipe or a source response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliIdentity {
+    pub command: String,
+    pub executable: String,
+    pub home: std::path::PathBuf,
+}
+
+impl CliIdentity {
+    pub fn resolve(command: &str, host: &crate::host::HostRunner) -> Result<Self, RequestError> {
+        use std::os::unix::fs::PermissionsExt;
+        if command.is_empty()
+            || command.contains("{{")
+            || command.chars().any(char::is_control)
+            || !host.home.is_absolute()
+        {
+            return Err(RequestError::CliInvalid);
+        }
+        let executable = if std::path::Path::new(command).is_absolute() {
+            std::path::PathBuf::from(command)
+        } else {
+            if command.contains('/') {
+                return Err(RequestError::CliInvalid);
+            }
+            std::env::split_paths(&host.extended_path().map_err(|_| RequestError::HostIo)?)
+                .map(|path| path.join(command))
+                .find(|path| {
+                    std::fs::metadata(path)
+                        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                })
+                .ok_or(RequestError::HostIo)?
+        };
+        let executable = std::fs::canonicalize(executable).map_err(|_| RequestError::HostIo)?;
+        if !std::fs::metadata(&executable)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        {
+            return Err(RequestError::HostIo);
+        }
+        Ok(Self {
+            command: command.into(),
+            executable: executable.to_str().ok_or(RequestError::CliInvalid)?.into(),
+            home: host.home.clone(),
+        })
+    }
+
+    pub fn pin(&self, request: &Request) -> Result<Request, RequestError> {
+        request.validate_cli()?;
+        let mut request = request.clone();
+        let argv = match &mut request {
+            Request::Cli { argv, .. }
+            | Request::Mcp {
+                transport: McpTransport::Stdio { argv },
+                ..
+            } => argv,
+            _ => return Err(RequestError::Destination),
+        };
+        let command = argv.first_mut().ok_or(RequestError::CliInvalid)?;
+        if *command != self.command && *command != self.executable {
+            return Err(RequestError::Destination);
+        }
+        *command = self.executable.clone();
+        Ok(request)
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct Placeholders<'a> {
     pub key: Option<&'a str>,
@@ -56,12 +121,16 @@ pub enum RequestError {
     Unsupported,
     #[error("invalid HTTP request")]
     Invalid,
+    #[error("Login expired or missing. Reconnect this source on Connect sources.")]
+    Login,
     #[error("request requires a source key")]
     MissingKey,
     #[error("HTTP request failed or timed out")]
     Transport,
     #[error("HTTP status {0}")]
     Status(u16),
+    #[error("Source rate limited. Automatic pulls will retry after {0} seconds.")]
+    RateLimited(u64),
     #[error("HTTP response exceeds size limit")]
     TooLarge,
     #[error("HTTP response is not JSON")]
@@ -90,11 +159,17 @@ pub enum RequestError {
 
 impl RequestError {
     pub fn needs_reconnect(&self) -> bool {
-        matches!(self, Self::Status(401 | 403))
+        matches!(
+            self,
+            Self::Login | Self::MissingKey | Self::Status(401 | 403)
+        )
     }
 
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Transport | Self::Status(408 | 429 | 500..=599))
+        matches!(
+            self,
+            Self::Transport | Self::RateLimited(_) | Self::Status(408 | 429 | 500..=599)
+        )
     }
 }
 
@@ -102,9 +177,22 @@ impl RequestError {
 /// Callers also cancel the enclosing future while a response is in flight.
 pub trait RequestGate: Sync {
     fn check(&self) -> impl std::future::Future<Output = Result<(), RequestError>> + Send;
+
+    /// Cancel resource I/O and lock waits, never an already-dispatched token
+    /// rotation. Polling also observes switches committed by another process.
+    fn cancelled(&self) -> impl std::future::Future<Output = RequestError> + Send {
+        async {
+            loop {
+                if let Err(error) = self.check().await {
+                    return error;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }
 
-struct Unrestricted;
+pub(crate) struct Unrestricted;
 impl RequestGate for Unrestricted {
     async fn check(&self) -> Result<(), RequestError> {
         Ok(())
@@ -112,9 +200,68 @@ impl RequestGate for Unrestricted {
 }
 
 impl Request {
+    /// A recipe may supply credential values, but cannot select a different
+    /// login, executable search path, runtime loader or credential directory.
+    pub fn validate_cli(&self) -> Result<(), RequestError> {
+        let argv = match self {
+            Self::Cli { argv, env } => {
+                // Only explicit key/token variables are useful request input.
+                // All directory, runtime and lookup variables are owner context.
+                if env.iter().any(|(name, value)| {
+                    !(name.ends_with("_KEY") || name.ends_with("_TOKEN"))
+                        || ["XDG_", "HX_", "FX_", "LD_", "DYLD_"]
+                            .iter()
+                            .any(|prefix| name.starts_with(prefix))
+                        || value != "{{key}}"
+                }) {
+                    return Err(RequestError::CliInvalid);
+                }
+                argv
+            }
+            Self::Mcp {
+                transport: McpTransport::Stdio { argv },
+                ..
+            } => argv,
+            _ => return Ok(()),
+        };
+        if argv
+            .first()
+            .is_none_or(|s| s.is_empty() || s.contains("{{"))
+            || argv.iter().skip(1).any(|arg| {
+                let name = arg.split('=').next().unwrap_or(arg).to_ascii_lowercase();
+                matches!(
+                    name.as_str(),
+                    "auth"
+                        | "login"
+                        | "logout"
+                        | "credentials"
+                        | "credential"
+                        | "config"
+                        | "configure"
+                ) || (name.starts_with('-')
+                    && [
+                        "config",
+                        "credential",
+                        "token",
+                        "profile",
+                        "account",
+                        "home",
+                        "directory",
+                        "exec",
+                    ]
+                    .iter()
+                    .any(|word| name.contains(word)))
+            })
+        {
+            return Err(RequestError::CliInvalid);
+        }
+        Ok(())
+    }
+
     /// Only owner-authored configuration can bind a credential destination.
     /// Response URLs and model-chosen source IDs are not credential authority.
     pub fn authorize(&self, description: &str) -> Result<(), RequestError> {
+        self.validate_cli()?;
         let permitted = match self {
             Self::Http { url, .. }
             | Self::Mcp {
@@ -172,6 +319,50 @@ impl Request {
         }
     }
 
+    /// Bind non-secret data without evaluating it. HTTP values are always encoded
+    /// as URL components; the authority is pinned by the original template.
+    pub fn bind(&self, name: &str, value: &str) -> Result<Self, RequestError> {
+        fn replace(value: &mut Value, needle: &str, replacement: &str) {
+            match value {
+                Value::String(s) => *s = s.replace(needle, replacement),
+                Value::Array(a) => {
+                    for v in a {
+                        replace(v, needle, replacement);
+                    }
+                }
+                Value::Object(o) => {
+                    for v in o.values_mut() {
+                        replace(v, needle, replacement);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let needle = format!("{{{{{name}}}}}");
+        let mut json = serde_json::to_value(self).map_err(|_| RequestError::Invalid)?;
+        if let Some(url) = json.get_mut("url") {
+            let template = url.as_str().ok_or(RequestError::Invalid)?;
+            let authority = template
+                .split_once("://")
+                .ok_or(RequestError::Invalid)?
+                .1
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            if authority.contains("{{") {
+                return Err(RequestError::Invalid);
+            }
+            *url = Value::String(template.replace(&needle, &encode_url_value(value)));
+        }
+        // Do not substitute a second time inside the already encoded URL.
+        let url = json.as_object_mut().and_then(|o| o.remove("url"));
+        replace(&mut json, &needle, value);
+        if let Some(url) = url {
+            json["url"] = url;
+        }
+        serde_json::from_value(json).map_err(|_| RequestError::Invalid)
+    }
+
     /// No retries and no model. CLI argv remain literal arguments, including
     /// response-controlled cursors; no substituted text is evaluated as shell.
     #[cfg(unix)]
@@ -193,6 +384,7 @@ impl Request {
         host: &crate::host::HostRunner,
         gate: &impl RequestGate,
     ) -> Result<Value, RequestError> {
+        self.validate_cli()?;
         match self {
             Self::Http { .. } => self.execute_http_guarded(values, timeout, gate).await,
             Self::Mcp {
@@ -303,7 +495,7 @@ impl Request {
             .await
             .map_err(|_| RequestError::Transport)?;
         if !response.status().is_success() {
-            return Err(RequestError::Status(response.status().as_u16()));
+            return Err(http_failure(response).await);
         }
         if response
             .content_length()
@@ -323,6 +515,74 @@ impl Request {
             bytes.extend_from_slice(&chunk);
         }
         serde_json::from_slice(&bytes).map_err(|_| RequestError::Json)
+    }
+}
+
+/// Honor a bounded Retry-After without spinning or sleeping inside a worker.
+pub(crate) fn http_status(response: &reqwest::Response) -> RequestError {
+    let status = response.status().as_u16();
+    if matches!(status, 403 | 429 | 503) {
+        let delay = response
+            .headers()
+            .get("retry-after")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|text| {
+                text.parse::<u64>().ok().or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(text).ok().map(|at| {
+                        (at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                            .num_seconds()
+                            .max(1) as u64
+                    })
+                })
+            });
+        if let Some(delay) = delay {
+            return RequestError::RateLimited(delay.clamp(1, 86400));
+        }
+    }
+    RequestError::Status(status)
+}
+
+/// Some APIs report quota exhaustion as 403. Inspect only bounded structured
+/// codes, never provider prose, and never expose the error body to callers.
+pub(crate) async fn http_failure(mut response: reqwest::Response) -> RequestError {
+    let error = http_status(&response);
+    if error != RequestError::Status(403) {
+        return error;
+    }
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if bytes.len() + chunk.len() > 64 * 1024 {
+            return error;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return error;
+    };
+    let limited = |value: &Value| {
+        value.as_str().is_some_and(|code| {
+            matches!(
+                code,
+                "RESOURCE_EXHAUSTED"
+                    | "rateLimitExceeded"
+                    | "userRateLimitExceeded"
+                    | "dailyLimitExceeded"
+                    | "quotaExceeded"
+                    | "rate_limit_exceeded"
+                    | "too_many_requests"
+            )
+        })
+    };
+    if limited(&value["error"]["status"])
+        || limited(&value["error"]["code"])
+        || limited(&value["error"]["type"])
+        || value["error"]["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|e| limited(&e["reason"])))
+    {
+        RequestError::RateLimited(3600)
+    } else {
+        error
     }
 }
 

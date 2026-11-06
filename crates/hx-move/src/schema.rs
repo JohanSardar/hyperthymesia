@@ -147,6 +147,13 @@ pub fn tables() -> Vec<Table> {
             "id",
             false,
         ),
+        Table::new("source_checks", "source_id:s request:j", "source_id", false),
+        Table::new(
+            "source_cli",
+            "source_id:s command:s executable:s home:s",
+            "source_id",
+            false,
+        ),
         Table::new(
             "recipes",
             "id:s source_id:s name:s identity_hash:s recipe:j enabled:b owner_off:b",
