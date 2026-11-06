@@ -13,7 +13,7 @@ Read `docs/DESIGN.md` (the consensus plan) first. The contract is `crates/hx-sch
 - Set `CARGO_TARGET_DIR` to the value in your task for every cargo command (disk is tight; never create a second target dir).
 - Build and test only your packages: `cargo test -p <pkg>` and `cargo clippy -p <pkg> --all-targets -- -D warnings`, then `cargo fmt -p <pkg>`.
 - Edition 2024, Rust 1.99. `unsafe_code` is forbidden by workspace lints except in `hx-macos-sys`.
-- Postgres for tests: `postgres://hx:hx@localhost:55432/hx` (already running via docker compose). Use a fresh schema or database per test run so tests don't collide.
+- Tests use temporary SQLite state folders. No database service is needed. Only the legacy mover's explicitly opted-in migration tests require a disposable Postgres instance.
 - No sudo, nothing that triggers a password or keychain prompt, no network services exposed beyond localhost.
 
 ## Quality bar
