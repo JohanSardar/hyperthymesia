@@ -197,6 +197,9 @@ impl std::fmt::Display for Deferred {
 }
 impl std::error::Error for Deferred {}
 pub async fn defer(store: &hx_store::Store, job: &Job, reason: &Deferred) -> Result<bool> {
+    hx_store::retry_busy("defer job", |_| defer_attempt(store, job, reason)).await
+}
+async fn defer_attempt(store: &hx_store::Store, job: &Job, reason: &Deferred) -> Result<bool> {
     let mut tx = store.begin_write().await?;
     let now = Ts::now();
     let at = match reason {

@@ -2268,3 +2268,57 @@ async fn writer_stall_past_busy_timeout_buys_no_second_run() {
         f.close().await;
     }
 }
+
+// When every pooled connection is queued behind the writer the error is a pool
+// timeout, not SQLITE_BUSY. It must not cost a finished paid result either.
+#[tokio::test]
+async fn pool_exhaustion_after_the_provider_keeps_the_paid_result() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::time::{Duration as Wait, sleep};
+    struct Holding {
+        pool: sqlx::SqlitePool,
+        calls: Arc<AtomicUsize>,
+    }
+    impl hx_interpret::Provider for Holding {
+        fn name(&self) -> String {
+            "synthetic-pool-exhaustion".into()
+        }
+        async fn complete(&self, _: &str, _: &str) -> Result<String, hx_interpret::InterpretError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let connection = self.pool.acquire().await.unwrap();
+            tokio::spawn(async move {
+                sleep(Wait::from_millis(400)).await;
+                drop(connection);
+            });
+            Ok(json!({"episodes":[],"tasks":[],"summary":"Synthetic"}).to_string())
+        }
+    }
+    let f = Fixture::new().await;
+    let w = window();
+    ingest(&f.store, vec![event("pool-exhaustion", 8)]).await;
+    f.store.normalize_window(w).await.unwrap();
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Wait::from_millis(50))
+        .connect_with(f.store.pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let store = Store::new(pool.clone(), &f.store.data_dir);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = Holding {
+        pool,
+        calls: calls.clone(),
+    };
+    hx_server::processing::interpret_window(&store, w, &provider)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let revisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM revisions")
+        .fetch_one(&f.store.pool)
+        .await
+        .unwrap();
+    assert_eq!(revisions, 1);
+}
