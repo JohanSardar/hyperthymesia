@@ -560,7 +560,7 @@ if [ "$app_only" = false ]; then
         printf ' login %s\n' "$provider"
     fi
     printf 'Then: hx-server --state-dir "%s" doctor (load server.env first).\n' "$state"
-    printf 'Pair a device: hx-server --state-dir "%s" pair --url http://127.0.0.1:7377 --name DEVICE (requires the pairing server).\n' "$state"
+    printf 'Pair a device: hx-server --state-dir "%s" pair --url http://127.0.0.1:7377 --name DEVICE.\n' "$state"
     printf 'Dashboard: create a read_l3 token with token create --name dashboard --prefix CONNECTOR --scopes read_l3. Keep the token private.\n'
     printf 'Remote access: tailscale serve --bg 7377, or ssh -N -L 7377:127.0.0.1:7377 user@host.\n'
     printf 'Automatic GC is off. A login delayed past 24 hours leaves old windows on the daily paid sweep cap.\n'

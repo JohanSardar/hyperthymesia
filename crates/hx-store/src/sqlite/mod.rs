@@ -281,6 +281,7 @@ async fn validate_schema(
             .fetch_all(conn)
             .await
             .context("core.sqlite has not been initialized")?;
+    // Compare the applied set, not MAX(version): reserved numbers can leave gaps.
     for (version, success, checksum) in &applied {
         let expected = migrator
             .iter()

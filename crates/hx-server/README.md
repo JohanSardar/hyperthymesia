@@ -18,7 +18,7 @@ with each command. There is no default. From the workspace:
     cargo run --release -p hx-server -- serve --listen 127.0.0.1:7377
 
 `migrate` creates a new `core.sqlite` and an empty `agent.sqlite`, plus `blobs/`
-and `locks/`. It refuses an existing core. `serve`, `token`, `compile`, `interpret`
+and `locks/`. It refuses an existing core. `serve`, `token`, `pair`, `compile`, `interpret`
 and `gc` open an initialized core and never silently create history. `doctor` and
 `--version` need no state folder. Use local disk only; WAL is unsuitable for a
 network filesystem. WAL, full synchronous writes and a 30-second busy timeout
@@ -31,15 +31,35 @@ or point an old service configuration at a new empty state.
 Token creation prints the credential once; only its SHA-256 is stored. Issue
 separate ingest-only and reader credentials for actual deployments. read_raw
 includes reader operations. Prefixes are literal connector-instance prefixes;
-choose namespace delimiters deliberately. The listener rejects non-loopback
+prefixes ending in `:` cover a namespace. Other prefixes match exactly or with
+colon-delimited descendants: `macos-agent:m` cannot write as `macos-agent:mac1`.
+The listener rejects non-loopback
 addresses. Put a private Tailscale proxy in front when accessing another machine;
 transport/proxy setup is external.
 
 Visit /login and enter a reader token for the dashboard. The cookie is HttpOnly
 and SameSite Strict, expires in twelve hours, and contains a revocable token.
 Use HTTPS at the private proxy. REST callers use Authorization: Bearer credentials.
-Revocation is currently administrative: set device_tokens.revoked=true for the
-credential hash.
+Use `hx-server token list` to list metadata and full hash IDs, then
+`hx-server token revoke <id>` to stop that token's next request. Listings never
+contain bearer secrets.
+
+For a Mac, mint a 15-minute single-use link with
+`hx-server pair --name NAME [--url URL]` (default URL `http://127.0.0.1:7377`).
+Paste it into the app or `hx-agent pair '<link>'`. Pairing grants ingest only
+within that device's five agent/media/companion prefixes. Device IDs contain
+1–255 ASCII letters, digits, `.`, `_` or `-`, and cannot be `.` or `..`.
+Re-pairing the same device requires revoking its previous server token first;
+a refusal leaves the code available. `hx-server pair list` shows code hash IDs,
+names, expiration/usage times (UTC microseconds) and revocation state;
+`hx-server pair revoke <id>` disables a link. It does not revoke an issued token.
+The server stores only hashes of codes and tokens. Pairing refusals uniformly
+return 410; internal failures return an empty 503, so retry the same link.
+See [Mac pairing](../../docs/mac-pairing.md) for stable device IDs and replacement.
+
+Paired blob uploads retain the existing behavior: they are not prefix-checked
+or quota-limited. Existing development `[1,3]` cores have no upgrade path to
+`[1,2,3]`; A3 owns the `migrate` upgrade work.
 
     cargo run -p hx-server -- compile --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
     cargo run -p hx-server -- interpret --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
