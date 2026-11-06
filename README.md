@@ -11,8 +11,10 @@ wrong. Citations let you check the evidence; missing capture is shown as unknown
 
 The Mac app can record focused windows, accessibility text, input activity,
 screen video and stills. It buffers uploads locally. The server stores evidence,
-saved source answers and day pages on your disk. Window summaries and allowed
-source content go to your configured **cloud model**. Model use can cost money.
+saved source answers and day pages on your disk. Your configured **cloud model**
+can receive captured window titles, URLs, accessibility text, screenshot OCR,
+fuller saved evidence from broker lookups, and source responses during setup and
+live lookups. Model use can cost money.
 
 The agent has full bash on the server, with access to files, existing CLI logins,
 credentials and the network. It is not sandboxed. Source keys are stored in
@@ -31,7 +33,9 @@ No Docker or database service is needed. The server uses SQLite and one explicit
 state folder on a **local disk**. The Mac app requires Apple Silicon and macOS 14+;
 the server also supports Linux x86_64/aarch64. Install Git, Python 3, curl and
 [Rust through rustup](https://rustup.rs/). On a Mac, install the Xcode command line
-tools first. Cargo uses the toolchain pinned in `rust-toolchain.toml`.
+tools first. On Linux, install a C compiler, linker and build tools
+(Debian/Ubuntu: `build-essential` and `pkg-config`). Cargo uses the toolchain pinned
+in `rust-toolchain.toml`.
 
 ```sh
 set -e
