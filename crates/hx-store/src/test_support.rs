@@ -4,54 +4,21 @@ use super::*;
 
 pub struct Fixture {
     pub store: Store,
-    admin: PgPool,
-    db: String,
     _dir: tempfile::TempDir,
 }
 impl Fixture {
     pub async fn new() -> Self {
-        Self::through_migration(i64::MAX).await
-    }
-    /// Exercise an upgrade with synthetic data written by the old schema.
-    pub async fn through_migration(version: i64) -> Self {
-        let url = std::env::var("HX_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://hx:hx@localhost:55432/hx".into());
-        let base = url.rsplit_once('/').expect("test database URL").0;
-        let admin = PgPool::connect(&format!("{base}/postgres")).await.unwrap();
-        let db = format!(
-            "hx_sc_{}",
-            ulid::Ulid::generate().to_string().to_lowercase()
-        );
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
-            .execute(&admin)
-            .await
-            .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::connect(&format!("{base}/{db}"), dir.path())
-            .await
-            .unwrap();
-        let mut migrations = sqlx::migrate!("./migrations");
-        migrations.migrations = migrations
-            .iter()
-            .filter(|m| m.version <= version)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into();
-        migrations.run(&store.pool).await.unwrap();
-        Self {
-            store,
-            admin,
-            db,
-            _dir: dir,
-        }
+        let store = Store::create(dir.path()).await.unwrap();
+        Self { store, _dir: dir }
+    }
+    /// Build synthetic legacy records in the current schema. `apply_legacy_admission_fixture` below
+    /// models only the paid-admission metadata applied by the future mover.
+    pub async fn legacy_admission_fixture() -> Self {
+        Self::new().await
     }
     pub async fn close(self) {
         self.store.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {}", self.db)))
-            .execute(&self.admin)
-            .await
-            .unwrap();
-        self.admin.close().await;
     }
 }
 #[derive(Debug, sqlx::FromRow)]
@@ -71,20 +38,34 @@ pub struct JobState {
     pub revivals: i32,
 }
 impl Store {
+    pub async fn apply_legacy_admission_fixture(&self) -> Result<()> {
+        // Synthetic equivalent of the legacy admission repair; never production startup.
+        let mut tx = self.begin_write().await?;
+        let now = Ts::now();
+        sqlx::query("UPDATE windows SET revision24_finished=true WHERE end_at+86400000000<=$1")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE jobs SET state='done',revivals=3 WHERE kind='interpret' AND state<>'running' AND window_start+100800000000<=$1").bind(now).execute(&mut *tx).await?;
+        tx.commit().await
+    }
     pub async fn sweep_reservations(
         &self,
     ) -> Result<Vec<(chrono::NaiveDate, DateTime<Utc>, bool)>> {
-        Ok(
+        let rows: Vec<(String, Ts, bool)> =
             sqlx::query_as("SELECT day,start_at,started FROM daily_sweeps ORDER BY day")
                 .fetch_all(&self.pool)
-                .await?,
-        )
+                .await?;
+        rows.into_iter()
+            .map(|(day, at, started)| Ok((day.parse()?, at.into(), started)))
+            .collect()
     }
+
     pub async fn window_state(&self, w: Interval) -> Result<WindowState> {
         Ok(sqlx::query_as(
             "SELECT generation,dirty,canonical_revision FROM windows WHERE start_at=$1",
         )
-        .bind(w.start)
+        .bind(Ts::from(w.start))
         .fetch_one(&self.pool)
         .await?)
     }
@@ -96,8 +77,8 @@ impl Store {
         .await?)
     }
     pub async fn request_work(&self, kind: &str, w: Interval, generation: i64) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        request_window_job(&mut tx, kind, w, generation).await?;
+        let mut tx = self.begin_write().await?;
+        request_window_job(&mut tx, kind, w, generation, Ts::now()).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -107,36 +88,36 @@ impl Store {
         generation: i64,
         revision24: bool,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         request_interpret_job(&mut tx, w, generation, revision24, Utc::now()).await?;
         tx.commit().await?;
         Ok(())
     }
     pub async fn make_jobs_due(&self, state: &str, kind: Option<&str>) -> Result<()> {
-        sqlx::query(
-            "UPDATE jobs SET available_at=now() WHERE state=$1 AND ($2::text IS NULL OR kind=$2)",
-        )
-        .bind(state)
-        .bind(kind)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE jobs SET available_at=$3 WHERE state=$1 AND ($2 IS NULL OR kind=$2)")
+            .bind(state)
+            .bind(kind)
+            .bind(Ts::now())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
     pub async fn settle_inputs(&self) -> Result<()> {
-        sqlx::query("UPDATE windows SET input_changed_at=now()-interval '1 hour'")
+        sqlx::query("UPDATE windows SET input_changed_at=$1-3600000000")
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     pub async fn change_input(&self, w: Interval) -> Result<()> {
         sqlx::query("UPDATE windows SET generation=generation+1,dirty=true WHERE start_at=$1")
-            .bind(w.start)
+            .bind(Ts::from(w.start))
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     pub async fn expire_lease(&self, id: i64, max_attempts: Option<i32>) -> Result<()> {
-        sqlx::query("UPDATE jobs SET lease_until=now()-interval '1 second',max_attempts=coalesce($2,max_attempts) WHERE id=$1").bind(id).bind(max_attempts).execute(&self.pool).await?;
+        sqlx::query("UPDATE jobs SET lease_until=$3-1000000,max_attempts=coalesce($2,max_attempts) WHERE id=$1").bind(id).bind(max_attempts).bind(Ts::now()).execute(&self.pool).await?;
         Ok(())
     }
     pub async fn record_count(&self, collection: &str) -> Result<i64> {
@@ -158,20 +139,21 @@ impl Store {
         )
     }
     pub async fn watermark(&self, connector: &str) -> Result<(DateTime<Utc>, String)> {
-        Ok(sqlx::query_as(
-            "SELECT observed_through,sequence::text FROM watermarks WHERE connector_instance=$1",
+        let (at, sequence): (Ts, String) = sqlx::query_as(
+            "SELECT observed_through,sequence FROM watermarks WHERE connector_instance=$1",
         )
         .bind(connector)
         .fetch_one(&self.pool)
-        .await?)
+        .await?;
+        Ok((at.into(), sequence.parse::<u64>()?.to_string()))
     }
     /// Move a synthetic reservation and its request past the UTC-day boundary.
     pub async fn expire_sweep_day(&self) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE daily_sweeps SET day=day-1")
+        let mut tx = self.begin_write().await?;
+        sqlx::query("UPDATE daily_sweeps SET day=date(day,'-1 day')")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE jobs SET payload=jsonb_set(payload,'{sweep_day}',to_jsonb((payload->>'sweep_day')::date-1)) WHERE payload ? 'sweep_day'")
+        sqlx::query("UPDATE jobs SET payload=json_set(payload,'$.sweep_day',date(payload->>'sweep_day','-1 day')) WHERE json_type(payload,'$.sweep_day') IS NOT NULL")
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
@@ -184,19 +166,8 @@ impl Store {
                 .context("interpretation gate already held")?,
         ))
     }
-    pub async fn hold_claim_gate(&self) -> Result<ClaimGate<'_>> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(6847291630281)")
-            .execute(&mut *tx)
-            .await?;
-        Ok(ClaimGate(tx))
-    }
-    pub async fn claim_is_waiting(&self) -> Result<bool> {
-        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))").fetch_one(&self.pool).await?)
-    }
-    pub async fn enqueue_due_probe(&self) -> Result<()> {
-        sqlx::query("INSERT INTO jobs(output_key,kind,payload,available_at) VALUES('became-due','test','{}',clock_timestamp())").execute(&self.pool).await?;
-        Ok(())
+    pub async fn hold_claim_gate(&self) -> Result<ClaimGate> {
+        Ok(ClaimGate(self.begin_write().await?))
     }
 }
 pub struct InterpretationGate(InterpretationGuard);
@@ -206,8 +177,13 @@ impl InterpretationGate {
         Ok(())
     }
 }
-pub struct ClaimGate<'a>(sqlx::Transaction<'a, sqlx::Postgres>);
-impl ClaimGate<'_> {
+
+pub struct ClaimGate(WriteTransaction);
+impl ClaimGate {
+    pub async fn enqueue_due_probe(&mut self) -> Result<()> {
+        sqlx::query("INSERT INTO jobs(output_key,kind,payload,available_at) VALUES('became-due','test','{}',$1)").bind(Ts::now()).execute(&mut *self.0).await?;
+        Ok(())
+    }
     pub async fn release(self) -> Result<()> {
         self.0.commit().await?;
         Ok(())
@@ -253,18 +229,19 @@ impl Store {
             .collect()
     }
     pub async fn observed_watermark(&self) -> Result<DateTime<Utc>> {
-        Ok(
-            sqlx::query_scalar("SELECT observed_through FROM watermarks")
+        Ok(DateTime::<Utc>::from(
+            sqlx::query_scalar::<_, Ts>("SELECT observed_through FROM watermarks")
                 .fetch_one(&self.pool)
                 .await?,
-        )
+        ))
     }
     pub async fn age_blobs_for_retention(&self, still: &str) -> Result<()> {
-        sqlx::query("UPDATE blobs SET created_at=now()-interval '31 days',retention_class=CASE WHEN sha256=$1 THEN 'keep' ELSE 'chunk' END").bind(still).execute(&self.pool).await?;
+        sqlx::query("UPDATE blobs SET created_at=$2-2678400000000,retention_class=CASE WHEN sha256=$1 THEN 'keep' ELSE 'chunk' END").bind(still).bind(Ts::now()).execute(&self.pool).await?;
         Ok(())
     }
     pub async fn expire_all_leases(&self) -> Result<()> {
-        sqlx::query("UPDATE jobs SET lease_until=now()-interval '1 second'")
+        sqlx::query("UPDATE jobs SET lease_until=$1-1000000")
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -368,7 +345,9 @@ impl Store {
                     ),
                     (
                         "available_at",
-                        serde_json::to_value(row.get::<DateTime<Utc>, _>("available_at"))?,
+                        serde_json::to_value(DateTime::<Utc>::from(
+                            row.get::<Ts, _>("available_at"),
+                        ))?,
                     ),
                 ]))
             })
@@ -404,7 +383,7 @@ impl Store {
         .await?)
     }
     pub async fn unfinished_job_count(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state!='done' AND NOT (kind='interpret' AND payload->>'revision24'='true' AND state='ready' AND available_at>now())").fetch_one(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state!='done' AND NOT (kind='interpret' AND payload->>'revision24'=1 AND state='ready' AND available_at>$1)").bind(Ts::now()).fetch_one(&self.pool).await?)
     }
     pub async fn current_revision_count(&self) -> Result<i64> {
         Ok(sqlx::query_scalar("SELECT count(*) FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE r.input_generation=w.generation").fetch_one(&self.pool).await?)
@@ -431,14 +410,16 @@ impl Store {
         Ok(())
     }
     pub async fn expire_job_lease(&self, id: i64) -> Result<()> {
-        sqlx::query("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE id=$1")
+        sqlx::query("UPDATE jobs SET lease_until=$2-1000000 WHERE id=$1")
             .bind(id)
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     pub async fn postpone_all_jobs(&self) -> Result<()> {
-        sqlx::query("UPDATE jobs SET available_at=now()+interval '1 hour'")
+        sqlx::query("UPDATE jobs SET available_at=$1+3600000000")
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -471,7 +452,8 @@ impl Store {
         ]))
     }
     pub async fn make_pending_interpretation_due(&self) -> Result<()> {
-        sqlx::query("UPDATE jobs SET available_at=now() WHERE output_key='pending-interpret'")
+        sqlx::query("UPDATE jobs SET available_at=$1 WHERE output_key='pending-interpret'")
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -486,7 +468,7 @@ impl Store {
     pub async fn canonical_revision_at(&self, start: DateTime<Utc>) -> Result<Option<i64>> {
         Ok(
             sqlx::query_scalar("SELECT canonical_revision FROM windows WHERE start_at=$1")
-                .bind(start)
+                .bind(Ts::from(start))
                 .fetch_one(&self.pool)
                 .await?,
         )
@@ -505,18 +487,7 @@ impl Store {
             .fetch_one(&self.pool)
             .await?)
     }
-    pub async fn remove_request_versions(&self) -> Result<()> {
-        sqlx::query("ALTER TABLE jobs DROP COLUMN request_version, DROP COLUMN leased_version")
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-    pub async fn apply_coalesced_work_migration(&self) -> Result<()> {
-        sqlx::raw_sql(include_str!("../migrations/0004_coalesced_work.sql"))
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
+
     pub async fn live_compile_count(&self) -> Result<i64> {
         Ok(sqlx::query_scalar(
             "SELECT count(*) FROM jobs WHERE kind='compile' AND state IN ('ready','running')",
@@ -569,7 +540,8 @@ impl Store {
             .await?)
     }
     pub async fn make_broken_ocr_due(&self) -> Result<()> {
-        sqlx::query("UPDATE ocr_jobs SET available_at=now() WHERE engine_version='broken/v1'")
+        sqlx::query("UPDATE ocr_jobs SET available_at=$1 WHERE engine_version='broken/v1'")
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -590,8 +562,8 @@ impl Store {
     }
     pub async fn dirty_window_count(&self, starts: Vec<DateTime<Utc>>) -> Result<i64> {
         Ok(
-            sqlx::query_scalar("SELECT count(*) FROM windows WHERE dirty AND start_at=ANY($1)")
-                .bind(starts)
+            sqlx::query_scalar("SELECT count(*) FROM windows WHERE dirty AND start_at IN (SELECT value FROM json_each($1))")
+                .bind(sqlx::types::Json(starts.into_iter().map(|at| Ts::from(at).0).collect::<Vec<_>>()))
                 .fetch_one(&self.pool)
                 .await?,
         )
@@ -653,14 +625,14 @@ impl Store {
     pub async fn required_canonical_revision_at(&self, start: DateTime<Utc>) -> Result<i64> {
         Ok(
             sqlx::query_scalar("SELECT canonical_revision FROM windows WHERE start_at=$1")
-                .bind(start)
+                .bind(Ts::from(start))
                 .fetch_one(&self.pool)
                 .await?,
         )
     }
     pub async fn advance_window_generation(&self, start: DateTime<Utc>) -> Result<()> {
         sqlx::query("UPDATE windows SET generation=generation+1 WHERE start_at=$1")
-            .bind(start)
+            .bind(Ts::from(start))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -700,7 +672,8 @@ impl Store {
         Ok(())
     }
     pub async fn settle_test_inputs(&self) -> Result<()> {
-        sqlx::query("UPDATE windows SET input_changed_at=now()-interval '1 hour'")
+        sqlx::query("UPDATE windows SET input_changed_at=$1-3600000000")
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -715,14 +688,15 @@ impl Store {
         )
     }
     pub async fn interpretation_generations(&self) -> Result<Vec<i64>> {
-        Ok(sqlx::query_scalar(
-            "SELECT (payload->>'generation')::bigint FROM jobs WHERE kind='interpret'",
+        Ok(
+            sqlx::query_scalar("SELECT generation FROM jobs WHERE kind='interpret'")
+                .fetch_all(&self.pool)
+                .await?,
         )
-        .fetch_all(&self.pool)
-        .await?)
     }
     pub async fn make_ready_interpretations_due(&self) -> Result<()> {
-        sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret' AND state='ready'")
+        sqlx::query("UPDATE jobs SET available_at=$1 WHERE kind='interpret' AND state='ready'")
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -754,10 +728,7 @@ impl Store {
             ),
         ]))
     }
-    pub async fn remove_interpretation_slots_schema(&self) -> Result<()> {
-        sqlx::raw_sql("DROP TRIGGER window_input_changed ON windows; DROP FUNCTION track_window_input(); ALTER TABLE windows DROP COLUMN input_changed_at; DROP INDEX revisions_input_identity;").execute(&self.pool).await?;
-        Ok(())
-    }
+
     pub async fn live_job_count(&self) -> Result<i64> {
         Ok(sqlx::query_scalar(
             "SELECT count(*) FROM jobs WHERE state IN ('ready','running','failed')",
@@ -786,7 +757,9 @@ impl Store {
                     ),
                     (
                         "available_at",
-                        serde_json::to_value(row.get::<DateTime<Utc>, _>("available_at"))?,
+                        serde_json::to_value(DateTime::<Utc>::from(
+                            row.get::<Ts, _>("available_at"),
+                        ))?,
                     ),
                     (
                         "attempts",
@@ -797,29 +770,35 @@ impl Store {
             .collect()
     }
     pub async fn ready_interpretation_generations(&self) -> Result<Vec<i64>> {
-        Ok(sqlx::query_scalar("SELECT (payload->>'generation')::bigint FROM jobs WHERE kind='interpret' AND state='ready'").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_scalar(
+            "SELECT generation FROM jobs WHERE kind='interpret' AND state='ready'",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
     pub async fn make_all_interpretations_due(&self) -> Result<()> {
-        sqlx::query("UPDATE jobs SET available_at=now() WHERE kind='interpret'")
+        sqlx::query("UPDATE jobs SET available_at=$1 WHERE kind='interpret'")
+            .bind(Ts::now())
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     pub async fn published_generation(&self, start: DateTime<Utc>) -> Result<i64> {
-        Ok(sqlx::query_scalar("SELECT r.input_generation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1").bind(start).fetch_one(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT r.input_generation FROM windows w JOIN revisions r ON r.id=w.canonical_revision WHERE w.start_at=$1").bind(Ts::from(start)).fetch_one(&self.pool).await?)
     }
     pub async fn fail_legacy_job(&self, key: String) -> Result<()> {
         sqlx::query(
-            "UPDATE jobs SET state='failed',attempts=5,available_at=now() WHERE output_key=$1",
+            "UPDATE jobs SET state='failed',attempts=5,available_at=$2 WHERE output_key=$1",
         )
         .bind(key)
+        .bind(Ts::now())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
     pub async fn reset_revision24(&self, start: DateTime<Utc>) -> Result<()> {
         sqlx::query("UPDATE windows SET revision24_finished=false WHERE start_at=$1")
-            .bind(start)
+            .bind(Ts::from(start))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -833,14 +812,11 @@ impl Store {
 }
 impl StoreTransaction {
     pub async fn database_now(&mut self) -> Result<DateTime<Utc>> {
-        Ok(sqlx::query_scalar("SELECT now()")
-            .fetch_one(&mut *self.0)
-            .await?)
-    }
-    pub async fn apply_interpret_slots_migration(&mut self) -> Result<()> {
-        sqlx::raw_sql(include_str!("../migrations/0007_interpret_slots.sql"))
-            .execute(&mut *self.0)
-            .await?;
-        Ok(())
+        Ok(DateTime::<Utc>::from(
+            sqlx::query_scalar::<_, Ts>("SELECT $1")
+                .bind(Ts::now())
+                .fetch_one(&mut *self.0)
+                .await?,
+        ))
     }
 }

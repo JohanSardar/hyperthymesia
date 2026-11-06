@@ -7,6 +7,7 @@ pub struct InterpretationGuard {
 #[derive(Debug, sqlx::FromRow)]
 pub struct SettledGeneration {
     pub generation: i64,
+    #[sqlx(try_from = "Ts")]
     pub ready_at: DateTime<Utc>,
 }
 impl Store {
@@ -17,7 +18,7 @@ impl Store {
         state: &InterpretationState,
         settle_s: i64,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         if state.canonical_revision.is_none() && Utc::now() < w.end + Duration::hours(24) {
             request_interpret_job(
                 &mut tx,
@@ -32,7 +33,7 @@ impl Store {
         if state.canonical_revision.is_some() {
             // A previously deferred first run is obsolete once any cadence
             // has published. Preserve active leases and daily sweep requests.
-            sqlx::query("UPDATE jobs SET state='done' WHERE output_key=$1 AND state='ready' AND NOT (payload ? 'sweep_day')")
+            sqlx::query("UPDATE jobs SET state='done' WHERE output_key=$1 AND state='ready' AND NOT (json_type(payload,'$.sweep_day') IS NOT NULL)")
                         .bind(format!("interpret:{}", w.start)).execute(&mut *tx).await?;
         }
         if !state.revision24_finished
@@ -46,15 +47,15 @@ impl Store {
         Ok(())
     }
     pub async fn schedule_compilations(&self) -> Result<()> {
-        let rows=sqlx::query("SELECT start_at,end_at,generation FROM windows WHERE dirty OR (end_at<=now() AND canonical_revision IS NULL AND empty_generation IS DISTINCT FROM generation) ORDER BY start_at DESC LIMIT 1000").fetch_all(&self.pool).await?;
-        let mut tx = self.pool.begin().await?;
+        let rows=sqlx::query("SELECT start_at,end_at,generation FROM windows WHERE dirty OR (end_at<=$1 AND canonical_revision IS NULL AND empty_generation IS DISTINCT FROM generation) ORDER BY start_at DESC LIMIT 1000").bind(Ts::now()).fetch_all(&self.pool).await?;
+        let mut tx = self.begin_write().await?;
         for r in rows {
             let w = Interval {
-                start: r.get("start_at"),
-                end: r.get("end_at"),
+                start: DateTime::<Utc>::from(r.get::<Ts, _>("start_at")),
+                end: DateTime::<Utc>::from(r.get::<Ts, _>("end_at")),
             };
             let generation: i64 = r.get("generation");
-            request_window_job(&mut tx, "compile", w, generation).await?;
+            request_window_job(&mut tx, "compile", w, generation, Ts::now()).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -73,7 +74,7 @@ impl Store {
         start: DateTime<Utc>,
         settle_s: f64,
     ) -> Result<SettledGeneration> {
-        Ok(sqlx::query_as("SELECT generation,greatest(end_at,input_changed_at+make_interval(secs=>$2::double precision)) AS ready_at FROM windows WHERE start_at=$1").bind(start).bind(settle_s).fetch_one(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT generation,max(end_at,input_changed_at+$2) AS ready_at FROM windows WHERE start_at=$1").bind(Ts::from(start)).bind((settle_s * 1_000_000.0) as i64).fetch_one(&self.pool).await?)
     }
     pub async fn revision_exists(
         &self,
@@ -81,17 +82,22 @@ impl Store {
         generation: i64,
         identity: &Value,
     ) -> Result<bool> {
-        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM revisions WHERE start_at=$1 AND input_generation=$2 AND interpretation->'input_manifest' @> $3)").bind(start).bind(generation).bind(identity).fetch_one(&self.pool).await?)
+        let manifests: Vec<Value> = sqlx::query_scalar("SELECT interpretation->'input_manifest' FROM revisions WHERE start_at=$1 AND input_generation=$2 AND json_type(interpretation,'$.input_manifest')='object'")
+            .bind(Ts::from(start)).bind(generation).fetch_all(&self.pool).await?;
+        Ok(manifests
+            .iter()
+            .any(|stored| crate::persistence::json_contains(stored, identity)))
     }
+
     pub async fn interpretation_ready_at(
         &self,
         start: DateTime<Utc>,
         revision24: bool,
         settle_s: f64,
     ) -> Result<DateTime<Utc>> {
-        Ok(sqlx::query_scalar(
-                    "SELECT greatest(end_at+CASE WHEN $2 THEN interval '24 hours' ELSE interval '0' END,input_changed_at+make_interval(secs=>$3::double precision)) FROM windows WHERE start_at=$1",
-                ).bind(start).bind(revision24).bind(settle_s).fetch_one(&self.pool).await?)
+        Ok(DateTime::<Utc>::from(sqlx::query_scalar::<_, Ts>(
+                    "SELECT max(end_at+CASE WHEN $2 THEN 86400000000 ELSE 0 END,input_changed_at+$3) FROM windows WHERE start_at=$1",
+                ).bind(Ts::from(start)).bind(revision24).bind((settle_s * 1_000_000.0) as i64).fetch_one(&self.pool).await?))
     }
     pub async fn cached_timeline(
         &self,
@@ -99,6 +105,6 @@ impl Store {
         generation: i64,
         compiler_version: &str,
     ) -> Result<Option<Value>> {
-        Ok(sqlx::query_scalar("SELECT timeline FROM windows WHERE start_at=$1 AND generation=$2 AND compiled_generation=$2 AND compiler_version=$3 AND timeline IS NOT NULL AND timeline_hash IS NOT NULL").bind(start).bind(generation).bind(compiler_version).fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT timeline FROM windows WHERE start_at=$1 AND generation=$2 AND compiled_generation=$2 AND compiler_version=$3 AND timeline IS NOT NULL AND timeline_hash IS NOT NULL").bind(Ts::from(start)).bind(generation).bind(compiler_version).fetch_optional(&self.pool).await?)
     }
 }

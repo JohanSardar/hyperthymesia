@@ -8,9 +8,8 @@ use tokio::time::{Duration as Wait, timeout};
 #[tokio::test]
 #[ignore = "subprocess helper for interpretation_lock_releases_on_process_death_and_drop"]
 async fn interpretation_lock_child() {
-    let url = std::env::var("HX_LOCK_TEST_URL").unwrap();
     let dir = std::env::var("HX_LOCK_TEST_DIR").unwrap();
-    let store = Store::connect(&url, dir).await.unwrap();
+    let store = Store::open(dir).await.unwrap();
     let _guard = store
         .try_interpretation_guard(window_at(DateTime::UNIX_EPOCH))
         .await
@@ -23,21 +22,16 @@ async fn interpretation_lock_child() {
 #[tokio::test]
 async fn interpretation_lock_releases_on_process_death_and_drop() {
     let f = test_support::Fixture::new().await;
-    let db: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(&f.store.pool)
-        .await
-        .unwrap();
-    let test_url = std::env::var("HX_TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://hx:hx@localhost:55432/hx".into());
-    let url = format!("{}/{db}", test_url.rsplit_once('/').unwrap().0);
     let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "concurrency_tests::interpretation_lock_child",
             "--ignored",
             "--nocapture",
+            // Serial libtest prefixes stdout with its progress label, which
+            // would hide the standalone LOCKED protocol line from the parent.
+            "--test-threads=2",
         ])
-        .env("HX_LOCK_TEST_URL", url)
         .env("HX_LOCK_TEST_DIR", &f.store.data_dir)
         .stdout(Stdio::piped())
         .kill_on_drop(true)
@@ -63,12 +57,12 @@ async fn interpretation_lock_releases_on_process_death_and_drop() {
     let os_excluded = std::fs::File::open(&path)
         .map(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
         .unwrap_or(false);
-    let database_transaction: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND state='idle in transaction')",
-    )
-    .fetch_one(&f.store.pool)
-    .await
-    .unwrap();
+    // A guard must leave the writer available to another connection.
+    let writer = timeout(Wait::from_secs(1), f.store.begin_write()).await;
+    let database_transaction = writer.is_err();
+    if let Ok(tx) = writer {
+        tx.unwrap().commit().await.unwrap();
+    }
     child.kill().await.unwrap(); // SIGKILL on Unix; no destructors can release it.
     let status = child.wait().await.unwrap();
     let guard = f.store.try_interpretation_guard(w).await.unwrap();
@@ -97,9 +91,41 @@ async fn interpretation_lock_releases_on_process_death_and_drop() {
     );
 }
 
+/// Commit observation lives inside WriteTransaction::commit, before it returns.
+/// Thus moving unlink after commit cannot race ahead of the test's observation.
+/// The second deletion is ordered before upload admission, then paused after
+/// commit until that upload finishes. Hooks exist only in unit-test builds.
+#[derive(Default)]
+pub(crate) struct GcBoundary {
+    committed: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    seen: std::sync::atomic::AtomicBool,
+    deleting: tokio::sync::Notify,
+    delete: tokio::sync::Notify,
+    second_committed: tokio::sync::Notify,
+    finish: tokio::sync::Notify,
+}
+impl GcBoundary {
+    pub(crate) async fn before_unlink(&self) {
+        if self.seen.load(std::sync::atomic::Ordering::SeqCst) {
+            self.deleting.notify_one();
+            self.delete.notified().await;
+        }
+    }
+    pub(crate) async fn after_commit(&self) {
+        if !self.seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.committed.notify_one();
+            self.resume.notified().await;
+        } else {
+            self.second_committed.notify_one();
+            self.finish.notified().await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn reupload_during_gc_keeps_its_file_and_does_not_wait_for_other_blobs() {
-    let f = test_support::Fixture::new().await;
+    let mut f = test_support::Fixture::new().await;
     let mut blobs = [
         b"synthetic chunk one".as_slice(),
         b"synthetic chunk two".as_slice(),
@@ -110,121 +136,92 @@ async fn reupload_during_gc_keeps_its_file_and_does_not_wait_for_other_blobs() {
     f.store.upload_blob(first, bytes).await.unwrap();
     f.store.upload_blob(second, other_bytes).await.unwrap();
     f.store.age_blobs_for_retention("").await.unwrap();
-    // Pause GC's second deletion at its UPDATE. The first deletion must already
-    // be committed, allowing its re-upload while this unrelated blob is held.
-    sqlx::raw_sql(
-        "CREATE TABLE gc_barrier(id integer PRIMARY KEY); INSERT INTO gc_barrier VALUES(1);
-        CREATE FUNCTION pause_gc() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
-            IF OLD.sha256 = TG_ARGV[0] AND NOT NEW.published THEN
-                PERFORM 1 FROM gc_barrier WHERE id=1 FOR UPDATE;
-            END IF;
-            RETURN NEW;
-        END $$;",
-    )
-    .execute(&f.store.pool)
-    .await
-    .unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TRIGGER pause_gc BEFORE UPDATE ON blobs FOR EACH ROW EXECUTE FUNCTION pause_gc('{second}')"
-    )))
-    .execute(&f.store.pool).await.unwrap();
-    let mut barrier = f.store.pool.begin().await.unwrap();
-    sqlx::query("SELECT id FROM gc_barrier FOR UPDATE")
-        .execute(&mut *barrier)
+    let boundary = std::sync::Arc::new(GcBoundary::default());
+    f.store.gc_boundary = Some(boundary.clone());
+    let gc_store = f.store.clone();
+    let mut gc = tokio::spawn(async move { gc_store.gc().await });
+    timeout(Wait::from_secs(10), boundary.committed.notified())
         .await
         .unwrap();
-    let gc_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            f.store
-                .pool
-                .connect_options()
-                .as_ref()
-                .clone()
-                .application_name("gc-race-test"),
-        )
-        .await
-        .unwrap();
-    let gc_store = Store::new(gc_pool.clone(), &f.store.data_dir);
-    let gc = tokio::spawn(async move { gc_store.gc().await });
-    timeout(Wait::from_secs(10), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND application_name='gc-race-test' AND wait_event_type='Lock')")
-                .fetch_one(&f.store.pool).await.unwrap();
-            if waiting { break; }
-            tokio::task::yield_now().await;
-        }
-    }).await.unwrap();
-    let upload_store = f.store.clone();
-    let upload_sha = first.clone();
-    let upload_bytes = bytes.to_vec();
-    let mut upload =
-        tokio::spawn(async move { upload_store.upload_blob(&upload_sha, &upload_bytes).await });
-    let progressed = match timeout(Wait::from_secs(2), &mut upload).await {
-        Ok(result) => {
-            assert!(result.unwrap().unwrap());
-            true
-        }
-        Err(_) => false,
-    };
-    // Also re-upload the blob whose deletion is still in flight. Upload must
-    // publish after GC commits, rather than return early or lose its new file.
-    let upload_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            f.store
-                .pool
-                .connect_options()
-                .as_ref()
-                .clone()
-                .application_name("gc-upload-test"),
-        )
-        .await
-        .unwrap();
-    let upload_store = Store::new(upload_pool.clone(), &f.store.data_dir);
-    let upload_sha = second.clone();
-    let upload_bytes = other_bytes.to_vec();
-    let reupload =
-        tokio::spawn(async move { upload_store.upload_blob(&upload_sha, &upload_bytes).await });
-    timeout(Wait::from_secs(10), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND application_name='gc-upload-test' AND wait_event_type='Lock')")
-                .fetch_one(&f.store.pool).await.unwrap();
-            if waiting { break; }
-            tokio::task::yield_now().await;
-        }
-    }).await.unwrap();
-    barrier.commit().await.unwrap();
-    assert_eq!(gc.await.unwrap().unwrap(), 2);
-    assert!(reupload.await.unwrap().unwrap());
-    if !progressed {
-        upload.await.unwrap().unwrap();
-    }
-    let published: bool =
-        sqlx::query_scalar("SELECT published AND NOT evidence_expired FROM blobs WHERE sha256=$1")
+    let observer = Store::open(&f.store.data_dir).await.unwrap();
+    let first_deleted: bool =
+        sqlx::query_scalar("SELECT NOT published AND evidence_expired FROM blobs WHERE sha256=$1")
             .bind(first)
-            .fetch_one(&f.store.pool)
+            .fetch_one(&observer.pool)
             .await
             .unwrap();
-    let on_disk = tokio::fs::read(f.store.blob_path(first).unwrap())
-        .await
-        .unwrap();
-    let other_on_disk = tokio::fs::read(f.store.blob_path(second).unwrap())
-        .await
-        .unwrap();
-    gc_pool.close().await;
-    upload_pool.close().await;
-    f.close().await;
     assert!(
-        progressed,
-        "re-upload must not wait for GC of a different blob"
+        first_deleted,
+        "another connection must see the first committed deletion during the run"
     );
-    assert!(published);
-    assert_eq!(on_disk, *bytes, "GC must not unlink the re-uploaded file");
-    assert_eq!(
-        other_on_disk, *other_bytes,
-        "same-blob GC and re-upload must serialize"
+    assert!(!f.store.blob_path(first).unwrap().exists());
+    assert!(
+        !gc.is_finished(),
+        "GC must still be part way through its run"
     );
+    assert!(
+        timeout(Wait::from_secs(2), observer.upload_blob(first, bytes))
+            .await
+            .expect("unrelated upload must complete before the whole GC run finishes")
+            .unwrap()
+    );
+    assert!(!gc.is_finished());
+
+    // Force GC to own the second blob's writer before starting its upload.
+    boundary.resume.notify_one();
+    timeout(Wait::from_secs(5), boundary.deleting.notified())
+        .await
+        .unwrap();
+    let upload_store = observer.clone();
+    let upload_sha = second.clone();
+    let upload_bytes = other_bytes.to_vec();
+    let mut reupload =
+        tokio::spawn(async move { upload_store.upload_blob(&upload_sha, &upload_bytes).await });
+    tokio::time::sleep(Wait::from_millis(50)).await;
+    assert!(
+        !reupload.is_finished(),
+        "second writer must wait for the gate"
+    );
+    assert!(!gc.is_finished(), "GC must wait at the deletion barrier");
+    boundary.delete.notify_one();
+    timeout(Wait::from_secs(5), boundary.second_committed.notified())
+        .await
+        .unwrap();
+    timeout(Wait::from_secs(5), &mut reupload)
+        .await
+        .expect("upload must succeed within busy_timeout")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !gc.is_finished(),
+        "upload must finish while GC is paused just after commit"
+    );
+    boundary.finish.notify_one();
+    let expired = timeout(Wait::from_secs(5), &mut gc)
+        .await
+        .expect("GC must succeed within busy_timeout")
+        .unwrap()
+        .unwrap();
+    assert!((1..=2).contains(&expired));
+    for (sha, bytes) in &blobs {
+        let published: bool = sqlx::query_scalar(
+            "SELECT published AND NOT evidence_expired FROM blobs WHERE sha256=$1",
+        )
+        .bind(sha)
+        .fetch_one(&observer.pool)
+        .await
+        .unwrap();
+        assert!(published, "a racing upload must end published");
+        assert_eq!(
+            tokio::fs::read(observer.blob_path(sha).unwrap())
+                .await
+                .unwrap(),
+            *bytes,
+            "GC must never lose the re-uploaded file"
+        );
+    }
+    observer.pool.close().await;
+    f.close().await;
 }
 
 // A 200 tells the client it may discard its copy, so it has to mean the file is
@@ -242,8 +239,9 @@ async fn reupload_restores_a_missing_file_and_restarts_retention() {
     f.store.upload_blob(&sha, bytes).await.unwrap();
     assert!(path.exists(), "upload acknowledged a blob with no file");
 
-    sqlx::query("UPDATE blobs SET created_at=now()-interval '31 days' WHERE sha256=$1")
+    sqlx::query("UPDATE blobs SET created_at=$2 WHERE sha256=$1")
         .bind(&sha)
+        .bind(Ts::from(Utc::now() - Duration::days(31)))
         .execute(&f.store.pool)
         .await
         .unwrap();

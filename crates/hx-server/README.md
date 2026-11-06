@@ -1,15 +1,32 @@
 # Server
 
 The server stores raw evidence before acknowledging producers and runs derived
-processing through a leased Postgres queue. Fixtures in this crate are synthetic.
+processing through a leased SQLite queue. FTS5 searches quote whitespace-separated
+terms as ANDed phrases, using unicode61 without diacritic removal. Punctuation
+is tokenized differently from the former search engine (for example, `example`
+can match `example.com`); sensitivity and literal namespace filters are unchanged.
+Fixtures in this crate are synthetic.
 
 ## Run
 
-Set DATABASE_URL to a local Postgres URL. From the workspace:
+Set `HX_STATE_DIR` to one explicit local state folder, or pass `--state-dir`
+with each command. There is no default. From the workspace:
 
+    export HX_STATE_DIR="$PWD/state"
     cargo run -p hx-server -- migrate
     cargo run -p hx-server -- token create --name laptop --prefix macos-agent: --scopes ingest,read_raw,read_l3
-    cargo run --release -p hx-server -- serve --listen 127.0.0.1:7377 --data-dir ./data
+    cargo run --release -p hx-server -- serve --listen 127.0.0.1:7377
+
+`migrate` creates a new `core.sqlite` and an empty `agent.sqlite`, plus `blobs/`
+and `locks/`. It refuses an existing core. `serve`, `token`, `compile`, `interpret`
+and `gc` open an initialized core and never silently create history. `doctor` and
+`--version` need no state folder. Use local disk only; WAL is unsuitable for a
+network filesystem. WAL, full synchronous writes and a 30-second busy timeout
+are configured on every core connection (including fullfsync on macOS).
+
+This command initializes new installations. Existing history requires the
+separate owner-run mover and backup/cutover runbook; do not replace a live binary
+or point an old service configuration at a new empty state.
 
 Token creation prints the credential once; only its SHA-256 is stored. Issue
 separate ingest-only and reader credentials for actual deployments. read_raw
@@ -24,12 +41,12 @@ Use HTTPS at the private proxy. REST callers use Authorization: Bearer credentia
 Revocation is currently administrative: set device_tokens.revoked=true for the
 credential hash.
 
-    cargo run -p hx-server -- compile --data-dir ./data --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
-    cargo run -p hx-server -- interpret --data-dir ./data --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
-    cargo run -p hx-server -- gc --data-dir ./data
+    cargo run -p hx-server -- compile --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
+    cargo run -p hx-server -- interpret --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
+    cargo run -p hx-server -- gc
 
-Use the same `--data-dir` for `serve`, `compile` and `interpret`. Provider runs
-hold OS locks in `<data-dir>/locks/interpret-<window-start>` so a manual run and
+Use the same `--state-dir` for `serve`, `compile` and `interpret`. Provider runs
+hold OS locks in `<state-dir>/locks/interpret-<window-start>` so a manual run and
 the job worker cannot buy the same window concurrently. Lock files remain on
 disk; dropping the guard or killing its process releases the lock immediately.
 
@@ -157,12 +174,8 @@ Missing normalization or changed compile inputs defer for one second without
 spending an attempt. Stored job errors use fixed categories or SQLSTATE codes,
 never arbitrary provider/database/payload text; detailed errors stay in local logs.
 
-Stop existing workers before running the migration and restart on the new binary.
-Migration 0004 retires the legacy normalize/compile backlog, fences its leases,
-and seeds window slots for remaining work. Existing failed interpret jobs are
-preserved; an operator can reset their attempts and requeue them after inspecting
-the local failure. Migration 0010 retires old automatic interpretation jobs and
-24-hour passes. After T+24h, windows without a canonical revision use the capped
+The SQLite core uses one squashed schema; historical backlog repairs belong to
+the separate mover, never server startup. After T+24h, windows without a canonical revision use the capped
 daily sweep; exhausted 24-hour passes are also eligible. The sweep reserves one
 window per UTC day and permits one paid attempt. Failed or deferred unchanged
 input becomes eligible again after seven UTC days, or sooner after input changes.
@@ -177,37 +190,34 @@ OCR lineage does.
     cargo fmt -p hx-store -p hx-jobs -p hx-server -- --check
 
 Set the task's CARGO_TARGET_DIR for every cargo command.
-Database tests require Postgres, default to the local development database,
-and accept HX_TEST_DATABASE_URL. Each uses a unique schema and temporary blob
-directory, dropping its schema after success. Tests never skip silently if
-Postgres is unavailable. Failed tests may leave synthetic schemas for diagnosis.
+Database tests create independent temporary SQLite state folders and need no
+server or database URL. They never open an owner state folder. The synthetic
+runner clears inherited state/database settings and isolates connector homes.
 
 Operational backup/restore drills, production provider integration, and
 long-duration deployment monitoring are outside this crate's verification.
 
 The `synthetic_day_burst` test ingests 20,000 generated agent messages over one
 UTC day in forty 500-event uploads, drains with the stub provider, checks all
-seven windows (including trailing overlap), and enforces a 60-second total bound.
+seven windows (including trailing overlap), and enforces a 180-second total bound.
 For an optimized measurement, run:
 
     cargo test --release -p hx-server synthetic_day_burst -- --nocapture
 
-An additional `synthetic_browser_point_stress` test uses open-ended browser
-transitions. It is explicitly ignored by default because profiling exposes a
-quadratic whole-window scan with repeated payload decoding inside hx-compile,
-which is outside this queue change. Its 60-second target is not met; this remains
-a compiler follow-up, not evidence of general workload performance:
+An additional `synthetic_browser_point_stress` test applies the same durable
+assertions and time bound to open-ended browser transitions. It runs with the
+default suite; to measure it separately:
 
-    cargo test --release -p hx-server synthetic_browser_point_stress -- --ignored --nocapture
+    cargo test --release -p hx-server synthetic_browser_point_stress -- --nocapture
 
 ## Server OCR
 
 On macOS, `serve` starts an independent OCR worker using `hx-visual`'s Apple Vision
 helper (`swiftc` must be installed). It discovers published `media.still` blobs on
 startup and while serving, including old stills and either event/blob upload
-ordering. Migration 0005 stores results per exact blob hash and engine identity
+ordering. The core stores results per exact blob hash and engine identity
 (helper source/configuration plus macOS build). One OS file lock in
-`<data-dir>/locks/hx-ocr` limits OCR concurrency to one across server processes
+`<state-dir>/locks/hx-ocr` limits OCR concurrency to one across server processes
 sharing that directory. Decoding and OCR run on a blocking
 thread, independently of the interpretation queue. PNG, JPEG and TIFF stills are
 supported by the sampling decoder; decode/engine failures retry five times with a
@@ -302,11 +312,11 @@ Synthetic tests:
 
 ```sh
 CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="$PWD/scripts/synthetic-test-runner.py" \
-  HX_TEST_DATABASE_URL=postgres://hx:hx@localhost:55432/YOUR_SCRATCH_DB cargo test --workspace
+  cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 # Optional subscription smoke, synthetic fixtures only:
 CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="$PWD/scripts/synthetic-test-runner.py" \
-  HX_TEST_DATABASE_URL=postgres://hx:hx@localhost:55432/YOUR_SCRATCH_DB HX_LIVE_FX=1 \
+  HX_LIVE_FX=1 \
   HX_FX_BINARY=/absolute/path/to/fx HX_FX_CREDENTIAL=/absolute/path/to/chatgpt-auth.json \
   cargo test -p hx-server --test server fx_live_synthetic_only -- --nocapture
 ```

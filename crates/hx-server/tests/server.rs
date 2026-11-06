@@ -9,67 +9,11 @@ use hx_schema::{
     Sensitivity, SourceKey,
 };
 use hx_server::disclosure::DisclosurePolicy;
+use hx_store::test_support::Fixture;
 use hx_store::{Store, Token, UploadBatch};
 use serde_json::{Value, json};
-use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
-struct Fixture {
-    store: Store,
-    admin: sqlx::PgPool,
-    schema: String,
-    _dir: tempfile::TempDir,
-}
-impl Fixture {
-    async fn new() -> Self {
-        let url = std::env::var("HX_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://hx:hx@localhost:55432/hx".into());
-        let admin = sqlx::PgPool::connect(&url)
-            .await
-            .expect("test Postgres must be running");
-        let schema = format!("test_{}", ulid::Ulid::generate().to_string().to_lowercase());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await
-            .unwrap();
-        let search = schema.clone();
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .after_connect(move |conn, _| {
-                let search = search.clone();
-                Box::pin(async move {
-                    sqlx::query("SELECT set_config('search_path',$1,false)")
-                        .bind(&search)
-                        .execute(conn)
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect(&url)
-            .await
-            .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::new(pool, dir.path());
-        store.migrate().await.unwrap();
-        Self {
-            store,
-            admin,
-            schema,
-            _dir: dir,
-        }
-    }
-    async fn close(self) {
-        self.store.pool.close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
-        )))
-        .execute(&self.admin)
-        .await
-        .unwrap();
-        self.admin.close().await;
-    }
-}
 fn token() -> Token {
     Token {
         prefixes: vec!["test:".into()],
@@ -1305,53 +1249,6 @@ async fn job_errors_are_bounded_and_do_not_persist_payload_text() {
     let error: String = f.store.job_error().await.unwrap();
     assert_eq!(error, "invalid job or derived JSON");
     assert!(error.len() < 128);
-    f.close().await;
-}
-
-#[tokio::test]
-async fn migration_supersedes_legacy_backlog_and_preserves_work() {
-    let f = Fixture::new().await;
-    ingest(&f.store, vec![event("legacy", 8)]).await;
-    f.store.delete_jobs().await.unwrap();
-    let w = hx_store::window_at(event("legacy", 8).time.observed_at);
-    let id: i64 = f.store.only_event_id().await.unwrap();
-    let mut tx = f.store.transaction().await.unwrap();
-    for generation in 1..=10 {
-        tx.enqueue(
-            &format!("compile:{}:{generation}", w.start),
-            "compile",
-            json!({"window":w,"generation":generation}),
-            false,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    }
-    tx.enqueue(
-        &format!("normalize:{id}"),
-        "normalize",
-        json!({"event_id":id}),
-        false,
-        Utc::now(),
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    let old = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
-    f.store.remove_request_versions().await.unwrap();
-    f.store.apply_coalesced_work_migration().await.unwrap();
-    assert!(!hx_jobs::finish(&f.store, &old, None).await.unwrap());
-    let live: i64 = f.store.live_compile_count().await.unwrap();
-    assert_eq!(live, 1);
-    ingest(&f.store, vec![event("after-upgrade", 8)]).await;
-    let live: i64 = f.store.live_compile_count().await.unwrap();
-    assert_eq!(live, 1);
-    let runner = hx_server::processing::Runner {
-        store: f.store.clone(),
-        provider: hx_server::processing::StubProvider,
-    };
-    while hx_jobs::run_one(&f.store, &runner).await.unwrap() {}
-    assert_eq!(count(&f.store, "normalized").await, 2);
     f.close().await;
 }
 
@@ -3069,47 +2966,6 @@ async fn interpretation_slot_preserves_lease_and_recovers_new_generation() {
 }
 
 #[tokio::test]
-async fn migration_collapses_legacy_backlog_without_stealing_surviving_lease() {
-    let f = Fixture::new().await;
-    let w = hx_store::window_at(event("migration", 8).time.observed_at);
-    f.store.generation(w).await.unwrap();
-    f.store.remove_interpretation_slots_schema().await.unwrap();
-    let mut tx = f.store.transaction().await.unwrap();
-    for g in 1..=108 {
-        for slot in ["interpret", "revision24"] {
-            tx.enqueue(
-                &format!("{slot}:{}:{g}", w.start),
-                "interpret",
-                json!({"window":w}),
-                slot == "revision24",
-                Utc::now(),
-            )
-            .await
-            .unwrap();
-        }
-    }
-    tx.commit().await.unwrap();
-    let running = hx_jobs::claim(&f.store, 120).await.unwrap().unwrap();
-    // Exactly the same SQL used by startup, inside a migration transaction.
-    let mut tx = f.store.transaction().await.unwrap();
-    tx.apply_interpret_slots_migration().await.unwrap();
-    tx.commit().await.unwrap();
-    let live: i64 = f.store.live_job_count().await.unwrap();
-    assert_eq!(live, 2);
-    assert!(hx_jobs::heartbeat(&f.store, &running, 120).await.unwrap());
-    assert!(hx_jobs::finish(&f.store, &running, None).await.unwrap());
-    let keys: Vec<String> = f.store.ready_output_keys().await.unwrap();
-    assert_eq!(
-        keys,
-        vec![
-            format!("interpret:{}", w.start),
-            format!("revision24:{}", w.start)
-        ]
-    );
-    f.close().await;
-}
-
-#[tokio::test]
 async fn revision_identity_includes_prompt_model_and_disclosure() {
     for field in ["prompt_version", "provider", "policy", "sensitive_egress"] {
         let f = Fixture::new().await;
@@ -3363,4 +3219,55 @@ async fn recent_interpretation_storm_coalesces_108_generations_into_one_paid_run
     assert_eq!(published, g);
     assert!(f.store.sweep_reservations().await.unwrap().is_empty());
     f.close().await;
+}
+
+#[cfg(unix)]
+async fn changed_fx_identity_calls_provider(field: &str) {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("fx-identity", 0)]).await;
+    let w = hx_store::window_at(event("fx-identity", 0).time.observed_at);
+    f.store.normalize_window(w).await.unwrap();
+    let (_, generation) = hx_server::processing::compile_window(&f.store, w)
+        .await
+        .unwrap();
+    let mut identity = json!({"input_generation":generation,"provider":"fx",
+        "model":std::env::var("HX_FX_MODEL").unwrap_or_else(|_| hx_server::fx::MODEL.into()),
+        "effort":std::env::var("HX_FX_EFFORT").unwrap_or_else(|_| "xhigh".into()),
+        "fx_version":hx_server::fx::FX_VERSION,"prompt_version":hx_server::fx::PROMPT_VERSION,
+        "sensitive_egress":hx_server::processing::SensitiveEgress::from_env(),
+        "disclosure_policy":{"digest":DisclosurePolicy::from_env().unwrap().digest()}});
+    identity[field] = json!("previous-setting");
+    f.store
+        .publish_revision(w, generation, json!({"tasks":[],"input_manifest":identity}))
+        .await
+        .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "rate");
+    let result = hx_server::fx::interpret_window(&f.store, w, "changed-fx-identity", &config).await;
+    let calls = std::fs::read_to_string(scratch.path().join("paid-calls")).unwrap_or_default();
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "changed {field} must invoke fx: {result:?}"
+    );
+    assert!(
+        result.is_err(),
+        "the scripted rate limit proves the provider path was reached"
+    );
+    f.close().await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn fx_model_change_calls_provider() {
+    changed_fx_identity_calls_provider("model").await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn fx_effort_change_calls_provider() {
+    changed_fx_identity_calls_provider("effort").await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn fx_version_change_calls_provider() {
+    changed_fx_identity_calls_provider("fx_version").await;
 }

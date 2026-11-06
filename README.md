@@ -27,7 +27,7 @@ Connectors ────────┘   T3 Code · Codex · Claude Code · git 
 |---|---|
 | `crates/hx-schema` | Envelope v1, core kinds, connector protocol (JSON Schema in `schema/`) |
 | `crates/hx-macos-sys`, `hx-agent`, `hx-agent-app` | macOS capture agent and menu-bar app |
-| `crates/hx-store`, `hx-jobs`, `hx-server` | Server: Postgres store, job queue, API, dashboard |
+| `crates/hx-store`, `hx-jobs`, `hx-server` | Server: SQLite store, job queue, API, dashboard |
 | `crates/hx-compile` | Deterministic timeline compiler |
 | `crates/hx-interpret`, `hx-visual` | LLM interpreter with claim checks; server OCR |
 | `crates/hx-connector-sdk`, `connectors/*` | Connectors for agent sessions, git, Apple Bridge |
@@ -37,9 +37,15 @@ Connectors ────────┘   T3 Code · Codex · Claude Code · git 
 ## Develop
 
 ```sh
-docker compose up -d          # Postgres + pgvector on localhost:55432
 ./scripts/check.sh            # fmt, clippy -D warnings, tests
 ```
+
+No database service is needed. The server requires an explicit local `--state-dir`
+(or `HX_STATE_DIR`), containing `core.sqlite`, `agent.sqlite`, `blobs/`, and `locks/`.
+Only `hx-server migrate` creates a new core; `serve` refuses an absent or
+uninitialized core. Use a local disk: SQLite WAL does not support network filesystems.
+See [server setup](crates/hx-server/README.md). Existing installations stay on their
+current binary until the owner completes the separate verified migration and cutover.
 
 Interpretation uses one durable primary slot and one 24-hour catch-up slot per window.
 The primary waits until the window ends and its input has settled for
@@ -52,7 +58,7 @@ Generation changes preserve paid retry budgets; explicit `hx interpret` requests
 remain available. All providers skip an already recorded input generation, prompt,
 model, and disclosure policy.
 
-Requires Rust 1.99 (pinned in `rust-toolchain.toml`), Docker, and macOS for the capture agent.
+Requires Rust 1.99 (pinned in `rust-toolchain.toml`), and macOS for the capture agent.
 
 ## License
 
