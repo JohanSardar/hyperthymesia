@@ -6,6 +6,7 @@ pub mod disclosure;
 pub mod fx;
 mod live;
 pub mod mcp;
+mod oauth;
 pub mod ocr;
 pub mod processing;
 pub mod pull;
@@ -97,6 +98,18 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
             post(connections::switch).layer(DefaultBodyLimit::max(32 * 1024)),
         )
         .merge(sources::router())
+        .route(
+            "/connect/oauth",
+            get(oauth::page)
+                .post(oauth::start)
+                .layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
+            "/connect/oauth/finish",
+            post(oauth::finish).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route("/connect/oauth/callback", get(oauth::callback))
+        .route("/connect/{id}/reconnect", post(connections::reconnect))
         .route("/agent-setup", get(connections::agent_setup))
         .route(
             "/agent-setup/{kind}/{id}",

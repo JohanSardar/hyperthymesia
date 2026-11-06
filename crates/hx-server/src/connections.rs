@@ -21,8 +21,28 @@ pub async fn page(
     headers: HeaderMap,
     Query(query): Query<ConnectQuery>,
 ) -> ApiResult<Response> {
-    let Json(configured) = sources::list(State(store), headers).await?;
+    let Json(configured) = sources::list(State(store.clone()), headers).await?;
     let (name, description) = match query.template.as_deref() {
+        Some("apple-mcp") => (
+            "Apple Bridge MCP",
+            "My Apple data through MCP at http://127.0.0.1:7780/mcp. Discover read tools such as calendar_agenda. Use a bounded recent time range; do not scan the full archive. Tool JSON may be in structuredContent or content text.",
+        ),
+        Some("apple-api") => (
+            "Apple Bridge API",
+            "My Apple data through the API at http://127.0.0.1:7780. Read calendar events with POST /v1/op/calendar.agenda (start, end). messages.thread takes chat_id, limit and opaque before/after cursors, not date filters. Use history-bound date filters. Discover schemas at /v1/catalog. records.query pages all history by ID; prefer time-bounded read operations.",
+        ),
+        Some("apple-cli") => (
+            "Apple Bridge CLI",
+            "My Apple data through `bridge`. Use bridge call --list and bridge call <read-operation> --args <JSON> --json. Read time-bounded calendar.agenda using history-bound filters. messages.thread uses chat_id and opaque before/after cursors, not dates. Do not start services, request permissions or read archives.",
+        ),
+        Some("gmail-gws") => (
+            "Gmail via gws",
+            "My Gmail through `gws`. Use gws gmail users messages list --params JSON with userId me, maxResults 50, q after:{{since_unix}}, pageToken {{cursor}}. List returns only id and threadId; use a detail request with gws gmail users messages get and id {{item}}, format full. Map internalDate as unix_ms and Subject from payload.headers. Use nextPageToken pagination; missing messages means empty. Auth exit code is 2. Use the connection check's HOME for all requests. Do not use --page-all (NDJSON) or export credentials.",
+        ),
+        Some("calendar-gws") => (
+            "Google Calendar via gws",
+            "My Google Calendar through `gws`. Use gws calendar events list --params JSON with calendarId primary, singleEvents true, timeMin {{since}}, timeMax {{until}}, maxResults 100 and pageToken {{cursor}}. Map id, summary, start.dateTime and end.dateTime. All-day dates are floating, not instants; never invent timestamps for them. Use nextPageToken pagination; missing items means empty. Auth exit code is 2. Use the connection check's HOME for all requests. Do not use --page-all (NDJSON) or export credentials.",
+        ),
         Some("github") => (
             "GitHub",
             "My GitHub work. Use https://api.github.com to read my recent activity, issues and pull requests.",
@@ -33,6 +53,15 @@ pub async fn page(
         ),
         _ => ("", ""),
     };
+    let probe = match query.template.as_deref() {
+        Some("gmail-gws") => {
+            r#"{"kind":"cli","argv":["gws","gmail","users","messages","list","--params","{\"userId\":\"me\",\"maxResults\":1,\"q\":\"newer_than:1d\"}"],"env":{}}"#
+        }
+        Some("calendar-gws") => {
+            r#"{"kind":"cli","argv":["gws","calendar","calendarList","list","--params","{\"maxResults\":1}"],"env":{}}"#
+        }
+        _ => "",
+    };
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         shell("Connect sources", html! {
@@ -42,7 +71,7 @@ pub async fn page(
                 h1 {"Connect your sources"}
                 p class="intro" {"Bring the rest of your work into your day. Paste a key and tell Hyperthymesia what it connects to. Your agent can use it live on later runs, with citations back to the answer it received."}
                 @if query.connected.as_deref() == Some("1") {
-                    p class="notice" role="status" {"Connected. One bounded setup run is queued. Your agent will set up automatic pulls; you do not need to do anything else."}
+                    p class="notice" role="status" {"Connection saved. Check its status below. Once login is available, one bounded setup run sets up automatic pulls."}
                 }
                 section aria-label="Connected sources" {
                     h2 {"Your sources"}
@@ -55,7 +84,7 @@ pub async fn page(
                                 div {
                                     h3 {(source["name"].as_str().unwrap_or("Source"))}
                                     span class="status" {
-                                        @if source["enabled"] == true {"On · available live"} @else {"Off · unavailable to the agent"}
+                                        @if source["enabled"] == true {(source["status"].as_str().unwrap_or("On"))} @else {"Off · unavailable to the agent"}
                                     }
                                 }
                                 form method="post" action=(format!("/connect/{}",source["id"].as_str().unwrap_or(""))) {
@@ -63,6 +92,19 @@ pub async fn page(
                                     button type="submit" role="switch" aria-checked=(if source["enabled"] == true {"true"} else {"false"})
                                         aria-label=(format!("{} {}",if source["enabled"] == true {"Switch off"} else {"Switch on"},source["name"].as_str().unwrap_or("source"))) {
                                         @if source["enabled"] == true {"Switch off"} @else {"Switch on"}
+                                    }
+                                }
+                            }
+                            @if let Some(error) = source["last_error"].as_str() {p role="alert" {(error)}}
+                            @if source["status"] == "needs_reconnect" {
+                                p {"Login is needed. Automatic pulls are paused; no repair run is purchased."}
+                                @if source["oauth"] == true {
+                                    a href=(format!("/connect/oauth?source={}",source["id"].as_str().unwrap_or(""))) {"Reconnect with OAuth"}
+                                } @else {
+                                    p {"Sign in to your CLI on the server using the configured HOME, or paste a replacement source key, then reconnect."}
+                                    form method="post" action=(format!("/connect/{}/reconnect",source["id"].as_str().unwrap_or(""))) autocomplete="off" {
+                                        label {"Replacement key (optional)" input type="password" name="key";}
+                                        button type="submit" {"Reconnect"}
                                     }
                                 }
                             }
@@ -77,6 +119,12 @@ pub async fn page(
                 section aria-label="Add a source" {
                     h2 {"Add a connection"}
                     div class="catalog" {
+                        a class="source-card" href="/connect?template=apple-mcp#add" {"Apple Bridge MCP"}
+                        a class="source-card" href="/connect?template=apple-api#add" {"Apple Bridge API"}
+                        a class="source-card" href="/connect?template=apple-cli#add" {"Apple Bridge CLI"}
+                        a class="source-card" href="/connect?template=gmail-gws#add" {"Gmail via gws"}
+                        a class="source-card" href="/connect?template=calendar-gws#add" {"Calendar via gws"}
+                        a class="source-card" href="/connect/oauth" {"Google Console OAuth" small {"Your own client; headless servers supported"}}
                         a class="source-card" href="/connect?template=github#add" {"GitHub" small {"Issues, pull requests, activity"}}
                         a class="source-card" href="/connect?template=linear#add" {"Linear" small {"Issues and project updates"}}
                         a class="source-card" href="/connect#add" {"Add your own" small {"Any API, CLI or MCP server"}}
@@ -91,6 +139,15 @@ pub async fn page(
                         label for="source-key" {"Key or credential"}
                         input id="source-key" name="key" type="password" autocomplete="new-password" spellcheck="false" autocapitalize="none" maxlength="16384" placeholder="Paste a key (optional for a signed-in CLI)";
                         p class="hint" {"Use a read-only, narrowly scoped key where possible. It is never shown back here."}
+                        label for="source-history" {"History days (0–30)"}
+                        input id="source-history" name="history_days" type="number" min="0" max="30" value="1";
+                        label for="source-home" {"CLI HOME (optional)"}
+                        input id="source-home" name="cli_home" placeholder="Absolute HOME of the signed-in CLI on this server";
+                        details {
+                            summary {"Connection check"}
+                            p class="hint" {"Optional read-only request checked without AI before setup. Change the executable here and in the description when using a custom CLI path. A failed check pauses setup until you reconnect."}
+                            textarea name="probe_json" aria-label="Connection check JSON" {(probe)}
+                        }
                         button type="submit" {"Connect and turn on"}
                     }
                 }
@@ -271,4 +328,35 @@ pub async fn retry_setup(
     same_origin(&headers)?;
     let _ = sources::setup(State(store), headers, Path(id)).await?;
     Ok(Redirect::to("/agent-setup").into_response())
+}
+
+#[derive(Deserialize)]
+pub struct Reconnect {
+    key: Option<String>,
+}
+pub async fn reconnect(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    request: Result<Form<Reconnect>, axum::extract::rejection::FormRejection>,
+) -> ApiResult<Response> {
+    same_origin(&headers)?;
+    sources::owner(&store, &headers).await?;
+    let Form(request) = request.map_err(|_| crate::bad("Invalid reconnect form"))?;
+    let key = request.key.filter(|s| !s.is_empty());
+    if let Some(key) = &key {
+        let filter = sources::scrubber(&store, Some(key)).await?;
+        let source = store
+            .source(&id)
+            .await?
+            .ok_or_else(|| crate::bad("Unknown source"))?;
+        let config = serde_json::json!({"source":source,"recipes":store.recipes(Some(&id)).await?.iter().map(|r| &r.recipe.0).collect::<Vec<_>>()});
+        if filter.contains_secret(&config.to_string()) {
+            return Err(crate::bad(
+                "Saved configuration must not contain credentials",
+            ));
+        }
+    }
+    sources::reconnect_source(&store, &id, key.as_deref()).await?;
+    Ok(Redirect::to("/connect").into_response())
 }

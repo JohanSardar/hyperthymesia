@@ -44,6 +44,33 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
             .await?;
         return Ok(());
     }
+    if let Some(probe) = store.source_check(source).await? {
+        let work = tempfile::tempdir()?;
+        let host = HostRunner::from_env(store.data_dir.clone(), work.path().to_owned());
+        let key = KeyStore::new(&store.data_dir)?.read(source)?;
+        if probe.authorize(&s.description).is_err()
+            || probe
+                .execute(
+                    Placeholders {
+                        key: key.as_deref(),
+                        cursor: None,
+                    },
+                    std::time::Duration::from_secs(30),
+                    &host,
+                )
+                .await
+                .is_err()
+        {
+            let message = "Login unavailable. Sign in to the CLI using the configured HOME, then reconnect. No model run was started.";
+            store
+                .finish_source_setup(source, generation, json!({}), Some(message))
+                .await?;
+            store
+                .record_source_pull(source, Utc::now(), true, Some(message))
+                .await?;
+            return Ok(());
+        }
+    }
     let mut broker = Broker::new(
         store.clone(),
         crate::disclosure::current(store).await?,
@@ -65,6 +92,7 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
         let no_pull = result["no_pull"].as_str().is_some_and(|reason| !reason.trim().is_empty());
         ensure!(has_pull || no_pull, "setup saved no recipe and gave no no_pull reason");
         ensure!(!broker.audit.lock().await.exhausted, "setup exhausted tool budget");
+        ensure!(store.source(source).await?.is_some_and(|s| s.status != "needs_reconnect"), "source needs reconnect");
         // Store only a small, scrubbed owner-facing result, never arbitrary provider output.
         let result = broker.secret_filter().await?.scrub_json(&json!({
             "summary":crate::mcp::bounded(result["summary"].as_str().unwrap_or("Setup completed"), 2000),
@@ -76,6 +104,20 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(_) => {
+            if store
+                .source(source)
+                .await?
+                .is_some_and(|s| s.status == "needs_reconnect")
+            {
+                let message = "Login expired or missing. Reconnect this source on Connect sources.";
+                store
+                    .finish_source_setup(source, generation, json!({}), Some(message))
+                    .await?;
+                store
+                    .record_source_pull(source, Utc::now(), true, Some(message))
+                    .await?;
+                return Ok(());
+            }
             // Setup never uses Deferred: refunds/revivals could otherwise buy
             // unbounded setup attempts. Missing login and crashes spend a claim too.
             if job.attempts >= 2 {
@@ -111,7 +153,7 @@ impl Broker {
             let recipes = self.store.recipes(Some(source_id)).await?;
             let tables = crate::agent_sql::tables(&self.store, Some(source_id)).await?;
             return Ok(
-                json!({"source":source,"recipes":recipes.iter().map(|r| json!({"id":r.id,"recipe":r.recipe.0,"enabled":r.enabled,"owner_off":r.owner_off})).collect::<Vec<_>>(),"addons":self.store.addons(Some(source_id)).await?,"tables":tables,"table_prefix":format!("s_{source_id}_"),"cadence_hours":4}),
+                json!({"source":source,"recipes":recipes.iter().map(|r| json!({"id":r.id,"recipe":r.recipe.0,"enabled":r.enabled,"owner_off":r.owner_off})).collect::<Vec<_>>(),"addons":self.store.addons(Some(source_id)).await?,"tables":tables,"table_prefix":format!("s_{source_id}_"),"connection_check":self.store.source_check(source_id).await?,"cadence_hours":4}),
             );
         }
         if name == "addon_save" {
@@ -132,6 +174,9 @@ impl Broker {
             .map_err(|_| anyhow::anyhow!("invalid recipe shape"))?;
         recipe.validate()?;
         recipe.request.authorize(&source.description)?;
+        if let Some(detail) = &recipe.detail {
+            detail.request.authorize(&source.description)?;
+        }
         ensure!(
             self.secret_filter().await?.scrub_json(args) == *args,
             "recipe contains credentials"

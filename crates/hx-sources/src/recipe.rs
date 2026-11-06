@@ -34,6 +34,18 @@ pub struct Recipe {
     pub ignore: Vec<String>,
     #[serde(default)]
     pub reconnect_exit_codes: Vec<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Detail>,
+    #[serde(default)]
+    pub missing_items_empty: bool,
+}
+
+/// One bounded, source-authorized detail request per listed item. No scripts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Detail {
+    pub id: String,
+    pub request: Request,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -42,7 +54,54 @@ pub struct FieldMap {
     pub id: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
-    pub title: Option<String>,
+    pub title: Option<Selector>,
+}
+
+/// Pointer or a value from a named member of an array (headers, properties, etc.).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Selector {
+    Pointer(String),
+    Named {
+        pointer: String,
+        field: String,
+        equals: String,
+        value: String,
+    },
+}
+impl Selector {
+    fn select<'a>(&self, item: &'a Value) -> Option<&'a Value> {
+        match self {
+            Self::Pointer(p) => item.pointer(p),
+            Self::Named {
+                pointer,
+                field,
+                equals,
+                value,
+            } => item
+                .pointer(pointer)?
+                .as_array()?
+                .iter()
+                .find(|entry| {
+                    entry
+                        .pointer(field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| v.eq_ignore_ascii_case(equals))
+                })?
+                .pointer(value),
+        }
+    }
+    fn pointers(&self) -> Vec<&str> {
+        match self {
+            Self::Pointer(p) => vec![p],
+            Self::Named {
+                pointer,
+                field,
+                value,
+                ..
+            } => vec![pointer, field, value],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +195,8 @@ impl Recipe {
             .chain(self.map.id.as_deref())
             .chain(self.map.start.as_deref())
             .chain(self.map.end.as_deref())
-            .chain(self.map.title.as_deref())
+            .chain(self.map.title.iter().flat_map(Selector::pointers))
+            .chain(self.detail.iter().map(|d| d.id.as_str()))
             .chain(self.cursor.as_ref().map(|c| c.pointer.as_str()))
             .chain(self.pages.as_ref().map(|p| p.next.as_str()))
             .chain(self.ignore.iter().map(String::as_str));
@@ -202,10 +262,17 @@ impl<'a> PullMapper<'a> {
         // PostgreSQL JSONB refuses NUL in both values and object keys. Normalize
         // before looking up fields so identity, hashes, cursors and payload agree.
         let response = without_nul(response);
-        let items = response
-            .pointer(&self.recipe.items)
-            .and_then(Value::as_array)
-            .ok_or(RecipeError::Items)?;
+        let empty = Vec::new();
+        let items = match response.pointer(&self.recipe.items) {
+            Some(Value::Array(items)) => items,
+            None if self.recipe.missing_items_empty
+                && response.is_object()
+                && response.get("error").is_none() =>
+            {
+                &empty
+            }
+            _ => return Err(RecipeError::Items),
+        };
         self.counts.pages += 1;
         let consumed = items.len().min(MAX_ITEMS_PER_PULL - self.counts.items_seen);
         let mut page = MappedPage {
@@ -270,7 +337,7 @@ impl<'a> PullMapper<'a> {
                 .map
                 .title
                 .as_ref()
-                .and_then(|p| item.pointer(p))
+                .and_then(|p| p.select(item))
                 .and_then(Value::as_str)
                 .map(|title| &title[..title.floor_char_boundary(MAX_TITLE_BYTES)]);
             page.envelopes.push(Envelope {

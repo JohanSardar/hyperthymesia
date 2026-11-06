@@ -129,6 +129,102 @@ impl SourceExchange {
         Ok(())
     }
 
+    async fn page(
+        &self,
+        values: Placeholders<'_>,
+        timeout: Duration,
+        host: &HostRunner,
+    ) -> Result<Value, RequestError> {
+        let source = self
+            .store
+            .source(&self.source)
+            .await
+            .map_err(|_| RequestError::Cancelled)?
+            .ok_or(RequestError::Cancelled)?;
+        let since = source.connected_at - chrono::Duration::days(source.history_days);
+        let until = chrono::Utc::now();
+        let bind_dates = |request: &hx_sources::request::Request| {
+            request
+                .bind("since", &since.to_rfc3339())?
+                .bind("since_unix", &since.timestamp().to_string())?
+                .bind("until", &until.to_rfc3339())
+        };
+        let keys = hx_sources::keys::KeyStore::new(&self.store.data_dir)
+            .map_err(|_| RequestError::MissingKey)?;
+        let request = bind_dates(&self.recipe.request)?;
+        request.authorize(&source.description)?;
+        let mut response = hx_sources::oauth::execute(
+            &keys,
+            &self.source,
+            &request,
+            values.cursor,
+            timeout,
+            host,
+            self,
+        )
+        .await?;
+        // MCP tool results carry JSON in structuredContent or a text content block.
+        // This is data decoding only, never tool/schema/instruction execution.
+        if matches!(request, hx_sources::request::Request::Mcp { .. }) {
+            response = response
+                .get("structuredContent")
+                .cloned()
+                .or_else(|| {
+                    let content = response.get("content")?.as_array()?;
+                    if content.len() != 1 {
+                        return None;
+                    }
+                    serde_json::from_str(content[0].get("text")?.as_str()?).ok()
+                })
+                .unwrap_or(response);
+        }
+        if let Some(detail) = &self.recipe.detail {
+            let request = bind_dates(&detail.request)?;
+            request.authorize(&source.description)?;
+            let mut bytes = serde_json::to_vec(&response)
+                .map_err(|_| RequestError::Json)?
+                .len();
+            if let Some(items) = response
+                .pointer_mut(&self.recipe.items)
+                .and_then(Value::as_array_mut)
+            {
+                if items.len() > hx_sources::recipe::MAX_ITEMS_PER_PULL {
+                    return Err(RequestError::TooLarge);
+                }
+                for item in items {
+                    let id = item
+                        .pointer(&detail.id)
+                        .and_then(Value::as_str)
+                        .filter(|id| id.len() <= 4096 && !id.contains("{{"))
+                        .ok_or(RequestError::Invalid)?;
+                    let request = request.bind("item", id)?;
+                    request.authorize(&source.description)?;
+                    let answer = hx_sources::oauth::execute(
+                        &keys,
+                        &self.source,
+                        &request,
+                        None,
+                        timeout,
+                        host,
+                        self,
+                    )
+                    .await?;
+                    let size = |value: &Value| {
+                        serde_json::to_vec(value)
+                            .map(|bytes| bytes.len())
+                            .map_err(|_| RequestError::Json)
+                    };
+                    bytes = bytes.saturating_sub(size(item)?) + size(&answer)?;
+                    if bytes > hx_sources::request::MAX_HTTP_RESPONSE_BYTES {
+                        return Err(RequestError::TooLarge);
+                    }
+                    *item = answer;
+                }
+            }
+        }
+        Ok(response)
+    }
+
     /// Cancellation races the *whole* exchange, including response bodies and
     /// child processes. The gate additionally checks SQLite before every later
     /// HTTP request / stdio message. Polling catches switches from other opens
@@ -140,7 +236,7 @@ impl SourceExchange {
         host: &HostRunner,
     ) -> Result<Value, RequestError> {
         let mut cancelled = self.cancelled.clone();
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = cancelled.wait_for(|off| *off) => Err(RequestError::Cancelled),
             _ = async {
@@ -149,7 +245,23 @@ impl SourceExchange {
                     if self.check().await.is_err() { break; }
                 }
             } => Err(RequestError::Cancelled),
-            result = self.recipe.request.execute_guarded(values, timeout, host, &self) => result,
+            result = tokio::time::timeout(timeout, self.page(values, timeout, host)) => result.map_err(|_| RequestError::Transport)?,
+        };
+        if let Err(error) = &result
+            && self.pull_id.is_none()
+            && (error.needs_reconnect()
+                || matches!(error, RequestError::Exit(code) if self.recipe.reconnect_exit_codes.contains(code)))
+        {
+            self.store
+                .record_source_pull(
+                    &self.source,
+                    chrono::Utc::now(),
+                    true,
+                    Some("Login expired or missing. Reconnect this source on Connect sources."),
+                )
+                .await
+                .map_err(|_| RequestError::Transport)?;
         }
+        result
     }
 }
