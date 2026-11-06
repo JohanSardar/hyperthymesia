@@ -14,6 +14,7 @@ enum Command {
     },
     Pair {
         link: String,
+        /// Replace saved credentials; revoke this device's previous server token first when re-pairing.
         #[arg(long)]
         replace: bool,
     },
