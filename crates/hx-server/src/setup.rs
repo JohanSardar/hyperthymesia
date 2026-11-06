@@ -41,6 +41,7 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
                 job.id,
                 &job.owner,
                 "Source is off. Turn it on and reconnect when ready. No model run was started.",
+                true,
             )
             .await?;
         return Ok(());
@@ -60,7 +61,7 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
         if failed {
             let message = "Login unavailable. Sign in to the CLI using the configured HOME, then reconnect. No model run was started.";
             store
-                .pause_source_setup(source, generation, job.id, &job.owner, message)
+                .pause_source_setup(source, generation, job.id, &job.owner, message, true)
                 .await?;
             return Ok(());
         }
@@ -93,7 +94,12 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
             "summary":crate::mcp::bounded(result["summary"].as_str().unwrap_or("Setup completed"), 2000),
             "no_pull":result["no_pull"].as_str().map(|reason| crate::mcp::bounded(reason,2000)), "recipes":recipes.iter().map(|r| &r.id).collect::<Vec<_>>()
         }));
-        store.finish_source_setup(source, generation, result, None).await?;
+        // An off switch can land while the model finishes. Stay off, and don't leave setup pending.
+        if !store.finish_source_setup(source, generation, result, None).await?
+            && store.source(source).await?.is_some_and(|s| !s.enabled)
+        {
+            store.pause_source_setup(source, generation, job.id, &job.owner, "Source is off. Turn it on and reconnect when ready.", false).await?;
+        }
         Ok::<_,anyhow::Error>(())
     }.await;
     match result {
@@ -108,12 +114,10 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
                     .await?
                     .is_some_and(|s| s.status == "needs_reconnect")
             {
+                // Atomic and fenced by generation. A launched run keeps its spent attempt.
                 let message = "Login expired or missing. Reconnect this source on Connect sources.";
                 store
-                    .finish_source_setup(source, generation, json!({}), Some(message))
-                    .await?;
-                store
-                    .record_source_pull(source, Utc::now(), true, Some(message))
+                    .pause_source_setup(source, generation, job.id, &job.owner, message, false)
                     .await?;
                 return Ok(());
             }
