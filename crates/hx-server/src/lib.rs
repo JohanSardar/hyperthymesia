@@ -78,6 +78,7 @@ pub async fn auth(store: &Store, headers: &HeaderMap, scope: &str) -> ApiResult<
 pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
+        .route("/v1/pair", post(pair).layer(DefaultBodyLimit::max(4096)))
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
         .route("/v1/events", post(events))
         .route("/v1/device", get(device))
@@ -98,6 +99,32 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(Extension(policy))
         .with_state(store)
+}
+async fn pair(
+    State(store): State<Store>,
+    request: Result<
+        Json<hx_schema::protocol::PairRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> ApiResult<Response> {
+    // Do not expose extractor, validation, or database errors (or their inputs).
+    let gone = || {
+        ApiError(
+            StatusCode::GONE,
+            "pairing code expired or already used".into(),
+        )
+    };
+    let Json(request) = request.map_err(|_| gone())?;
+    let token = store
+        .redeem_pair_code(&request.code, &request.device_id)
+        .await
+        .map_err(|_| gone())?
+        .ok_or_else(gone)?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(hx_schema::protocol::PairResponse { token }),
+    )
+        .into_response())
 }
 async fn device(
     State(store): State<Store>,
