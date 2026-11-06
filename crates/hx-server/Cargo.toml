@@ -10,10 +10,10 @@ workspace = true
 
 [dependencies]
 hx-schema.workspace = true
+hx-sources = { path = "../hx-sources" }
 hx-visual.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 hx-store.workspace = true
-hx-sources = { path = "../hx-sources" }
 hx-jobs.workspace = true
 hx-compile.workspace = true
 hx-interpret.workspace = true

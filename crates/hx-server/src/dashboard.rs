@@ -343,11 +343,11 @@ async fn authorized_run(
     ))?;
     let namespaces: Vec<String> = row.input_namespaces;
     let interpretation: serde_json::Value = row.interpretation;
-    let policy = crate::disclosure::DisclosurePolicy::from_env()?;
+    let policy = crate::disclosure::current(store).await?;
     let sensitive = crate::processing::SensitiveEgress::from_env();
     if namespaces.iter().any(|ns| !token.allows(ns))
-        || interpretation["input_manifest"]["disclosure_policy"]["digest"] != policy.digest()
-        || interpretation["input_manifest"]["sensitive_egress"] != serde_json::json!(sensitive)
+        || !crate::disclosure::revision_disclosable(store, &interpretation, &policy, sensitive)
+            .await?
     {
         return Err(crate::ApiError(
             axum::http::StatusCode::NOT_FOUND,

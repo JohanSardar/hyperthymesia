@@ -77,6 +77,19 @@ impl Store {
         description: &str,
         history_days: u8,
     ) -> Result<Source> {
+        self.connect_source_with_key(name, description, history_days, None)
+            .await
+    }
+
+    /// Publish setup only after its optional key is durably in the private key file.
+    /// A crash before commit may leave an orphan key, never a runnable setup job.
+    pub async fn connect_source_with_key(
+        &self,
+        name: &str,
+        description: &str,
+        history_days: u8,
+        key: Option<&str>,
+    ) -> Result<Source> {
         ensure!(!name.trim().is_empty(), "source name required");
         ensure!(history_days <= 30, "history_days must be in 0..=30");
         let id = new_id();
@@ -86,6 +99,9 @@ impl Store {
         let source = sqlx::query_as("INSERT INTO sources(id,connector_instance,name,description,history_days,connected_at) VALUES($1,$2,$3,$4,$5,$6) RETURNING *")
             .bind(&id).bind(connector).bind(name).bind(description).bind(i64::from(history_days)).bind(now).fetch_one(&mut *tx).await?;
         enqueue_setup(&mut tx, &id, 1, now).await?;
+        if let Some(key) = key {
+            hx_sources::keys::KeyStore::new(&self.data_dir)?.write(&id, key)?;
+        }
         tx.commit().await?;
         Ok(source)
     }
@@ -118,15 +134,51 @@ impl Store {
     /// Owner-only. Agent saves and setup completion never call this path.
     /// No switch queues interpretation or changes a window generation.
     pub async fn set_source_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        self.patch_source(id, Some(enabled), None).await
+    }
+
+    /// Rotate the file before committing switches. A crash cannot queue work;
+    /// a completed file replacement is safe to repeat with the same key.
+    pub async fn patch_source(
+        &self,
+        id: &str,
+        enabled: Option<bool>,
+        key: Option<&str>,
+    ) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        let changed = sqlx::query("UPDATE sources SET enabled=$2 WHERE id=$1")
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE id=$1)")
             .bind(id)
-            .bind(enabled)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-        ensure!(changed.rows_affected() == 1, "unknown source");
-        log_switch(&mut tx, "source", id, enabled).await?;
+        ensure!(exists, "unknown source");
+        if let Some(key) = key {
+            hx_sources::keys::KeyStore::new(&self.data_dir)?.write(id, key)?;
+        }
+        if let Some(enabled) = enabled {
+            sqlx::query("UPDATE sources SET enabled=$2 WHERE id=$1")
+                .bind(id)
+                .bind(enabled)
+                .execute(&mut *tx)
+                .await?;
+            log_switch(&mut tx, "source", id, enabled).await?;
+        }
         tx.commit().await
+    }
+    pub async fn recipe_exists(&self, id: &str) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM recipes WHERE id=$1)")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+    pub async fn addon_exists(&self, id: &str) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM addons WHERE id=$1)")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     /// Owner-only retry, with a distinct durable job identity. It cannot enable
@@ -648,3 +700,12 @@ fn recipe_identity(recipe: &Recipe) -> Result<String> {
     };
     Ok(hash(&serde_json::to_vec(&identity)?))
 }
+
+#[derive(Debug)]
+pub struct SourceAccessChanged;
+impl std::fmt::Display for SourceAccessChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("owner disabled an input source")
+    }
+}
+impl std::error::Error for SourceAccessChanged {}
