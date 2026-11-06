@@ -239,6 +239,10 @@ impl Store {
                 .bind(source)
                 .execute(&mut *tx)
                 .await?;
+            // Every successful setup gets one immediate pull, including a
+            // re-setup of an existing recipe. Off recipes remain untouched.
+            sqlx::query("UPDATE recipe_state SET next_run_at=$2 WHERE recipe_id IN (SELECT id FROM recipes WHERE source_id=$1 AND enabled AND NOT owner_off)")
+                .bind(source).bind(Ts::now()).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(true)
@@ -280,6 +284,23 @@ impl Store {
         .await?)
     }
 
+    /// Read again before each page; queued jobs are never switch authority.
+    pub async fn recipe(&self, id: &str) -> Result<Option<StoredRecipe>> {
+        Ok(sqlx::query_as("SELECT * FROM recipes WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// One durable slot per recipe. Repeated scheduler ticks neither multiply
+    /// missed boundaries nor steal a running lease or refill retry attempts.
+    pub async fn schedule_pulls(&self, now: DateTime<Utc>) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query("INSERT INTO jobs(output_key,kind,payload,available_at) SELECT 'pull:' || r.id,'pull',json_object('recipe',r.id),$1 FROM recipes r JOIN sources s ON s.id=r.source_id JOIN recipe_state rs ON rs.recipe_id=r.id WHERE r.enabled AND NOT r.owner_off AND s.enabled AND s.status='ready' AND rs.next_run_at<=$1 ON CONFLICT(output_key) DO UPDATE SET state='ready',attempts=0,available_at=EXCLUDED.available_at,last_error=NULL,request_version=jobs.request_version+1 WHERE jobs.state IN ('done','failed')")
+            .bind(Ts::from(now)).execute(&mut *tx).await?;
+        tx.commit().await
+    }
+
     /// Owner-only, and the sole path that may clear a recipe's owner_off.
     pub async fn set_recipe_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         self.set_child_enabled("recipe", id, enabled).await
@@ -301,6 +322,26 @@ impl Store {
         let updated = sqlx::query("UPDATE recipe_state SET cursor=$2,next_run_at=$3,last_ok_at=$4,last_error=$5 WHERE recipe_id=$1")
             .bind(&state.recipe_id).bind(cursor).bind(Ts::from(state.next_run_at)).bind(state.last_ok_at.map(Ts::from)).bind(&state.last_error).execute(&mut *tx).await?;
         ensure!(updated.rows_affected() == 1, "unknown recipe");
+        tx.commit().await
+    }
+
+    /// Finish a pull atomically: a crash cannot advance its boundary without
+    /// also recording reconnect/error status. Call only after ingest commits.
+    pub async fn finish_recipe_pull(
+        &self,
+        source: &str,
+        state: &RecipeState,
+        at: DateTime<Utc>,
+        reconnect: bool,
+    ) -> Result<()> {
+        let cursor = state.cursor.clone().map(stored_json);
+        let mut tx = self.begin_write().await?;
+        let updated = sqlx::query("UPDATE recipe_state SET cursor=$2,next_run_at=$3,last_ok_at=$4,last_error=$5 WHERE recipe_id=$1 AND EXISTS(SELECT 1 FROM recipes WHERE id=$1 AND source_id=$6)")
+            .bind(&state.recipe_id).bind(cursor).bind(Ts::from(state.next_run_at)).bind(state.last_ok_at.map(Ts::from)).bind(&state.last_error).bind(source).execute(&mut *tx).await?;
+        ensure!(updated.rows_affected() == 1, "unknown source recipe");
+        let updated = sqlx::query("UPDATE sources SET last_pull_at=$2,last_error=$3,status=CASE WHEN $4 THEN 'needs_reconnect' ELSE status END WHERE id=$1")
+            .bind(source).bind(Ts::from(at)).bind(&state.last_error).bind(reconnect).execute(&mut *tx).await?;
+        ensure!(updated.rows_affected() == 1, "unknown source");
         tx.commit().await
     }
 
