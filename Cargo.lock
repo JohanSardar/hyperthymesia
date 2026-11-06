@@ -1247,6 +1247,7 @@ dependencies = [
  "hex",
  "hx-compile",
  "hx-schema",
+ "hx-sources",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1256,6 +1257,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "url",
 ]
 
 [[package]]
