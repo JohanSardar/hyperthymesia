@@ -67,9 +67,8 @@ pub async fn page(
         shell("Connect sources", html! {
             main class="connect" {
                 style {".connect{max-width:960px;margin:3rem auto}.eyebrow{color:#8fd3ff;text-transform:uppercase;letter-spacing:.14em;font-size:12px}.connect h1{font-size:2.6rem;margin:.4rem 0}.intro{color:#b9c6d8;max-width:620px;line-height:1.6}.catalog{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.8rem;margin:1.5rem 0}.source-card,.connect-form,.disclosure{border:1px solid #354358;border-radius:12px;padding:1.3rem;background:linear-gradient(125deg,#1b2737,#151d2a)}.catalog a{display:block;text-decoration:none;font-weight:600}.catalog small{display:block;color:#b9c6d8;font-weight:400;margin-top:.5rem}.source-row{display:flex;justify-content:space-between;gap:1rem;align-items:center}.source-row h3{margin:.2rem 0}.source-card{margin:.8rem 0}.source-card p{overflow-wrap:anywhere;line-height:1.5}.connect-form{margin:1.5rem 0}.connect label{display:block;margin:1rem 0 .4rem;font-weight:600}.connect input,.connect textarea{box-sizing:border-box;width:100%;background:#0f1723;color:#e8edf5;border:1px solid #61758f;border-radius:6px;padding:.7rem;font:inherit}.connect textarea{min-height:110px;resize:vertical}.connect button{font:inherit;cursor:pointer;border:1px solid #8fd3ff;border-radius:6px;padding:.6rem 1rem;color:#10151e;background:#8fd3ff}.connect button[aria-checked=false]{color:#b9c6d8;background:#1b2737;border-color:#61758f}.connect .hint{font-size:14px;color:#b9c6d8;line-height:1.5}.disclosure{margin:2rem 0;border-color:#8c7951}.disclosure h2{font-size:18px;margin-top:0}.disclosure p{font-size:14px;line-height:1.6}.status{color:#a8e6c1}.notice{border-left:3px solid #a8e6c1;padding:.8rem;background:#1b302d}@media(max-width:600px){body{margin:1rem}.connect{margin:2rem 0}.connect h1{font-size:2rem}.source-row{align-items:flex-start}}"}
-                p class="eyebrow" {"Your memory, connected"}
                 h1 {"Connect your sources"}
-                p class="intro" {"Bring the rest of your work into your day. Paste a key and tell Hyperthymesia what it connects to. Your agent can use it live on later runs, with citations back to the answer it received."}
+                p class="intro" {"Connect an API, CLI or MCP server. The agent reads it during setup and later day-page runs. Saved answers can be cited."}
                 @if query.connected.as_deref() == Some("1") {
                     p class="notice" role="status" {"Connection saved. Check its status below. Once login is available, one bounded setup run sets up automatic pulls."}
                 }
@@ -84,7 +83,7 @@ pub async fn page(
                                 div {
                                     h3 {(source["name"].as_str().unwrap_or("Source"))}
                                     span class="status" {
-                                        @if source["enabled"] == true {(source["status"].as_str().unwrap_or("On"))} @else {"Off · unavailable to the agent"}
+                                        @if source["enabled"] == true {(source["status"].as_str().unwrap_or("On"))} @else {"Off · broker requests and pulls stopped"}
                                     }
                                 }
                                 form method="post" action=(format!("/connect/{}",source["id"].as_str().unwrap_or(""))) {
@@ -113,6 +112,7 @@ pub async fn page(
                                 @if source["has_key"] == true {"Key stored privately"} @else {"No key stored; uses the server's existing CLI login, if available"}
                                 ". Turning a source off stays off. Only you can turn it back on."
                             }
+                            p class="hint" {"Source removal is not available yet. Switching off stops this source's broker requests and automatic pulls, including running exchanges. It keeps the key, login material, settings, agent tables, saved evidence and citations. Full host bash can still access the source."}
                         }
                     }
                 }
@@ -136,6 +136,7 @@ pub async fn page(
                         label for="source-description" {"What is it?"}
                         textarea id="source-description" name="description" required maxlength="16384" placeholder="My messages at https://mail.example/api. Read my recent conversations." {(description)}
                         p class="hint" {"Include the API or MCP server's address. For a CLI, include its command in backticks, like `my-cli`. The agent works out how to call it. Only owner-described destinations receive the key in direct requests."}
+                        p class="hint" {"“Keep it local” in this description is an instruction to the agent, not a wall. The agent has full host bash, can read files and credentials, and can contact the network."}
                         label for="source-key" {"Key or credential"}
                         input id="source-key" name="key" type="password" autocomplete="new-password" spellcheck="false" autocapitalize="none" maxlength="16384" placeholder="Paste a key (optional for a signed-in CLI)";
                         p class="hint" {"Use a read-only, narrowly scoped key where possible. It is never shown back here."}
@@ -150,6 +151,7 @@ pub async fn page(
                             p class="hint" {"Optional read-only request checked without AI before setup. Change the executable here and in the description when using a custom CLI path. A failed check pauses setup until you reconnect."}
                             textarea name="probe_json" aria-label="Connection check JSON" {(probe)}
                         }
+                        p class="hint" {"The configured cloud model can receive captured window titles, URLs, accessibility text, screenshot OCR, fuller saved evidence from broker lookups, and source responses during setup and live lookups. Connecting starts a paid setup run; later day-page runs can also use this source."}
                         button type="submit" {"Connect and turn on"}
                     }
                 }
@@ -158,7 +160,7 @@ pub async fn page(
                     p {"The agent has full bash on this server, with its real HOME and extended PATH. There is no sandbox. Commands can read or change files, use existing CLI logins, install software and contact the network."}
                     p {"Code blocks common literal catastrophic commands, including disk erasure, shutdown, fork bombs and forced recursive deletion of root or home. It also blocks literal access to Hyperthymesia's state folder. This is an accident guard, not a security boundary: scripts, variables, symlinks, obfuscated commands and other destructive operations can bypass it."}
                     p {"Keys are kept in private, mode-0600 files on this server, outside SQLite and backups. Each call receives only its own source's key. Known keys and common encodings are scrubbed before prompts, tool logs and saved answers. Full host bash can still read keys and other host credentials or send them elsewhere; keys are not hidden from the agent, and scrubbing cannot stop every encoding or deliberate exfiltration."}
-                    p {"Allowed source content and your summaries go to the configured cloud model. Retrieved text is treated as untrusted data. Live answers are saved for citations, but old records and current lookups are context, not proof of activity at another time."}
+                    p {"Retrieved text is treated as untrusted data. Live answers are saved for citations, but old records and current lookups are context, not proof of activity at another time."}
                     p {"Connecting starts one bounded setup job with at most two attempts. Pulls then run every four hours without AI. Switching sources starts no model run. An off source cannot be called or re-enabled through the agent's broker tools."}
                 }
             }

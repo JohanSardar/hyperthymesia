@@ -1,5 +1,10 @@
 # Install Hyperthymesia
 
+For a source build and foreground server, start with the
+[README quickstart](../README.md#install-from-source). This page describes the
+managed-service installer. Both use SQLite and a single local state folder;
+neither needs Docker or a database service.
+
 The installer starts a loopback user service without sudo. Supported: Apple
 Silicon macOS and Linux x86_64/aarch64 (glibc 2.35+). Intel Macs are refused.
 State must live on a local disk; SQLite WAL is unsuitable for network storage.
@@ -111,17 +116,21 @@ For remote access use `tailscale serve --bg 7377` and its HTTPS URL, or maintain
 `ssh -N -L 7377:127.0.0.1:7377 user@host` with `http://127.0.0.1:7377`.
 The server itself always remains on loopback.
 
-Create a dashboard token yourself; it is returned once, so store it privately:
+Create a dashboard token yourself; it is returned once, so store it privately.
+To manage sources, it needs `read_raw` and the `source:` prefix:
 
 ```sh
 hx-server --state-dir "$STATE" token create --name dashboard \
-  --prefix macos-agent:DEVICE --prefix macos-media:DEVICE --scopes read_l3
+  --prefix source: --prefix macos-agent:DEVICE --prefix macos-media:DEVICE \
+  --scopes read_raw,read_l3
 ```
 
 Dashboard tokens are prefix-bound. Add `--prefix` for every git, shell or other
 connector namespace you intend to see; otherwise its revisions/citations stay
 hidden. Pairing grants ingestion, not read access. Installation never prints a
-dashboard secret into unattended logs.
+dashboard secret into unattended logs. Open `/login` on the server and paste the
+token, then use **Connect sources**. `read_raw` also permits reading retained raw
+evidence; only give this administrative token to people you trust with that data.
 
 ## Upgrade and recovery
 

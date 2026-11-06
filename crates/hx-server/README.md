@@ -9,6 +9,10 @@ Fixtures in this crate are synthetic.
 
 ## Run
 
+For installation, model-provider login and connecting a source, start with the
+[README quickstart](../../README.md#install-from-source). No database service or
+Docker is needed.
+
 Set `HX_STATE_DIR` to one explicit local state folder, or pass `--state-dir`
 with each command. There is no default. From the workspace:
 
@@ -18,7 +22,8 @@ with each command. There is no default. From the workspace:
     cargo run --release -p hx-server -- serve --listen 127.0.0.1:7377
 
 `migrate` creates a new `core.sqlite` and an empty `agent.sqlite`, plus `blobs/`
-and `locks/`. It refuses an existing core. `serve`, `token`, `pair`, `compile`, `interpret`
+and `locks/`. It upgrades compatible existing schemas and refuses unknown or
+changed migrations. `serve`, `token`, `pair`, `compile`, `interpret`
 and `gc` open an initialized core and never silently create history. `doctor` and
 `--version` need no state folder. Use local disk only; WAL is unsuitable for a
 network filesystem. WAL, full synchronous writes and a 30-second busy timeout
@@ -58,8 +63,8 @@ return 410; internal failures return an empty 503, so retry the same link.
 See [Mac pairing](../../docs/mac-pairing.md) for stable device IDs and replacement.
 
 Paired blob uploads retain the existing behavior: they are not prefix-checked
-or quota-limited. Existing development `[1,3]` cores have no upgrade path to
-`[1,2,3]`; A3 owns the `migrate` upgrade work.
+or quota-limited. `migrate` applies missing migrations, including lower-numbered
+versions arriving later. Back up and stop an existing server before migrating.
 
     cargo run -p hx-server -- compile --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
     cargo run -p hx-server -- interpret --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
@@ -70,9 +75,12 @@ hold OS locks in `<state-dir>/locks/interpret-<window-start>` so a manual run an
 the job worker cannot buy the same window concurrently. Lock files remain on
 disk; dropping the guard or killing its process releases the lock immediately.
 
-Interpretation uses a stub provider unless `HX_PROVIDER=claude` selects the
-`claude -p` CLI (model from `HX_MODEL`, default `sonnet`). Restricted evidence
-never reaches a provider. Sensitive evidence is sent in full text by default;
+Interpretation uses a stub provider by default. `HX_PROVIDER=fx` selects the
+day-page agent described in the [quickstart](../../README.md); `HX_PROVIDER=claude`
+selects the legacy `claude -p` CLI (model from `HX_MODEL`, default `sonnet`).
+The structured evidence packet excludes restricted content. The fx agent also
+has full host bash: this filter does not isolate files, keys or CLI logins from
+the agent. Sensitive packet evidence is sent in full text by default;
 `HX_EGRESS_SENSITIVE=redact` sends only its kind and time. Both egress settings
 and disclosure rules are part of the input digest. To apply a policy change to already interpreted windows, run
 `interpret` again for the desired range; changing the file alone does not enqueue
@@ -83,8 +91,9 @@ at four-hour UTC boundaries, and enqueues a second interpretation at window end
 plus 24 hours. Late data dirties affected windows, including the next window when
 its thirty-minute input overlap is affected. The prior canonical revision remains
 readable while new work runs. Changed entity memory invalidates existing windows;
-changed carried tasks invalidate later windows. Run gc regularly with the same
-data directory as serve; chunk files expire after thirty days, stills remain,
+changed carried tasks invalidate later windows. Automatic GC is off; read
+[GC safety](../../docs/gc-safety.md) before running it with the same
+state folder as serve. Eligible chunk files expire after thirty days; stills remain,
 and pins prevent deletion. Raw envelopes and expired blob manifests remain.
 
 ## Server-owner disclosure policy

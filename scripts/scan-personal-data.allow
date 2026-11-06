@@ -4,3 +4,8 @@
 # metadata:commit-message mean commit metadata.
 metadata:commit-author	identity-name	*	the owner's name as commit author
 scripts/build-release.sh	identity-name	1	the public repository URL required in release source notices
+README.md	identity-name	1	the public repository clone URL
+scripts/install.sh	identity-name	1	the public repository release URL
+docs/install.md	identity-name	1	the public repository release URL
+.audit/build.tsv	identity-name	5	public repository and merged pull request URLs in the build log
+crates/hx-interpret/src/snapshots/hx_interpret__digest__tests__mac_only_digest_main.snap	captured-prose	2	fixed renderer format and citation instructions; sample observations and screen text are synthetic
