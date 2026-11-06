@@ -362,8 +362,7 @@ impl Store {
     /// Unchanged failed/deferred input cools down for seven UTC days.
     /// Historical first runs and exhausted 24h passes share this same cap.
     pub async fn schedule_daily_sweep(&self, now: DateTime<Utc>) -> Result<()> {
-        let mut tx = self.begin_write().await?;
-        let candidate = sqlx::query(
+        let candidate_sql =
             "SELECT w.start_at,w.end_at,w.generation
              FROM windows w LEFT JOIN revisions r ON r.id=w.canonical_revision
              WHERE w.empty_generation IS DISTINCT FROM w.generation
@@ -399,12 +398,29 @@ impl Store {
                      AND NOT (json_type(j.payload,'$.sweep_day') IS NOT NULL)
                    ))
                )
-             ORDER BY w.end_at DESC LIMIT 1",
-        )
-        .bind(Ts::from(now))
-        .bind((now.date_naive()-Duration::days(7)).to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
+             ORDER BY w.end_at DESC LIMIT 1";
+        let candidate = sqlx::query(candidate_sql)
+            .bind(Ts::from(now))
+            .bind((now.date_naive() - Duration::days(7)).to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(selected) = candidate else {
+            return Ok(());
+        };
+        let start: Ts = selected.get("start_at");
+        let mut tx = self.begin_write().await?;
+        // Recheck just the selected primary key under the writer. Reservations
+        // still arbitrate the global daily cap across concurrent schedulers.
+        let recheck = candidate_sql.replace(
+            "WHERE w.empty_generation",
+            "WHERE w.start_at=$3 AND w.empty_generation",
+        );
+        let candidate = sqlx::query(sqlx::AssertSqlSafe(recheck))
+            .bind(Ts::from(now))
+            .bind((now.date_naive() - Duration::days(7)).to_string())
+            .bind(start)
+            .fetch_optional(&mut *tx)
+            .await?;
         if let Some(row) = candidate {
             let w = Interval {
                 start: DateTime::<Utc>::from(row.get::<Ts, _>("start_at")),
@@ -483,6 +499,24 @@ impl Store {
         output_key: &str,
         namespaces: &[String],
     ) -> Result<(i64, bool)> {
+        retry_busy("publish revision", |_| {
+            self.publish_revision_attempt(w, generation, &value, output_key, namespaces)
+        })
+        .await
+    }
+    async fn publish_revision_attempt(
+        &self,
+        w: Interval,
+        generation: i64,
+        value: &Value,
+        output_key: &str,
+        namespaces: &[String],
+    ) -> Result<(i64, bool)> {
+        let mut content = value.clone();
+        let agent_run = content.as_object_mut().and_then(|v| v.remove("agent_run"));
+        let dependencies = revision_dependency_ids(&content, agent_run.as_ref());
+        let content = stored_json(content);
+        let agent_run = agent_run.map(stored_json);
         let mut tx = self.begin_write().await?;
         let window =
             sqlx::query("SELECT generation,canonical_revision FROM windows WHERE start_at=$1")
@@ -494,10 +528,7 @@ impl Store {
         if value.get("agent_run").is_some() && current != generation {
             return Ok((canonical.unwrap_or_default(), false));
         }
-        let mut content = value.clone();
-        let agent_run = content.as_object_mut().and_then(|v| v.remove("agent_run"));
-        let dependencies = revision_dependency_ids(&content, agent_run.as_ref());
-        let inserted = sqlx::query("INSERT INTO revisions(start_at,input_generation,interpretation,output_key,input_namespaces,agent_run,created_at,has_dependency_record) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(output_key) DO NOTHING").bind(Ts::from(w.start)).bind(generation).bind(stored_json(content)).bind(output_key).bind(sqlx::types::Json(namespaces)).bind(agent_run.map(stored_json)).bind(Ts::now()).bind(dependencies.is_some()).execute(&mut *tx).await?;
+        let inserted = sqlx::query("INSERT INTO revisions(start_at,input_generation,interpretation,output_key,input_namespaces,agent_run,created_at,has_dependency_record) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(output_key) DO NOTHING").bind(Ts::from(w.start)).bind(generation).bind(content).bind(output_key).bind(sqlx::types::Json(namespaces)).bind(agent_run).bind(Ts::now()).bind(dependencies.is_some()).execute(&mut *tx).await?;
         let revision = sqlx::query(
             "SELECT id,input_generation,start_at,interpretation FROM revisions WHERE output_key=$1",
         )
@@ -531,8 +562,8 @@ impl Store {
                 // The same 16h lookback as prior_context must still become stale
                 // when new tasks appear. Recorded dependencies use the indexed table;
                 // legacy runs retain the lookback fallback. Mark only; payment stays cadence-gated.
-                sqlx::query("UPDATE windows SET generation=generation+1,dirty=true WHERE start_at >= $1 AND (canonical_revision IN (SELECT revision_id FROM revision_dependencies WHERE prior_revision_id=$2) OR (start_at < $1+57600000000 AND ($3 OR canonical_revision IS NULL OR canonical_revision IN (SELECT id FROM revisions WHERE NOT has_dependency_record))))")
-                    .bind(Ts::from(w.end)).bind(canonical).bind(!open_tasks(stored.get("tasks").unwrap_or(&Value::Null)).is_empty()).execute(&mut *tx).await?;
+                sqlx::query("UPDATE windows SET generation=generation+1,dirty=true WHERE start_at >= $1 AND start_at < $1+57600000000 AND (canonical_revision IN (SELECT revision_id FROM revision_dependencies WHERE prior_revision_id IN (SELECT id FROM revisions WHERE start_at=$2)) OR $3 OR canonical_revision IS NULL OR canonical_revision IN (SELECT id FROM revisions WHERE NOT has_dependency_record))")
+                    .bind(Ts::from(w.end)).bind(Ts::from(w.start)).bind(!open_tasks(stored.get("tasks").unwrap_or(&Value::Null)).is_empty()).execute(&mut *tx).await?;
             }
             sqlx::query("UPDATE windows SET canonical_revision=$2 WHERE start_at=$1")
                 .bind(Ts::from(w.start))
@@ -544,8 +575,25 @@ impl Store {
         Ok((id, publish))
     }
     pub async fn search(&self, q: &str, raw: bool, prefixes: &[String]) -> Result<Vec<Value>> {
-        let rows=sqlx::query("SELECT e.id,n.search_text,e.source_start FROM normalized n JOIN events e ON e.id=n.event_id WHERE n.event_id IN (SELECT rowid FROM normalized_fts WHERE normalized_fts MATCH $1) AND ($2 OR e.sensitivity='normal') AND EXISTS(SELECT 1 FROM json_each($3) p WHERE substr(e.connector_instance,1,length(p.value))=p.value) ORDER BY e.source_start DESC LIMIT 100")
-            .bind(sqlite::search_query(q)).bind(raw).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await?;
+        let query = sqlite::search_query(q);
+        // Small posting lists are cheaper to sort; common terms should walk the
+        // time index and stop at 100 permitted hits instead of sorting history.
+        let hits: Vec<i64> = sqlx::query_scalar(
+            "SELECT rowid FROM normalized_fts WHERE normalized_fts MATCH $1 LIMIT 1001",
+        )
+        .bind(&query)
+        .fetch_all(&self.pool)
+        .await?;
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = if hits.len() <= 1000 {
+            sqlx::query("SELECT e.id,n.search_text,e.source_start FROM events e JOIN normalized n ON n.event_id=e.id WHERE e.id IN (SELECT value FROM json_each($1)) AND ($2 OR e.sensitivity='normal') AND EXISTS(SELECT 1 FROM json_each($3) p WHERE substr(e.connector_instance,1,length(p.value))=p.value) ORDER BY e.source_start DESC LIMIT 100")
+                .bind(sqlx::types::Json(&hits)).bind(raw).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await?
+        } else {
+            sqlx::query("SELECT e.id,n.search_text,e.source_start FROM events e INDEXED BY events_time CROSS JOIN normalized n ON n.event_id=e.id WHERE ($2 OR e.sensitivity='normal') AND EXISTS(SELECT 1 FROM json_each($3) p WHERE substr(e.connector_instance,1,length(p.value))=p.value) AND EXISTS(SELECT 1 FROM normalized_fts WHERE normalized_fts MATCH $1 AND rowid=e.id) ORDER BY e.source_start DESC LIMIT 100")
+                .bind(query).bind(raw).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await?
+        };
         Ok(rows.into_iter().map(|r| json!({"id":r.get::<i64,_>("id"),"text":r.get::<String,_>("search_text"),"at":DateTime::<Utc>::from(r.get::<Ts, _>("source_start"))})).collect())
     }
     pub fn blob_path(&self, sha: &str) -> Result<PathBuf> {
@@ -607,6 +655,10 @@ impl Store {
         let mut expired = 0;
         for sha in &hashes {
             let mut tx = self.begin_write().await?;
+            #[cfg(test)]
+            if let Some(boundary) = &self.gc_boundary {
+                tx.observe_gc_commit(boundary.clone());
+            }
             let eligible: Option<String> = sqlx::query_scalar("SELECT sha256 FROM blobs WHERE sha256=$1 AND retention_class='chunk' AND pins=0 AND published AND created_at < $2")
                 .bind(sha).bind(Ts::from(Utc::now()-Duration::days(30))).fetch_optional(&mut *tx).await?;
             if eligible.is_none() {
@@ -616,6 +668,10 @@ impl Store {
             // Unlink under the same writer lock used by upload's rename. Keep this
             // synchronous so cancellation cannot leave an unlink in flight after
             // releasing the transaction and race a later upload.
+            #[cfg(test)]
+            if let Some(boundary) = &self.gc_boundary {
+                boundary.before_unlink().await;
+            }
             match std::fs::remove_file(self.blob_path(sha)?) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -627,10 +683,6 @@ impl Store {
                 .await?;
             tx.commit().await?;
             expired += 1;
-            #[cfg(test)]
-            if let Some(boundary) = &self.gc_boundary {
-                boundary.after_commit().await;
-            }
         }
         Ok(expired)
     }
@@ -745,3 +797,6 @@ mod persistence;
 pub use persistence::{
     job_window_start, record_revision_dependencies, revision_dependency_ids, stored_json,
 };
+
+mod contention;
+pub use contention::{is_busy, retry_busy};

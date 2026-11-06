@@ -3220,3 +3220,54 @@ async fn recent_interpretation_storm_coalesces_108_generations_into_one_paid_run
     assert!(f.store.sweep_reservations().await.unwrap().is_empty());
     f.close().await;
 }
+
+#[cfg(unix)]
+async fn changed_fx_identity_calls_provider(field: &str) {
+    let f = Fixture::new().await;
+    ingest(&f.store, vec![event("fx-identity", 0)]).await;
+    let w = hx_store::window_at(event("fx-identity", 0).time.observed_at);
+    f.store.normalize_window(w).await.unwrap();
+    let (_, generation) = hx_server::processing::compile_window(&f.store, w)
+        .await
+        .unwrap();
+    let mut identity = json!({"input_generation":generation,"provider":"fx",
+        "model":std::env::var("HX_FX_MODEL").unwrap_or_else(|_| hx_server::fx::MODEL.into()),
+        "effort":std::env::var("HX_FX_EFFORT").unwrap_or_else(|_| "xhigh".into()),
+        "fx_version":hx_server::fx::FX_VERSION,"prompt_version":hx_server::fx::PROMPT_VERSION,
+        "sensitive_egress":hx_server::processing::SensitiveEgress::from_env(),
+        "disclosure_policy":{"digest":DisclosurePolicy::from_env().unwrap().digest()}});
+    identity[field] = json!("previous-setting");
+    f.store
+        .publish_revision(w, generation, json!({"tasks":[],"input_manifest":identity}))
+        .await
+        .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config = fake_fx(scratch.path(), "rate");
+    let result = hx_server::fx::interpret_window(&f.store, w, "changed-fx-identity", &config).await;
+    let calls = std::fs::read_to_string(scratch.path().join("paid-calls")).unwrap_or_default();
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "changed {field} must invoke fx: {result:?}"
+    );
+    assert!(
+        result.is_err(),
+        "the scripted rate limit proves the provider path was reached"
+    );
+    f.close().await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn fx_model_change_calls_provider() {
+    changed_fx_identity_calls_provider("model").await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn fx_effort_change_calls_provider() {
+    changed_fx_identity_calls_provider("effort").await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn fx_version_change_calls_provider() {
+    changed_fx_identity_calls_provider("fx_version").await;
+}

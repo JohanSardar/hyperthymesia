@@ -47,6 +47,17 @@ impl Store {
             "{} already exists",
             path.display()
         );
+        let blobs = state_dir.join("blobs");
+        if tokio::fs::try_exists(&blobs).await? {
+            ensure!(
+                tokio::fs::read_dir(&blobs)
+                    .await?
+                    .next_entry()
+                    .await?
+                    .is_none(),
+                "refusing non-empty blobs folder without core.sqlite"
+            );
+        }
         let aside = tempfile::Builder::new()
             .prefix(".core-creating")
             .tempdir_in(state_dir)?;
@@ -92,11 +103,19 @@ impl Store {
     /// migrations remains an explicit operation, never a side effect of serve.
     pub async fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
         let path = state_dir.as_ref().join("core.sqlite");
-        let store = Self::connect(&path, SqliteJournalMode::Wal).await?;
+        // Validate through a read-only connection without journal pragmas. Even
+        // refusing an unrelated SQLite file must leave its journal unchanged.
+        let mut validation = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true)
+                .create_if_missing(false),
+        )
+        .await?;
         let applied: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
             "SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version",
         )
-        .fetch_all(&store.pool)
+        .fetch_all(&mut validation)
         .await
         .context("core.sqlite has not been initialized")?;
         ensure!(
@@ -111,7 +130,8 @@ impl Store {
                 "core.sqlite migration {version} is incomplete or has a different checksum"
             );
         }
-        Ok(store)
+        validation.close().await?;
+        Self::connect(&path, SqliteJournalMode::Wal).await
     }
 
     async fn connect(path: &Path, journal: SqliteJournalMode) -> Result<Self> {
@@ -141,11 +161,18 @@ impl Store {
     pub async fn begin_write(&self) -> Result<WriteTransaction> {
         Ok(WriteTransaction(
             self.pool.begin_with("BEGIN IMMEDIATE").await?,
+            std::time::Instant::now(),
+            #[cfg(test)]
+            None,
         ))
     }
 }
 
-pub struct WriteTransaction(sqlx::Transaction<'static, Sqlite>);
+pub struct WriteTransaction(
+    sqlx::Transaction<'static, Sqlite>,
+    std::time::Instant,
+    #[cfg(test)] Option<std::sync::Arc<crate::concurrency_tests::GcBoundary>>,
+);
 
 impl WriteTransaction {
     /// Execute an INSERT using `(SELECT next_id FROM evidence_seq)` for its ID,
@@ -170,8 +197,23 @@ impl WriteTransaction {
         Ok(id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_gc_commit(
+        &mut self,
+        boundary: std::sync::Arc<crate::concurrency_tests::GcBoundary>,
+    ) {
+        self.2 = Some(boundary);
+    }
     pub async fn commit(self) -> Result<()> {
         self.0.commit().await?;
+        tracing::debug!(
+            writer_hold_us = self.1.elapsed().as_micros() as u64,
+            "SQLite writer committed"
+        );
+        #[cfg(test)]
+        if let Some(boundary) = self.2 {
+            boundary.after_commit().await;
+        }
         Ok(())
     }
 
@@ -197,13 +239,34 @@ impl DerefMut for WriteTransaction {
 /// Treat each whitespace-separated term as a literal phrase, joined by AND.
 /// Quoting also prevents FTS operators from changing the query's meaning.
 pub fn search_query(text: &str) -> String {
-    let terms: Vec<_> = text
-        .split_whitespace()
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+    // Ask the bundled tokenizer itself: Rust's Unicode tables have a different
+    // version/category definition from unicode61 (which includes private use).
+    let terms: Vec<_> = text.split_whitespace().collect();
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory tokenizer");
+    conn.execute_batch("CREATE VIRTUAL TABLE terms USING fts5(term, tokenize='unicode61 remove_diacritics 0'); CREATE VIRTUAL TABLE tokens USING fts5vocab(terms,instance);").expect("bundled unicode61");
+    for (id, term) in terms.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO terms(rowid,term) VALUES(?1,?2)",
+            rusqlite::params![id as i64 + 1, term],
+        )
+        .expect("tokenize term");
+    }
+    let mut query = conn
+        .prepare("SELECT DISTINCT doc FROM tokens ORDER BY doc")
+        .expect("tokenizer vocabulary");
+    let retained: Vec<String> = query
+        .query_map([], |row| row.get::<_, i64>(0))
+        .expect("tokenizer rows")
+        .map(|id| {
+            format!(
+                "\"{}\"",
+                terms[id.expect("token row") as usize - 1].replace('"', "\"\"")
+            )
+        })
         .collect();
-    if terms.is_empty() {
-        "\"\"".to_owned()
+    if retained.is_empty() {
+        "\"\"".into()
     } else {
-        terms.join(" AND ")
+        retained.join(" AND ")
     }
 }

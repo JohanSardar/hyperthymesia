@@ -16,6 +16,8 @@ CREATE TABLE events (
  UNIQUE(connector_instance,source_key,revision)
 ) STRICT;
 CREATE INDEX events_time ON events(source_start,source_end);
+CREATE INDEX events_stills ON events(id) WHERE kind='media.still';
+CREATE INDEX events_recent_source ON events(connector_instance,kind,source_start DESC,id DESC);
 
 CREATE TABLE normalized (
  event_id INTEGER PRIMARY KEY REFERENCES events(id), normalizer_version TEXT NOT NULL,
@@ -52,14 +54,18 @@ CREATE TABLE event_blobs (
  event_id INTEGER REFERENCES events(id), sha256 TEXT REFERENCES blobs(sha256), PRIMARY KEY(event_id,sha256)
 ) STRICT;
 
+CREATE INDEX event_blobs_sha ON event_blobs(sha256,event_id);
+
 CREATE TABLE windows (
  start_at INTEGER PRIMARY KEY, end_at INTEGER NOT NULL, generation INTEGER NOT NULL DEFAULT 1,
  dirty INTEGER NOT NULL DEFAULT 1 CHECK(dirty IN (0,1)),
- timeline TEXT CHECK(timeline IS NULL OR json_valid(timeline)), compiler_version TEXT, compiled_generation INTEGER,
+ compiler_version TEXT, compiled_generation INTEGER,
  canonical_revision INTEGER REFERENCES revisions(id),
  input_changed_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec')*1000000 AS INTEGER)),
  empty_generation INTEGER, timeline_hash TEXT,
- revision24_finished INTEGER NOT NULL DEFAULT 0 CHECK(revision24_finished IN (0,1))
+ revision24_finished INTEGER NOT NULL DEFAULT 0 CHECK(revision24_finished IN (0,1)),
+ -- Keep scheduling metadata ahead of the large timeline payload.
+ timeline TEXT CHECK(timeline IS NULL OR json_valid(timeline))
 ) STRICT;
 CREATE TABLE revisions (
  id INTEGER PRIMARY KEY AUTOINCREMENT, start_at INTEGER NOT NULL REFERENCES windows(start_at),
@@ -109,6 +115,18 @@ CREATE TABLE jobs (
 CREATE INDEX jobs_ready ON jobs(state,available_at);
 CREATE INDEX jobs_window_generation ON jobs(window_start,generation);
 
+-- The allocator commits evidence IDs in writer order; source times may be late.
+CREATE TABLE ocr_scan_progress (
+ engine_version TEXT PRIMARY KEY, event_id INTEGER NOT NULL, sha256 TEXT NOT NULL
+) STRICT;
+CREATE TABLE ocr_pending_sources (
+ engine_version TEXT NOT NULL, source_event_id INTEGER NOT NULL REFERENCES events(id),
+ sha256 TEXT NOT NULL REFERENCES blobs(sha256),
+ settled INTEGER NOT NULL DEFAULT 0 CHECK(settled IN (0,1)),
+ PRIMARY KEY(engine_version,source_event_id,sha256)
+) STRICT;
+CREATE INDEX ocr_sources_active ON ocr_pending_sources(engine_version,source_event_id,sha256) WHERE NOT settled;
+CREATE INDEX ocr_sources_blob ON ocr_pending_sources(sha256,engine_version);
 CREATE TABLE ocr_jobs (
  sha256 TEXT NOT NULL REFERENCES blobs(sha256), engine_version TEXT NOT NULL,
  source_event_id INTEGER NOT NULL REFERENCES events(id),
@@ -118,6 +136,11 @@ CREATE TABLE ocr_jobs (
  result TEXT CHECK(result IS NULL OR json_valid(result)),
  PRIMARY KEY(sha256,engine_version)
 ) STRICT;
+-- Operator resets must reactivate sources even after discovery advanced past them.
+CREATE TRIGGER ocr_reset AFTER UPDATE OF status ON ocr_jobs
+WHEN NEW.status='pending' AND OLD.status IN ('failed','sampled') BEGIN
+ UPDATE ocr_pending_sources SET settled=0 WHERE sha256=NEW.sha256 AND engine_version=NEW.engine_version;
+END;
 CREATE TABLE ocr_evidence (
  id INTEGER PRIMARY KEY, observation_id TEXT NOT NULL UNIQUE,
  source_event_id INTEGER NOT NULL REFERENCES events(id),

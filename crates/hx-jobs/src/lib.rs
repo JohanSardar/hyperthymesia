@@ -52,18 +52,40 @@ pub async fn claim(store: &hx_store::Store, lease_seconds: i64) -> Result<Option
     }))
 }
 pub async fn heartbeat(store: &hx_store::Store, job: &Job, seconds: i64) -> Result<bool> {
+    hx_store::retry_busy("heartbeat", |waited| {
+        heartbeat_attempt(store, job, seconds, waited)
+    })
+    .await
+}
+async fn heartbeat_attempt(
+    store: &hx_store::Store,
+    job: &Job,
+    seconds: i64,
+    waited: bool,
+) -> Result<bool> {
     let mut tx = store.begin_write().await?;
     let now = Ts::now();
-    let changed = sqlx::query("UPDATE jobs SET lease_until=$3 WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>$4")
-        .bind(job.id).bind(&job.owner).bind(Ts(now.0+seconds*1_000_000)).bind(now).execute(&mut *tx).await?.rows_affected()==1;
+    let changed = sqlx::query("UPDATE jobs SET lease_until=$3 WHERE id=$1 AND lease_owner=$2 AND state='running' AND (lease_until>$4 OR $5)")
+        .bind(job.id).bind(&job.owner).bind(Ts(now.0+seconds*1_000_000)).bind(now).bind(waited).execute(&mut *tx).await?.rows_affected()==1;
     tx.commit().await?;
     Ok(changed)
 }
 pub async fn finish(store: &hx_store::Store, job: &Job, error: Option<&str>) -> Result<bool> {
+    hx_store::retry_busy("finish job", |waited| {
+        finish_attempt(store, job, error, waited)
+    })
+    .await
+}
+async fn finish_attempt(
+    store: &hx_store::Store,
+    job: &Job,
+    error: Option<&str>,
+    waited: bool,
+) -> Result<bool> {
     let mut tx = store.begin_write().await?;
     let now = Ts::now();
-    let state: Option<String> = sqlx::query_scalar("UPDATE jobs SET state=CASE WHEN $3 IS NULL THEN CASE WHEN request_version>leased_version THEN 'ready' ELSE 'done' END WHEN request_version>leased_version THEN 'ready' WHEN attempts>=max_attempts THEN 'failed' ELSE 'ready' END,attempts=CASE WHEN request_version>leased_version AND kind<>'interpret' THEN 0 ELSE attempts END,last_error=$3,available_at=CASE WHEN request_version>leased_version THEN $4 WHEN $3 IS NOT NULL AND attempts>=max_attempts THEN $4+300000000 ELSE $4+5000000 END,lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND lease_until>$4 RETURNING state")
-        .bind(job.id).bind(&job.owner).bind(error).bind(now).fetch_optional(&mut *tx).await?;
+    let state: Option<String> = sqlx::query_scalar("UPDATE jobs SET state=CASE WHEN $3 IS NULL THEN CASE WHEN request_version>leased_version THEN 'ready' ELSE 'done' END WHEN request_version>leased_version THEN 'ready' WHEN attempts>=max_attempts THEN 'failed' ELSE 'ready' END,attempts=CASE WHEN request_version>leased_version AND kind<>'interpret' THEN 0 ELSE attempts END,last_error=$3,available_at=CASE WHEN request_version>leased_version THEN $4 WHEN $3 IS NOT NULL AND attempts>=max_attempts THEN $4+300000000 ELSE $4+5000000 END,lease_until=NULL,lease_owner=NULL WHERE id=$1 AND lease_owner=$2 AND state='running' AND (lease_until>$4 OR $5) RETURNING state")
+        .bind(job.id).bind(&job.owner).bind(error).bind(now).bind(waited).fetch_optional(&mut *tx).await?;
     if state.as_deref() == Some("failed") && job.kind == "normalize" {
         quarantine_exhausted(&mut tx, std::slice::from_ref(&job.payload), now).await?;
     }
@@ -102,6 +124,21 @@ pub trait Handler: Send + Sync {
     fn handle(&self, job: &Job) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 pub async fn run_one<H: Handler>(store: &hx_store::Store, handler: &H) -> Result<bool> {
+    run_one_interval(store, handler, std::time::Duration::from_secs(30)).await
+}
+#[cfg(feature = "test-support")]
+pub async fn run_one_with_test_heartbeat<H: Handler>(
+    store: &hx_store::Store,
+    handler: &H,
+    interval: std::time::Duration,
+) -> Result<bool> {
+    run_one_interval(store, handler, interval).await
+}
+async fn run_one_interval<H: Handler>(
+    store: &hx_store::Store,
+    handler: &H,
+    interval: std::time::Duration,
+) -> Result<bool> {
     let Some(job) = claim(store, 120).await? else {
         return Ok(false);
     };
@@ -110,8 +147,19 @@ pub async fn run_one<H: Handler>(store: &hx_store::Store, handler: &H) -> Result
     let result = loop {
         tokio::select! {
             result=&mut future=>break result,
-            _=tokio::time::sleep(std::time::Duration::from_secs(30))=>{
-                if !heartbeat(store,&job,120).await? {return Ok(true)}
+            _=tokio::time::sleep(interval)=>{
+                let renewal = heartbeat(store, &job, 120);
+                tokio::pin!(renewal);
+                // Keep draining provider I/O and polling its deadlines while a
+                // renewal waits for the writer. Retain completed output until
+                // this renewal finishes, so finish sees a fresh lease too.
+                tokio::select! {
+                    owned = &mut renewal => if !owned? { return Ok(true) },
+                    result = &mut future => {
+                        if !renewal.await? { return Ok(true) }
+                        break result;
+                    }
+                }
             }
         }
     };

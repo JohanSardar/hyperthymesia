@@ -82,8 +82,13 @@ impl Store {
         generation: i64,
         identity: &Value,
     ) -> Result<bool> {
-        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM revisions WHERE start_at=$1 AND input_generation=$2 AND interpretation->'input_manifest'->'input_generation' IS $3->'input_generation' AND interpretation->'input_manifest'->'prompt_version' IS $3->'prompt_version' AND interpretation->'input_manifest'->'provider' IS $3->'provider' AND interpretation->'input_manifest'->'sensitive_egress' IS $3->'sensitive_egress' AND interpretation->'input_manifest'->'disclosure_policy'->'digest' IS $3->'disclosure_policy'->'digest')").bind(Ts::from(start)).bind(generation).bind(identity).fetch_one(&self.pool).await?)
+        let manifests: Vec<Value> = sqlx::query_scalar("SELECT interpretation->'input_manifest' FROM revisions WHERE start_at=$1 AND input_generation=$2 AND json_type(interpretation,'$.input_manifest')='object'")
+            .bind(Ts::from(start)).bind(generation).fetch_all(&self.pool).await?;
+        Ok(manifests
+            .iter()
+            .any(|stored| crate::persistence::json_contains(stored, identity)))
     }
+
     pub async fn interpretation_ready_at(
         &self,
         start: DateTime<Utc>,

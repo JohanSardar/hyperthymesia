@@ -94,7 +94,14 @@ impl Store {
         sqlx::query_scalar("SELECT connector_instance FROM events WHERE id=$1 UNION ALL SELECT e.connector_instance FROM ocr_evidence d JOIN events e ON e.id=d.source_event_id WHERE d.id=$1").bind(id).fetch_optional(&self.pool).await
     }
     pub async fn recent_source_records(&self) -> Result<Vec<SourceRecord>> {
-        sqlx::query_as("SELECT id,envelope FROM (SELECT id,envelope,connector_instance,kind,row_number() OVER (PARTITION BY connector_instance,kind ORDER BY source_start DESC,id DESC) AS rn FROM events) WHERE rn=1 ORDER BY connector_instance,kind LIMIT 2000").fetch_all(&self.pool).await
+        // Seek the next kind within this connector, then the next connector.
+        // A single tuple inequality only seeks the first index column in SQLite
+        // and still walks every earlier kind's history within that connector.
+        sqlx::query_as("WITH RECURSIVE latest(id,connector_instance,kind) AS (
+            SELECT id,connector_instance,kind FROM (SELECT id,connector_instance,kind FROM events INDEXED BY events_recent_source ORDER BY connector_instance,kind,source_start DESC,id DESC LIMIT 1)
+            UNION ALL
+            SELECT e.id,e.connector_instance,e.kind FROM latest previous JOIN events e ON e.id=coalesce((SELECT id FROM events INDEXED BY events_recent_source WHERE connector_instance=previous.connector_instance AND kind>previous.kind ORDER BY kind,source_start DESC,id DESC LIMIT 1),(SELECT id FROM events INDEXED BY events_recent_source WHERE connector_instance>previous.connector_instance ORDER BY connector_instance,kind,source_start DESC,id DESC LIMIT 1)) LIMIT 2000
+        ) SELECT e.id,e.envelope FROM latest JOIN events e ON e.id=latest.id ORDER BY latest.connector_instance,latest.kind").fetch_all(&self.pool).await
     }
     pub async fn owner_utc_offset(&self) -> Result<Option<i32>> {
         sqlx::query_scalar(

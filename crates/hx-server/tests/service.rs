@@ -231,7 +231,6 @@ fn doctor_needs_no_database_or_model() {
             .arg("doctor")
             .env_clear()
             .env("HOME", &root)
-            .env("DATABASE_URL", "not-a-database")
             .env("HX_FX_BINARY", binary)
             .env("HX_FX_CREDENTIAL", credential)
             .env("HX_PROVIDER", if case == "stub" { "stub" } else { "fx" })

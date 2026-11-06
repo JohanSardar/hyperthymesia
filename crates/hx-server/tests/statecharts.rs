@@ -983,7 +983,7 @@ time.sleep(10)
 // PR #44 review regressions. All data is synthetic and providers are local fakes.
 #[tokio::test]
 async fn review_legacy_windows_do_not_buy_a_24h_rerun() {
-    let f = Fixture::through_migration(9).await;
+    let f = Fixture::legacy_admission_fixture().await;
     let old = window();
     let recent = hx_store::window_at(Utc::now() - chrono::Duration::hours(4));
     for w in [old, recent] {
@@ -993,7 +993,7 @@ async fn review_legacy_windows_do_not_buy_a_24h_rerun() {
             .await
             .unwrap();
     }
-    f.store.migrate().await.unwrap();
+    f.store.apply_legacy_admission_fixture().await.unwrap();
     assert!(
         f.store
             .interpretation_state(old)
@@ -1491,7 +1491,7 @@ async fn review_deferred_sweep_releases_its_unspent_start_but_not_future_days() 
 
 #[tokio::test]
 async fn cap_upgrade_never_interpreted_backlog_uses_only_the_sweep() {
-    let f = Fixture::through_migration(9).await;
+    let f = Fixture::legacy_admission_fixture().await;
     for hour in [0, 8, 16] {
         let w = hx_store::window_at(event("at", hour).time.observed_at);
         ingest(&f.store, vec![event(&format!("legacy-{hour}"), hour)]).await;
@@ -1507,7 +1507,7 @@ async fn cap_upgrade_never_interpreted_backlog_uses_only_the_sweep() {
                 .unwrap();
         }
     }
-    f.store.migrate().await.unwrap();
+    f.store.apply_legacy_admission_fixture().await.unwrap();
     let runner = hx_server::processing::Runner {
         store: f.store.clone(),
         provider: Counts::default(),
@@ -2081,4 +2081,190 @@ async fn ingest_succeeds_while_interpretation_is_running() {
     );
     assert!(outcome.is_ok(), "{outcome:?}");
     store.pool.close().await;
+}
+
+#[tokio::test]
+async fn writer_stall_past_busy_timeout_buys_no_second_run() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration as Wait, sleep, timeout},
+    };
+    struct BlockedProvider {
+        calls: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        returned: Arc<Notify>,
+    }
+    impl hx_interpret::Provider for BlockedProvider {
+        fn name(&self) -> String {
+            "synthetic-writer-stall".into()
+        }
+        async fn complete(&self, _: &str, _: &str) -> Result<String, hx_interpret::InterpretError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            self.returned.notify_one();
+            Ok(json!({"episodes":[],"tasks":[],"summary":"Synthetic"}).to_string())
+        }
+    }
+    struct PaidHandler {
+        store: Store,
+        window: Interval,
+        provider: BlockedProvider,
+        finished: Arc<Notify>,
+        finish_release: Arc<Notify>,
+        block_finish: bool,
+    }
+    impl hx_jobs::Handler for PaidHandler {
+        async fn handle(&self, _: &hx_jobs::Job) -> anyhow::Result<()> {
+            hx_server::processing::interpret_window(&self.store, self.window, &self.provider)
+                .await?;
+            self.finished.notify_one();
+            if self.block_finish {
+                self.finish_release.notified().await;
+            }
+            Ok(())
+        }
+    }
+    for stage in ["publish", "finish", "heartbeat"] {
+        let f = Fixture::new().await;
+        // Only this synthetic pool has a short timeout; production stays 30s.
+        let options = f
+            .store
+            .pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .busy_timeout(Wait::from_millis(30));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let store = Store::new(pool, &f.store.data_dir);
+        let w = window();
+        ingest(&store, vec![event("writer-stall", 8)]).await;
+        store.normalize_window(w).await.unwrap();
+        store.delete_jobs().await.unwrap();
+        hx_jobs::enqueue(
+            &store,
+            "synthetic-paid",
+            "interpret",
+            json!({"window":w}),
+            false,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let returned = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let finish_release = Arc::new(Notify::new());
+        let handler = Arc::new(PaidHandler {
+            store: store.clone(),
+            window: w,
+            provider: BlockedProvider {
+                calls: calls.clone(),
+                started: started.clone(),
+                release: release.clone(),
+                returned: returned.clone(),
+            },
+            finished: finished.clone(),
+            finish_release: finish_release.clone(),
+            block_finish: stage == "finish",
+        });
+        let runner_store = store.clone();
+        let runner = handler.clone();
+        let interval = if stage == "heartbeat" {
+            Wait::from_millis(20)
+        } else {
+            Wait::from_secs(60)
+        };
+        let mut worker = tokio::spawn(async move {
+            hx_jobs::run_one_with_test_heartbeat(&runner_store, &*runner, interval).await
+        });
+        timeout(Wait::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        if stage == "finish" {
+            release.notify_one();
+            timeout(Wait::from_secs(3), finished.notified())
+                .await
+                .unwrap();
+        }
+        let mut gate = f.store.begin_write().await.unwrap();
+        if stage != "publish" {
+            sqlx::query("UPDATE jobs SET lease_until=$1")
+                .bind(hx_store::Ts(hx_store::Ts::now().0 + 100_000))
+                .execute(&mut *gate)
+                .await
+                .unwrap();
+        }
+        if stage == "publish" {
+            release.notify_one();
+        }
+        if stage == "finish" {
+            finish_release.notify_one();
+        }
+        let provider_progressed = if stage == "heartbeat" {
+            sleep(Wait::from_millis(60)).await;
+            release.notify_one();
+            let progressed = timeout(Wait::from_millis(100), returned.notified())
+                .await
+                .is_ok();
+            sleep(Wait::from_millis(190)).await;
+            progressed
+        } else {
+            sleep(Wait::from_millis(250)).await;
+            true
+        };
+        let retained = !worker.is_finished();
+        gate.commit().await.unwrap();
+        if stage == "heartbeat" {
+            release.notify_one();
+        }
+        let result = timeout(Wait::from_secs(4), &mut worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            retained,
+            "{stage}: busy must retain the provider/result until the writer releases: {result:?}"
+        );
+        assert!(
+            provider_progressed,
+            "heartbeat contention must keep polling the provider"
+        );
+        assert!(result.unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{stage}");
+        assert_eq!(store.record_count("revisions").await.unwrap(), 1, "{stage}");
+        assert_eq!(
+            store.job_states().await.unwrap()[0].state,
+            "done",
+            "{stage}"
+        );
+        // Simulate a crash after publication but before acknowledgement: the
+        // reclaimed job must consult the durable identity before another buy.
+        sqlx::query("UPDATE jobs SET state='ready',available_at=$1")
+            .bind(hx_store::Ts::now())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        handler.finish_release.notify_one();
+        assert!(hx_jobs::run_one(&store, &*handler).await.unwrap());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "{stage}: reclaim must not buy again"
+        );
+        assert_eq!(store.record_count("revisions").await.unwrap(), 1);
+        store.pool.close().await;
+        f.close().await;
+    }
 }
