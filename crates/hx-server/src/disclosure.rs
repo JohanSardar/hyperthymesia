@@ -167,6 +167,49 @@ impl DisclosurePolicy {
     }
 }
 
+/// Grants are current owner state, outside the base policy's identity.
+pub async fn current(store: &hx_store::Store) -> Result<DisclosurePolicy> {
+    let mut policy = DisclosurePolicy::from_env()?;
+    policy.source_grants = store.source_grants().await?;
+    Ok(policy)
+}
+
+/// Prose is indivisible: an uncited source is still an input dependency.
+pub async fn revision_disclosable(
+    store: &hx_store::Store,
+    value: &serde_json::Value,
+    policy: &DisclosurePolicy,
+    sensitive: crate::processing::SensitiveEgress,
+) -> Result<bool> {
+    if value["input_manifest"]["disclosure_policy"]["digest"] != policy.digest()
+        || value["input_manifest"]["sensitive_egress"] != serde_json::json!(sensitive)
+        || input_namespaces(value)
+            .any(|ns| ns.starts_with("source:") && !policy.source_grants.contains(ns))
+    {
+        return Ok(false);
+    }
+    let ids = crate::mcp::revision_evidence(value);
+    Ok(ids.is_empty() || crate::mcp::owner_allowed_ids(store, policy, sensitive, &ids).await?)
+}
+pub(crate) fn input_namespaces(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+    value["input_manifest"]["input_namespaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+}
+/// Convert the store's transactional switch fence into a free deferred job.
+pub(crate) fn publish_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<hx_store::sources::SourceAccessChanged>()
+        .is_some()
+    {
+        hx_jobs::Deferred::InputChanged.into()
+    } else {
+        error
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

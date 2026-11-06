@@ -2322,3 +2322,594 @@ async fn pool_exhaustion_after_the_provider_keeps_the_paid_result() {
         .unwrap();
     assert_eq!(revisions, 1);
 }
+
+// P7: drive owner switches through HTTP; inspect durable jobs and broker output.
+async fn source_api(
+    store: &Store,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    source_api_as(store, method, path, body, &["source:", "macos-agent:"]).await
+}
+async fn source_api_as(
+    store: &Store,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+    prefixes: &[&str],
+) -> (u16, serde_json::Value) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let secret = store
+        .create_token(
+            "synthetic-owner",
+            prefixes.iter().map(|p| p.to_string()).collect(),
+            vec!["read_raw".into()],
+        )
+        .await
+        .unwrap();
+    let response = hx_server::router(
+        store.clone(),
+        hx_server::disclosure::DisclosurePolicy::laptop(),
+    )
+    .oneshot(
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {secret}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+async fn source_prior(store: &Store, before: chrono::DateTime<Utc>) -> serde_json::Value {
+    // Build independently from the stored switch, so this fixture does not rely
+    // on the production policy loader that the API/worker must use.
+    let mut policy = hx_server::disclosure::DisclosurePolicy::laptop();
+    policy.source_grants = store.source_grants().await.unwrap();
+    hx_server::mcp::Broker::new(
+        store.clone(),
+        policy,
+        hx_server::processing::SensitiveEgress::Full,
+        hx_store::window_at(before),
+    )
+    .prior_context(before)
+    .await
+    .unwrap()
+}
+async fn source_revision(store: &Store, w: Interval, namespaces: &[String], summary: &str) -> i64 {
+    let g = store.generation(w).await.unwrap();
+    store.publish_revision_manifest(w, g, json!({"episodes":[],"tasks":[{"id":"synthetic-task","title":"Synthetic task","description":"Synthetic","intervals":[],"episode_ids":[],"confidence":0.5,"open":true}],"summary":summary,
+        "input_manifest":{"input_namespaces":namespaces,"sensitive_egress":"full","disclosure_policy":{"digest":hx_server::disclosure::DisclosurePolicy::laptop().digest()}},
+        "agent_run":{"evidence":{},"calls":[]}}), summary, namespaces).await.unwrap().0
+}
+#[tokio::test]
+async fn source_connect_preserves_history_without_interpret_jobs() {
+    let f = Fixture::new().await;
+    let w = window();
+    let prior = source_revision(&f.store, w, &[], "synthetic legacy history").await;
+    let generation = f.store.generation(w).await.unwrap();
+    let before_connect = hx_server::processing::prepare_input(&f.store, w, "stub")
+        .await
+        .unwrap()
+        .packet
+        .input_digest;
+    let key = "invented-p7-secret";
+    let rejected = source_api(
+        &f.store,
+        "POST",
+        "/v1/sources",
+        json!({"name":"synthetic", "description":format!("contains {key}"), "key":key}),
+    )
+    .await;
+    assert_eq!(rejected.0, 400);
+    assert!(f.store.sources().await.unwrap().is_empty());
+    assert_eq!(
+        source_api_as(&f.store, "GET", "/v1/sources", json!({}), &["source:abc"])
+            .await
+            .0,
+        403
+    );
+    let (status, connected) = source_api(
+        &f.store,
+        "POST",
+        "/v1/sources",
+        json!({"name":"synthetic", "description":"fake API", "key":key}),
+    )
+    .await;
+    let after_connect = hx_server::processing::prepare_input(&f.store, w, "stub")
+        .await
+        .unwrap()
+        .packet
+        .input_digest;
+    assert_eq!(
+        before_connect, after_connect,
+        "an unrelated grant must not change packet identity"
+    );
+    assert_eq!(status, 201);
+    let id = connected["id"].as_str().unwrap();
+    assert_eq!(connected["connector_instance"], format!("source:{id}"));
+    assert_eq!(connected["status"], "setting_up");
+    assert!(!connected.to_string().contains(key));
+    let listed = source_api(&f.store, "GET", "/v1/sources", json!({})).await;
+    assert_eq!(listed.0, 200);
+    assert_eq!(listed.1[0]["has_key"], true);
+    assert!(!listed.1.to_string().contains(key));
+    assert_eq!(
+        std::fs::read_to_string(f.store.data_dir.join(format!("secrets/{id}.key"))).unwrap(),
+        key
+    );
+    assert_eq!(
+        source_prior(&f.store, w.end).await["revisions"][0]["revision_id"],
+        prior
+    );
+    assert_eq!(f.store.generation(w).await.unwrap(), generation);
+    let jobs = f.store.job_states().await.unwrap();
+    assert_eq!(jobs.iter().filter(|j| j.kind == "setup").count(), 1);
+    assert_eq!(jobs.iter().filter(|j| j.kind == "interpret").count(), 0);
+    assert_eq!(
+        source_api(
+            &f.store,
+            "POST",
+            &format!("/v1/sources/{id}/setup"),
+            json!({})
+        )
+        .await
+        .0,
+        202
+    );
+    for path in ["/v1/recipes", "/v1/addons", "/v1/agent-tables"] {
+        assert_eq!(
+            source_api(&f.store, "GET", &format!("{path}?source={id}"), json!({})).await,
+            (200, json!([]))
+        );
+    }
+    let recipe = serde_json::from_value(json!({"source":id,"name":"synthetic pull","request":{"kind":"http","method":"GET","url":"https://example.invalid/messages"},"items":"/messages","kind":"source.document","map":{"id":"/id","title":"/title"},"time_format":"rfc3339"})).unwrap();
+    let recipe = f.store.save_recipe(id, &recipe).await.unwrap();
+    let addon = f
+        .store
+        .save_addon(id, "synthetic-note", "Synthetic note")
+        .await
+        .unwrap();
+    for (path, target) in [("recipes", &recipe.id), ("addons", &addon.id)] {
+        let list = source_api(
+            &f.store,
+            "GET",
+            &format!("/v1/{path}?source={id}"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(list.0, 200);
+        assert_eq!(list.1[0]["id"], *target);
+        assert_eq!(
+            source_api(
+                &f.store,
+                "PATCH",
+                &format!("/v1/{path}/{target}"),
+                json!({"enabled":false})
+            )
+            .await
+            .0,
+            200
+        );
+        // Setup re-saving the same stable identities cannot undo owner off.
+    }
+    f.store.save_recipe(id, &recipe.recipe.0).await.unwrap();
+    f.store
+        .save_addon(id, "synthetic-note", "Updated synthetic note")
+        .await
+        .unwrap();
+    assert!(f.store.recipes(Some(id)).await.unwrap()[0].owner_off);
+    assert!(f.store.addons(Some(id)).await.unwrap()[0].owner_off);
+    assert_eq!(
+        source_api(
+            &f.store,
+            "PATCH",
+            &format!("/v1/sources/{id}"),
+            json!({"key":"replacement-synthetic-key"})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.store.data_dir.join(format!("secrets/{id}.key"))).unwrap(),
+        "replacement-synthetic-key"
+    );
+    assert_eq!(
+        source_api(
+            &f.store,
+            "PATCH",
+            "/v1/sources/not-an-id",
+            json!({"enabled":false})
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        source_api(
+            &f.store,
+            "PATCH",
+            "/v1/sources/00000000000000000000000000",
+            json!({"enabled":false})
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        f.store
+            .job_states()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|j| j.kind == "interpret")
+            .count(),
+        0
+    );
+    use sqlx::Connection;
+    let mut agent = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new().filename(f.store.data_dir.join("agent.sqlite")),
+    )
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE s_{id}_notes (body TEXT)"
+    )))
+    .execute(&mut agent)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO s_{id}_notes VALUES ('synthetic private row')"
+    )))
+    .execute(&mut agent)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE outside_source (body TEXT)")
+        .execute(&mut agent)
+        .await
+        .unwrap();
+    assert_eq!(
+        source_api(
+            &f.store,
+            "GET",
+            &format!("/v1/agent-tables?source={id}"),
+            json!({})
+        )
+        .await,
+        (200, json!([{"name":format!("s_{id}_notes"),"row_count":1}]))
+    );
+    agent.close().await.unwrap();
+    f.close().await;
+}
+#[tokio::test]
+async fn source_off_hides_uncited_and_inherited_context() {
+    let f = Fixture::new().await;
+    let w = window();
+    let source = f
+        .store
+        .connect_source("synthetic", "fake", 1)
+        .await
+        .unwrap();
+    let evidence = ingest_source(&f.store, &source.connector_instance, w).await;
+    let mut policy = hx_server::disclosure::DisclosurePolicy::laptop();
+    policy
+        .source_grants
+        .insert(source.connector_instance.clone());
+    let reading = hx_server::mcp::Broker::new(
+        f.store.clone(),
+        policy,
+        hx_server::processing::SensitiveEgress::Full,
+        w,
+    );
+    let read = reading
+        .call("read_evidence", json!({"id":evidence}))
+        .await
+        .unwrap();
+    assert!(read.to_string().contains("Synthetic source title"));
+    let namespaces: Vec<_> = reading
+        .audit
+        .lock()
+        .await
+        .input_namespaces
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(namespaces, vec![source.connector_instance.clone()]);
+    let direct = source_revision(&f.store, w, &namespaces, "synthetic uncited source prose").await;
+    let mut policy = hx_server::disclosure::DisclosurePolicy::laptop();
+    policy
+        .source_grants
+        .insert(source.connector_instance.clone());
+    let next = hx_store::window_at(w.end);
+    let broker = hx_server::mcp::Broker::new(
+        f.store.clone(),
+        policy,
+        hx_server::processing::SensitiveEgress::Full,
+        next,
+    );
+    let prior = broker.call("prior_context", json!({})).await.unwrap();
+    assert_eq!(prior["revisions"][0]["revision_id"], direct);
+    assert_eq!(prior["revisions"][0]["input_namespaces"], json!(namespaces));
+    let inherited: Vec<_> = broker
+        .audit
+        .lock()
+        .await
+        .input_namespaces
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(inherited, namespaces);
+    let derived = source_revision(&f.store, next, &inherited, "synthetic inherited prose").await;
+    let prepared =
+        hx_server::processing::prepare_input(&f.store, hx_store::window_at(next.end), "stub")
+            .await
+            .unwrap();
+    assert_eq!(prepared.namespaces, namespaces);
+
+    let reader = Token {
+        prefixes: vec!["source:".into()],
+        scopes: vec!["read_l3".into()],
+    };
+    let visible = hx_server::timeline_value(
+        &f.store,
+        &reader,
+        &hx_server::disclosure::DisclosurePolicy::laptop(),
+        Interval {
+            start: w.start,
+            end: next.end,
+        },
+        "episodes",
+    )
+    .await
+    .unwrap();
+    assert_eq!(visible["revisions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        source_api(
+            &f.store,
+            "GET",
+            &format!("/revision/{derived}/run"),
+            json!({})
+        )
+        .await
+        .0,
+        200
+    );
+    let partial = Token {
+        prefixes: vec![source.connector_instance[..source.connector_instance.len() - 1].into()],
+        scopes: vec!["read_l3".into()],
+    };
+    assert_eq!(
+        hx_server::timeline_value(
+            &f.store,
+            &partial,
+            &hx_server::disclosure::DisclosurePolicy::laptop(),
+            Interval {
+                start: w.start,
+                end: next.end
+            },
+            "episodes"
+        )
+        .await
+        .unwrap()["revisions"],
+        json!([])
+    );
+    let (status, _) = source_api(
+        &f.store,
+        "PATCH",
+        &format!("/v1/sources/{}", source.id),
+        json!({"enabled":false}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        source_prior(&f.store, next.end).await["revisions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let reader = Token {
+        prefixes: vec!["source:".into()],
+        scopes: vec!["read_l3".into()],
+    };
+    let range = Interval {
+        start: w.start,
+        end: next.end,
+    };
+    let timeline = hx_server::timeline_value(
+        &f.store,
+        &reader,
+        &hx_server::disclosure::DisclosurePolicy::laptop(),
+        range,
+        "episodes",
+    )
+    .await
+    .unwrap();
+    assert_eq!(timeline["revisions"], json!([]));
+    let owner = Token {
+        scopes: vec!["read_raw".into()],
+        ..reader
+    };
+    assert_eq!(
+        hx_server::timeline_value(
+            &f.store,
+            &owner,
+            &hx_server::disclosure::DisclosurePolicy::laptop(),
+            range,
+            "episodes"
+        )
+        .await
+        .unwrap()["revisions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    for id in [direct, derived] {
+        assert_eq!(
+            source_api(&f.store, "GET", &format!("/revision/{id}/run"), json!({}))
+                .await
+                .0,
+            404
+        );
+    }
+    // A namespace with no source row has no grant either.
+    source_revision(
+        &f.store,
+        hx_store::window_at(next.end),
+        &["source:unregistered".into()],
+        "synthetic ungranted prose",
+    )
+    .await;
+    assert!(
+        source_prior(&f.store, next.end + chrono::Duration::hours(4)).await["revisions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    f.close().await;
+}
+#[tokio::test]
+async fn source_on_again_queues_nothing_and_keeps_history() {
+    let f = Fixture::new().await;
+    let source = f
+        .store
+        .connect_source("synthetic", "fake", 1)
+        .await
+        .unwrap();
+    let w = window();
+    let prior = source_revision(
+        &f.store,
+        w,
+        std::slice::from_ref(&source.connector_instance),
+        "synthetic retained source context",
+    )
+    .await;
+    let generation = f.store.generation(w).await.unwrap();
+    let jobs = f.store.job_states().await.unwrap().len();
+    for enabled in [false, true] {
+        assert_eq!(
+            source_api(
+                &f.store,
+                "PATCH",
+                &format!("/v1/sources/{}", source.id),
+                json!({"enabled":enabled})
+            )
+            .await
+            .0,
+            200
+        );
+        assert_eq!(f.store.job_states().await.unwrap().len(), jobs);
+        assert_eq!(f.store.generation(w).await.unwrap(), generation);
+        assert_eq!(
+            f.store
+                .job_states()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|j| j.kind == "interpret")
+                .count(),
+            0
+        );
+    }
+    assert_eq!(
+        source_prior(&f.store, w.end).await["revisions"][0]["revision_id"],
+        prior
+    );
+    f.close().await;
+}
+
+struct SwitchSourceOff {
+    store: Store,
+    id: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl hx_interpret::Provider for SwitchSourceOff {
+    fn name(&self) -> String {
+        "synthetic-switch-off".into()
+    }
+    async fn complete(&self, _: &str, _: &str) -> Result<String, hx_interpret::InterpretError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            source_api(
+                &self.store,
+                "PATCH",
+                &format!("/v1/sources/{}", self.id),
+                json!({"enabled":false})
+            )
+            .await
+            .0,
+            200
+        );
+        Ok(
+            json!({"episodes":[],"tasks":[],"summary":"Synthetic uncited source input"})
+                .to_string(),
+        )
+    }
+}
+async fn ingest_source(store: &Store, connector: &str, w: Interval) -> i64 {
+    let mut e = event("synthetic-source-record", 8);
+    e.connector_instance = ConnectorInstance::new(connector);
+    e.kind = Kind::new("source.document");
+    e.sensitivity = Sensitivity::Restricted;
+    e.payload = json!({"title":"Synthetic source title"});
+    e.time = ObservationTime::point(w.start);
+    let ack = store
+        .ingest(
+            UploadBatch {
+                batch_id: ulid::Ulid::generate(),
+                envelopes: vec![e],
+            },
+            &Token {
+                prefixes: vec![connector.into()],
+                scopes: vec!["ingest".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ack.rejected.is_empty());
+    store.normalize_window(w).await.unwrap();
+    store.observations(w, false).await.unwrap()[0].id
+}
+#[tokio::test]
+async fn source_off_during_run_defers_publication_and_next_start_is_free() {
+    let f = Fixture::new().await;
+    let source = f
+        .store
+        .connect_source("synthetic", "fake", 1)
+        .await
+        .unwrap();
+    let w = window();
+    ingest_source(&f.store, &source.connector_instance, w).await;
+    let provider = SwitchSourceOff {
+        store: f.store.clone(),
+        id: source.id,
+        calls: Default::default(),
+    };
+    let result = hx_server::processing::interpret_window(&f.store, w, &provider).await;
+    assert!(matches!(
+        result.unwrap_err().downcast_ref::<hx_jobs::Deferred>(),
+        Some(hx_jobs::Deferred::InputChanged)
+    ));
+    assert_eq!(
+        f.store.window_state(w).await.unwrap().canonical_revision,
+        None
+    );
+    assert!(
+        !hx_server::processing::interpret_window(&f.store, w, &provider)
+            .await
+            .unwrap()
+    );
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    f.close().await;
+}

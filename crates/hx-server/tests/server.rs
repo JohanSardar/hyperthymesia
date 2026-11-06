@@ -848,7 +848,8 @@ async fn api_withholds_canonical_revisions_citing_restricted_evidence() {
     ] {
         let interpretation = json!({
             "episodes":[{"evidence":[core_id],"claims":[{"outcome_evidence":[id]}]}],
-            "tasks":[],"summary":"synthetic stored interpretation"
+            "tasks":[],"summary":"synthetic stored interpretation",
+            "input_manifest":{"disclosure_policy":{"digest":policy.digest()},"sensitive_egress":"full"}
         });
         let generation = f.store.generation(w).await.unwrap();
         let (revision, published) = f

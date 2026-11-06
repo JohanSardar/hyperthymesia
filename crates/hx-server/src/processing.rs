@@ -118,7 +118,7 @@ pub(crate) async fn admit_visible_window(store: &Store, w: Interval) -> Result<b
         .collect();
     let broker = crate::mcp::Broker::new(
         store.clone(),
-        DisclosurePolicy::from_env()?,
+        crate::disclosure::current(store).await?,
         SensitiveEgress::from_env(),
         w,
     );
@@ -205,8 +205,9 @@ async fn interpret_window_key<P: Provider>(
         let mut value = serde_json::to_value(interpretation)?;
         value["input_manifest"] = manifest;
         Ok(store
-            .publish_revision_manifest(w, generation, value, output_key, &namespaces)
-            .await?
+            .publish_disclosed_revision_manifest(w, generation, value, output_key, &namespaces)
+            .await
+            .map_err(crate::disclosure::publish_error)?
             .1)
     }
     .await;
@@ -265,7 +266,7 @@ pub async fn prepare_input_with(
         w,
         provider_name,
         sensitive,
-        &DisclosurePolicy::from_env()?,
+        &crate::disclosure::current(store).await?,
     )
     .await
 }
@@ -295,6 +296,14 @@ pub async fn prepare_input_with_policy(
             if matches!(o.envelope.kind.as_str(), "policy.gap" | "media.chunk") {
                 return None;
             }
+            let is_source = o
+                .envelope
+                .connector_instance
+                .as_str()
+                .starts_with("source:");
+            if is_source && sensitive == SensitiveEgress::Redact {
+                return None;
+            }
             let effective_class = disclosure.effective_class(&o.envelope);
             let class = match (effective_class, sensitive) {
                 (Sensitivity::Normal, _) | (Sensitivity::Sensitive, SensitiveEgress::Full) => {
@@ -303,7 +312,8 @@ pub async fn prepare_input_with_policy(
                 (Sensitivity::Sensitive, SensitiveEgress::Redact) => "sensitive",
                 (Sensitivity::Restricted, _) => return None,
             };
-            (hx_schema::kinds::is_core(o.envelope.kind.as_str())
+            (is_source
+                || hx_schema::kinds::is_core(o.envelope.kind.as_str())
                 || o.envelope
                     .connector_instance
                     .as_str()
@@ -372,6 +382,16 @@ pub async fn prepare_input_with_policy(
             namespaces.insert(ns.to_owned());
         }
     }
+    for revision in prior["revisions"].as_array().into_iter().flatten() {
+        namespaces.extend(
+            revision["input_namespaces"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
     let namespaces: Vec<String> = namespaces.into_iter().collect();
     // Compile only the public evidence projection: captured strings never bypass egress policy.
     let safe_observations: Vec<_> = observations
@@ -386,8 +406,12 @@ pub async fn prepare_input_with_policy(
         .compiled_timeline_hash(w, generation)
         .await?
         .ok_or(Deferred::InputChanged)?;
-    let manifest = json!({"window":w,"timeline_hash":timeline_hash,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"disclosure_policy":{"version":POLICY_VERSION,"digest":disclosure.digest(),"policy":disclosure},"packet":packet,"input_namespaces":namespaces,"prior_revision_ids":prior["revisions"].as_array().into_iter().flatten().take(1).filter(|_| !packet.open_tasks.is_empty()).filter_map(|r| r["revision_id"].as_i64()).collect::<Vec<_>>()});
+    let mut manifest = json!({"window":w,"timeline_hash":timeline_hash,"overlap_window":expanded,"input_generation":generation,"compiler_version":hx_compile::COMPILER_VERSION,"normalizer_version":"normalize/v1","prompt_version":hx_interpret::PROMPT_VERSION,"provider":provider_name,"sensitive_egress":sensitive,"disclosure_policy":{"version":POLICY_VERSION,"digest":disclosure.digest(),"policy":disclosure},"packet":packet,"input_namespaces":namespaces,"prior_revision_ids":prior["revisions"].as_array().into_iter().flatten().take(1).filter(|_| !packet.open_tasks.is_empty()).filter_map(|r| r["revision_id"].as_i64()).collect::<Vec<_>>()});
     packet.input_digest = hx_store::hash(&serde_json::to_vec(&manifest)?);
+    // Informational grants cannot change a packet or run identity.
+    if !disclosure.source_grants.is_empty() {
+        manifest["source_grants"] = json!(disclosure.source_grants);
+    }
     Ok(PreparedInput {
         packet,
         manifest,
