@@ -366,5 +366,5 @@ pub async fn execute(
     }
     crate::scrub::Scrubber::new(secrets)
         .map_err(|_| RequestError::Invalid)
-        .map(|s| s.scrub_json(&value))
+        .map(|s| request.split_text(s.scrub_json(&value)))
 }

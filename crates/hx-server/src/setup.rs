@@ -10,7 +10,7 @@ use hx_sources::{
     host::HostRunner,
     keys::KeyStore,
     recipe::{MapContext, PullMapper, Recipe},
-    request::{MAX_TIMEOUT, Placeholders, RequestGate},
+    request::{MAX_TIMEOUT, Placeholders, RequestError, RequestGate},
 };
 use hx_store::Store;
 use serde_json::{Value, json};
@@ -85,6 +85,7 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
         let has_pull = !recipes.is_empty();
         let no_pull = result["no_pull"].as_str().is_some_and(|reason| !reason.trim().is_empty());
         ensure!(has_pull || no_pull, "setup saved no recipe and gave no no_pull reason");
+        ensure!(has_pull || !broker.audit.lock().await.key_refused, "source refused its key");
         ensure!(!broker.audit.lock().await.exhausted, "setup exhausted tool budget");
         ensure!(store.source(source).await?.is_some_and(|s| s.status != "needs_reconnect"), "source needs reconnect");
         // Store only a small, scrubbed owner-facing result, never arbitrary provider output.
@@ -98,10 +99,14 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(_) => {
-            if store
-                .source(source)
-                .await?
-                .is_some_and(|s| s.status == "needs_reconnect")
+            // A refused key with nothing saved won't improve on a second paid attempt.
+            let key_dead = broker.audit.lock().await.key_refused
+                && store.recipes(Some(source)).await?.is_empty();
+            if key_dead
+                || store
+                    .source(source)
+                    .await?
+                    .is_some_and(|s| s.status == "needs_reconnect")
             {
                 let message = "Login expired or missing. Reconnect this source on Connect sources.";
                 store
@@ -200,7 +205,11 @@ impl Broker {
                 MAX_TIMEOUT,
                 &host,
             )
-            .await?;
+            .await;
+        if key.is_some() && matches!(response, Err(RequestError::Status(401))) {
+            self.audit.lock().await.key_refused = true;
+        }
+        let response = response?;
         self.check_source(args).await?;
         let response = self
             .secret_filter()
