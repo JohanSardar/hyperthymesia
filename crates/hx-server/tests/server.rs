@@ -2299,7 +2299,8 @@ def rpc(method,params):
  req=urllib.request.Request(server['url'],data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['HX_MCP_TOKEN']})
  return json.load(urllib.request.urlopen(req))['result']
 rpc('initialize',{})
-assert len(rpc('tools/list',{})['tools'])==8
+assert len(rpc('tools/list',{})['tools'])==10
+assert server['operation_timeout_ms']==200000
 if mode=='digest':
  import re
  line=next(l for l in instr.splitlines() if l.startswith('[') and 'Synthetic Editor' in l)
