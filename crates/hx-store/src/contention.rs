@@ -2,14 +2,17 @@
 use std::{future::Future, time::Duration};
 
 pub fn is_busy(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let Some(sqlx::Error::Database(db)) = cause.downcast_ref::<sqlx::Error>() else {
-            return false;
-        };
-        db.code()
-            .and_then(|code| code.parse::<i32>().ok())
-            .is_some_and(|code| matches!(code & 255, 5 | 6))
-    })
+    error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::Database(db)) => db
+                .code()
+                .and_then(|code| code.parse::<i32>().ok())
+                .is_some_and(|code| matches!(code & 255, 5 | 6)),
+            // Every pooled connection queued behind the writer: the same stall.
+            Some(sqlx::Error::PoolTimedOut) => true,
+            _ => false,
+        })
 }
 /// Cancellation still stops the retry when its owning process/task stops.
 /// Only static operation names and wait durations are logged, never SQL/data.
