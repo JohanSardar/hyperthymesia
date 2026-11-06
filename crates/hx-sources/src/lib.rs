@@ -5,6 +5,7 @@
 pub mod host;
 pub mod keys;
 mod mcp;
+pub mod oauth;
 pub mod recipe;
 pub mod request;
 pub mod scrub;

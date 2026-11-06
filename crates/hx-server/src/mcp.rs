@@ -1055,7 +1055,7 @@ fn tool_schema(name: &str) -> (Value, Vec<&str>) {
             vec!["source", "name", "text"],
         ),
         "recipe_test" | "recipe_save" => (
-            json!({"source":source,"name":{"type":"string"},"request":request,"items":{"type":"string"},"kind":{"type":"string"},"map":{"type":"object"},"time_format":{"type":"string","enum":["rfc3339","unix_s","unix_ms"]},"cursor":{"type":["object","null"]},"pages":{"type":["object","null"]},"ignore":{"type":"array"},"reconnect_exit_codes":{"type":"array"}}),
+            json!({"source":source,"name":{"type":"string"},"request":request,"items":{"type":"string"},"kind":{"type":"string"},"map":{"type":"object"},"time_format":{"type":"string","enum":["rfc3339","unix_s","unix_ms"]},"cursor":{"type":["object","null"]},"pages":{"type":["object","null"]},"ignore":{"type":"array"},"reconnect_exit_codes":{"type":"array"},"detail":{"type":["object","null"]},"missing_items_empty":{"type":"boolean"}}),
             vec![
                 "source",
                 "name",
@@ -1093,6 +1093,7 @@ fn validate_arguments(mode: &RunMode, name: &str, args: &Value) -> Result<Option
         let matches_type = |kind: &str| match kind {
             "string" => value.is_string(),
             "integer" => value.is_i64() || value.is_u64(),
+            "boolean" => value.is_boolean(),
             "object" => value.is_object(),
             "array" => value.is_array(),
             "null" => value.is_null(),

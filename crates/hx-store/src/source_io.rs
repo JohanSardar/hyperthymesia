@@ -28,6 +28,10 @@ pub struct SourceExchange {
     pull_id: Option<String>,
     setup_generation: Option<i64>,
     cancelled: watch::Receiver<bool>,
+    cancel: watch::Sender<bool>,
+    deadline: Option<tokio::time::Instant>,
+    live: bool,
+    command: Option<String>,
 }
 
 impl Store {
@@ -49,7 +53,7 @@ impl Store {
             source: source.to_owned(),
             identity: identity.clone(),
             pull_id: pull_id.map(str::to_owned),
-            cancel,
+            cancel: cancel.clone(),
         });
         Ok(SourceExchange {
             store: self.clone(),
@@ -59,7 +63,39 @@ impl Store {
             pull_id: pull_id.map(str::to_owned),
             setup_generation,
             cancelled,
+            cancel,
+            deadline: None,
+            live: false,
+            command: None,
         })
+    }
+
+    /// Live lookups share the same off-switch registry and refresh lifecycle as
+    /// pulls. The synthetic recipe is never saved, mapped or scheduled.
+    pub fn live_exchange(
+        &self,
+        source: &str,
+        request: &hx_sources::request::Request,
+        generation: Option<i64>,
+    ) -> anyhow::Result<SourceExchange> {
+        let recipe = Recipe {
+            source: source.into(),
+            name: "live".into(),
+            request: request.clone(),
+            items: String::new(),
+            kind: "source.live".into(),
+            map: Default::default(),
+            time_format: hx_sources::recipe::TimeFormat::Rfc3339,
+            cursor: None,
+            pages: None,
+            ignore: vec![],
+            reconnect_exit_codes: vec![],
+            detail: None,
+            missing_items_empty: false,
+        };
+        let mut exchange = self.recipe_exchange(source, &recipe, None, generation)?;
+        exchange.live = true;
+        Ok(exchange)
     }
 
     pub(crate) async fn cancel_source_exchanges(&self, source: &str, recipe: Option<(&str, &str)>) {
@@ -94,7 +130,14 @@ impl RequestGate for SourceExchange {
     async fn check(&self) -> Result<(), RequestError> {
         self.check_state()
             .await
-            .map_err(|_| RequestError::Cancelled)
+            .map_err(|_| RequestError::Cancelled)?;
+        if self
+            .deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(RequestError::Transport);
+        }
+        Ok(())
     }
 }
 
@@ -110,6 +153,9 @@ impl SourceExchange {
                     .is_none_or(|generation| source.setup_generation == generation)),
             "source request cancelled"
         );
+        if self.live {
+            return Ok(());
+        }
         let recipes = self.store.recipes(Some(&self.source)).await?;
         for saved in &recipes {
             anyhow::ensure!(
@@ -129,27 +175,238 @@ impl SourceExchange {
         Ok(())
     }
 
-    /// Cancellation races the *whole* exchange, including response bodies and
-    /// child processes. The gate additionally checks SQLite before every later
-    /// HTTP request / stdio message. Polling catches switches from other opens
-    /// or processes while I/O is blocked; in-process switches signal immediately.
-    pub async fn execute(
-        self,
+    async fn page(
+        &self,
         values: Placeholders<'_>,
         timeout: Duration,
         host: &HostRunner,
     ) -> Result<Value, RequestError> {
-        let mut cancelled = self.cancelled.clone();
-        tokio::select! {
-            biased;
-            _ = cancelled.wait_for(|off| *off) => Err(RequestError::Cancelled),
-            _ = async {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    if self.check().await.is_err() { break; }
+        let source = self
+            .store
+            .source(&self.source)
+            .await
+            .map_err(|_| RequestError::Cancelled)?
+            .ok_or(RequestError::Cancelled)?;
+        let since = source.connected_at - chrono::Duration::days(source.history_days);
+        let until = chrono::Utc::now();
+        let bind_dates = |request: &hx_sources::request::Request| {
+            request
+                .bind("since", &since.to_rfc3339())?
+                .bind("since_unix", &since.timestamp().to_string())?
+                .bind("until", &until.to_rfc3339())
+        };
+        let keys = hx_sources::keys::KeyStore::new(&self.store.data_dir)
+            .map_err(|_| RequestError::MissingKey)?;
+        if let Some(command) = &self.command {
+            let key = keys
+                .read(&self.source)
+                .map_err(|_| RequestError::MissingKey)?;
+            // Owner-bound CLIs and OAuth are structured-only: bash must never
+            // bypass the pinned identity or expose an opaque credential bundle.
+            if self
+                .store
+                .source_cli(&self.source)
+                .await
+                .map_err(|_| RequestError::Transport)?
+                .is_some()
+                || key
+                    .as_deref()
+                    .map(hx_sources::oauth::Credential::parse)
+                    .transpose()?
+                    .flatten()
+                    .is_some()
+            {
+                return Err(RequestError::CliInvalid);
+            }
+            let env = key
+                .map(|key| std::collections::BTreeMap::from([("SOURCE_KEY".into(), key)]))
+                .unwrap_or_default();
+            self.check().await?;
+            let output = tokio::select! {
+                biased;
+                error = self.cancelled() => return Err(error),
+                output = host.run(command, &env, timeout) => output.map_err(|error| match error {
+                    hx_sources::host::HostError::Blocked(reason) => RequestError::HostBlocked(reason),
+                    hx_sources::host::HostError::Deadline => RequestError::HostDeadline,
+                    hx_sources::host::HostError::OutputLimit => RequestError::HostOutputLimit,
+                    hx_sources::host::HostError::Io(_) => RequestError::HostIo,
+                })?,
+            };
+            return Ok(
+                serde_json::json!({"exit_code":output.status.code(),"stdout":String::from_utf8_lossy(&output.stdout),"stderr":String::from_utf8_lossy(&output.stderr)}),
+            );
+        }
+        let request = bind_dates(&self.recipe.request)?;
+        self.authorize(&request, &source.description).await?;
+        let (request, host) = self
+            .store
+            .prepare_source_request(&self.source, &request, host)
+            .await
+            .map_err(|_| RequestError::CliInvalid)?;
+        let mut response = hx_sources::oauth::execute(
+            &keys,
+            &self.source,
+            &request,
+            values.cursor,
+            timeout,
+            &host,
+            self,
+        )
+        .await?;
+        if !self.live {
+            response = decode_response(&request, response);
+        }
+        if let Some(detail) = &self.recipe.detail {
+            let request = bind_dates(&detail.request)?;
+            self.authorize(&request, &source.description).await?;
+            let mut bytes = serde_json::to_vec(&response)
+                .map_err(|_| RequestError::Json)?
+                .len();
+            if let Some(items) = response
+                .pointer_mut(&self.recipe.items)
+                .and_then(Value::as_array_mut)
+            {
+                if items.len() > hx_sources::recipe::MAX_ITEMS_PER_PULL {
+                    return Err(RequestError::TooLarge);
                 }
-            } => Err(RequestError::Cancelled),
-            result = self.recipe.request.execute_guarded(values, timeout, host, &self) => result,
+                for item in items {
+                    let id = item
+                        .pointer(&detail.id)
+                        .and_then(Value::as_str)
+                        .filter(|id| id.len() <= 4096 && !id.contains("{{"))
+                        .ok_or(RequestError::Invalid)?;
+                    let request = request.bind("item", id)?;
+                    self.authorize(&request, &source.description).await?;
+                    let (request, detail_host) = self
+                        .store
+                        .prepare_source_request(&self.source, &request, &host)
+                        .await
+                        .map_err(|_| RequestError::CliInvalid)?;
+                    let answer = hx_sources::oauth::execute(
+                        &keys,
+                        &self.source,
+                        &request,
+                        None,
+                        timeout,
+                        &detail_host,
+                        self,
+                    )
+                    .await?;
+                    let answer = decode_response(&request, answer);
+                    let size = |value: &Value| {
+                        serde_json::to_vec(value)
+                            .map(|bytes| bytes.len())
+                            .map_err(|_| RequestError::Json)
+                    };
+                    bytes = bytes.saturating_sub(size(item)?) + size(&answer)?;
+                    if bytes > hx_sources::request::MAX_HTTP_RESPONSE_BYTES {
+                        return Err(RequestError::TooLarge);
+                    }
+                    *item = answer;
+                }
+            }
+        }
+        Ok(response)
+    }
+
+    async fn authorize(
+        &self,
+        request: &hx_sources::request::Request,
+        description: &str,
+    ) -> Result<(), RequestError> {
+        if let Some(cli) = self
+            .store
+            .source_cli(&self.source)
+            .await
+            .map_err(|_| RequestError::Transport)?
+        {
+            cli.pin(request).map(|_| ())
+        } else {
+            request.authorize(description)
         }
     }
+
+    pub async fn execute_bash(
+        mut self,
+        command: String,
+        timeout: Duration,
+        host: &HostRunner,
+    ) -> Result<Value, RequestError> {
+        self.command = Some(command);
+        self.execute(Placeholders::default(), timeout, host).await
+    }
+
+    /// Keep the registered exchange alive if its caller is dropped. Cancelling
+    /// resource I/O is immediate; an already-dispatched refresh has its own
+    /// bounded timeout and must durably save rotation before the switch returns.
+    pub async fn execute(
+        mut self,
+        values: Placeholders<'_>,
+        timeout: Duration,
+        host: &HostRunner,
+    ) -> Result<Value, RequestError> {
+        struct CancelOnDrop(watch::Sender<bool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.send_replace(true);
+            }
+        }
+        let _cancel = CancelOnDrop(self.cancel.clone());
+        self.deadline =
+            Some(tokio::time::Instant::now() + timeout.min(hx_sources::request::MAX_TIMEOUT));
+        let host = host.clone();
+        let cursor = values.cursor.map(str::to_owned);
+        tokio::spawn(async move {
+            let result = self
+                .page(
+                    Placeholders {
+                        key: None,
+                        cursor: cursor.as_deref(),
+                    },
+                    timeout,
+                    &host,
+                )
+                .await;
+            self.finish(result).await
+        })
+        .await
+        .map_err(|_| RequestError::Transport)?
+    }
+
+    async fn finish(&self, result: Result<Value, RequestError>) -> Result<Value, RequestError> {
+        if let Err(error) = &result
+            && self.pull_id.is_none()
+            && (error.needs_reconnect()
+                || matches!(error, RequestError::Exit(code) if self.recipe.reconnect_exit_codes.contains(code)))
+        {
+            self.store
+                .record_source_pull(
+                    &self.source,
+                    chrono::Utc::now(),
+                    true,
+                    Some("Login expired or missing. Reconnect this source on Connect sources."),
+                )
+                .await
+                .map_err(|_| RequestError::Transport)?;
+        }
+        result
+    }
+}
+
+/// Both list and detail MCP tool results use the same bounded JSON data decoder.
+fn decode_response(request: &hx_sources::request::Request, response: Value) -> Value {
+    if !matches!(request, hx_sources::request::Request::Mcp { .. }) {
+        return response;
+    }
+    response
+        .get("structuredContent")
+        .cloned()
+        .or_else(|| {
+            let content = response.get("content")?.as_array()?;
+            if content.len() != 1 {
+                return None;
+            }
+            serde_json::from_str(content[0].get("text")?.as_str()?).ok()
+        })
+        .unwrap_or(response)
 }
