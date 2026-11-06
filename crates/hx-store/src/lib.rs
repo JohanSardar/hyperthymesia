@@ -1,4 +1,5 @@
 //! Durable evidence, derived generations, credentials and content-addressed files.
+pub mod backup;
 pub mod sqlite;
 pub use sqlite::{Store, Ts, WriteTransaction};
 
