@@ -101,7 +101,7 @@ async fn token_guarded(
     config: &Config,
     fields: &[(&str, &str)],
     gate: &impl crate::request::RequestGate,
-    dispatched: &mut bool,
+    uncertain: &mut bool,
 ) -> Result<Value, RequestError> {
     config.validate()?;
     let mut form =
@@ -123,9 +123,19 @@ async fn token_guarded(
         .body(form.query().unwrap_or("").to_owned());
     gate.check().await?;
     // No cancellable await between this final check and dispatch.
-    *dispatched = true;
-    let mut response = request.send().await.map_err(|_| RequestError::Transport)?;
+    *uncertain = true;
+    let mut response = request.send().await.map_err(|error| {
+        // DNS, TCP and TLS connection failures occur before an HTTP request
+        // reaches the provider. Other send failures may have lost a rotation.
+        if error.is_connect() || error.is_dns() {
+            *uncertain = false;
+        }
+        RequestError::Transport
+    })?;
     if !response.status().is_success() {
+        // An explicit error status issues no token. Preserve its normal error
+        // classification so transient failures retry at the pull cadence.
+        *uncertain = false;
         return Err(if matches!(response.status().as_u16(), 400 | 401 | 403) {
             RequestError::Login
         } else {
@@ -222,7 +232,7 @@ async fn access_key(
         // The containing registered exchange owns this future independently of
         // its caller. Once dispatched, the bounded response and durable save
         // complete even if a switch or caller deadline occurs.
-        let mut dispatched = false;
+        let mut uncertain = false;
         let value = match token_guarded(
             &credential.config,
             &[
@@ -230,12 +240,12 @@ async fn access_key(
                 ("refresh_token", &credential.refresh_token),
             ],
             gate,
-            &mut dispatched,
+            &mut uncertain,
         )
         .await
         {
             Ok(value) => value,
-            Err(error) if !dispatched => {
+            Err(error) if !uncertain => {
                 credential.refresh_in_flight = false;
                 save(&credential)?;
                 return Err(error);
