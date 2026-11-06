@@ -60,18 +60,12 @@ fn keys(store: &Store) -> ApiResult<KeyStore> {
     })
 }
 pub(crate) async fn scrubber(store: &Store, extra: Option<&str>) -> ApiResult<Scrubber> {
-    let keys = keys(store)?;
-    let mut secrets = vec![];
-    for source in store.sources().await? {
-        if let Some(key) = keys.read(&source.id).map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "source key storage unavailable".into(),
-            )
-        })? {
-            secrets.push(key);
-        }
-    }
+    let mut secrets = keys(store)?.redaction_keys().map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "source key storage unavailable".into(),
+        )
+    })?;
     if let Some(key) = extra {
         secrets.push(key.to_owned());
     }

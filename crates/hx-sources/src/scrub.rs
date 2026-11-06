@@ -99,6 +99,11 @@ impl Scrubber {
                     })
                     .collect(),
             ),
+            Value::Number(number)
+                if self.contains_secret(&hx_schema::json::stored_number(number)) =>
+            {
+                Value::String(REDACTED.into())
+            }
             _ if self.contains_secret(&value.to_string()) => Value::String(REDACTED.into()),
             _ => value.clone(),
         }

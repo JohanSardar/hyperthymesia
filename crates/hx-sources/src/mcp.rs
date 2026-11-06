@@ -29,6 +29,11 @@ fn lookup(tool: &str, arguments: Value) -> Value {
     if tool == "tools/list" {
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
     } else {
+        let arguments = if arguments.is_null() {
+            json!({})
+        } else {
+            arguments
+        };
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":arguments}})
     }
 }

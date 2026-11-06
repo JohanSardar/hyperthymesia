@@ -495,7 +495,11 @@ async fn cli_dispatch_and_reconnect_codes_and_mcp_transport_are_honest() {
         .unwrap();
     recipe.request = Request::Mcp {
         transport: McpTransport::Stdio {
-            argv: vec!["never-spawn-this-program".into()],
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "read request; printf 'not-json\\n'".into(),
+            ],
         },
         tool: "messages".into(),
         arguments: json!({}),
@@ -507,7 +511,7 @@ async fn cli_dispatch_and_reconnect_codes_and_mcp_transport_are_honest() {
         .unwrap();
     assert_eq!(
         report.error.as_deref(),
-        Some("MCP transport is not implemented (P16)")
+        Some("MCP exchange failed or returned an invalid response")
     );
     assert!(f.requests.lock().unwrap().is_empty());
 }
