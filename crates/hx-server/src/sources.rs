@@ -10,7 +10,7 @@ use hx_store::{Store, sources::Source};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-async fn owner(store: &Store, headers: &HeaderMap) -> ApiResult<()> {
+pub(crate) async fn owner(store: &Store, headers: &HeaderMap) -> ApiResult<()> {
     let token = auth(store, headers, "read_raw").await?;
     if !token.allows("source:") {
         return Err(ApiError(
@@ -59,19 +59,13 @@ fn keys(store: &Store) -> ApiResult<KeyStore> {
         )
     })
 }
-async fn scrubber(store: &Store, extra: Option<&str>) -> ApiResult<Scrubber> {
-    let keys = keys(store)?;
-    let mut secrets = vec![];
-    for source in store.sources().await? {
-        if let Some(key) = keys.read(&source.id).map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "source key storage unavailable".into(),
-            )
-        })? {
-            secrets.push(key);
-        }
-    }
+pub(crate) async fn scrubber(store: &Store, extra: Option<&str>) -> ApiResult<Scrubber> {
+    let mut secrets = keys(store)?.redaction_keys().map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "source key storage unavailable".into(),
+        )
+    })?;
     if let Some(key) = extra {
         secrets.push(key.to_owned());
     }
@@ -85,29 +79,8 @@ async fn scrubber(store: &Store, extra: Option<&str>) -> ApiResult<Scrubber> {
         ),
     })
 }
-fn scrub_value(value: &mut Value, scrubber: &Scrubber) {
-    match value {
-        Value::String(text) => *text = scrubber.scrub(text),
-        Value::Array(items) => {
-            for item in items {
-                scrub_value(item, scrubber);
-            }
-        }
-        Value::Object(items) => {
-            *items = std::mem::take(items)
-                .into_iter()
-                .map(|(key, mut value)| {
-                    scrub_value(&mut value, scrubber);
-                    (scrubber.scrub(&key), value)
-                })
-                .collect();
-        }
-        _ => {}
-    }
-}
-async fn safe(store: &Store, mut value: Value) -> ApiResult<Json<Value>> {
-    scrub_value(&mut value, &scrubber(store, None).await?);
-    Ok(Json(value))
+async fn safe(store: &Store, value: Value) -> ApiResult<Json<Value>> {
+    Ok(Json(scrubber(store, None).await?.scrub_json(&value)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,7 +100,8 @@ pub async fn connect(
     request: Result<Json<Connect>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     owner(&store, &headers).await?;
-    let request = body(request)?;
+    let mut request = body(request)?;
+    request.key = request.key.filter(|key| !key.is_empty());
     if request.name.trim().is_empty()
         || request.name.len() > 200
         || request.name.chars().any(char::is_control)

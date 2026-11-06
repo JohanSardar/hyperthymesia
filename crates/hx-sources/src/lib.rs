@@ -4,6 +4,7 @@
 #[cfg(unix)]
 pub mod host;
 pub mod keys;
+mod mcp;
 pub mod recipe;
 pub mod request;
 pub mod scrub;

@@ -80,11 +80,8 @@ impl HostRunner {
             .set_language(&tree_sitter_bash::LANGUAGE.into())
             .ok()?;
         let tree = parser.parse(source, None)?;
-        // Best-effort accident guard: unsupported or unparseable shell must run.
-        // Rejecting it would turn ordinary source commands into source failures.
-        if tree.root_node().has_error() {
-            return None;
-        }
+        // Bash may execute complete commands before a later syntax error.
+        // Inspect the recovered tree without rejecting syntax errors themselves.
         self.inspect_node(tree.root_node(), source, &mut cwd.to_path_buf(), depth)
     }
 
@@ -349,33 +346,10 @@ impl HostRunner {
         source_env: &BTreeMap<String, String>,
         timeout: Duration,
     ) -> Result<Output, HostError> {
-        if let Some(reason) = self.block_reason(command) {
-            return Err(HostError::Blocked(reason));
-        }
         let deadline = Instant::now() + timeout.min(Duration::from_secs(180));
-        let mut command_builder = Command::new("/bin/bash");
-        command_builder
-            .args(["--noprofile", "--norc", "-c", command])
-            .current_dir(&self.work_dir)
-            .env_clear()
-            .envs(source_env.iter().filter(|(key, _)| {
-                !key.starts_with("HX_") && !key.starts_with("FX_") && key.as_str() != "DATABASE_URL"
-            }))
-            .env("HOME", &self.home)
-            .env("PATH", self.extended_path()?)
-            .env("USER", &self.user)
-            .env("LANG", &self.lang)
-            .env("TMPDIR", &self.tmp_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        let mut child = command_builder.spawn()?;
-        // Created before the next await: aborting the caller can never leave a
-        // successfully spawned process without a group guard. Tokio reaps the
-        // direct child on drop; kill_on_drop alone would miss its grandchildren.
-        let group = ProcessGroup(Pid::from_raw(child.id().expect("spawned child") as i32));
+        let mut child = self.command(command, source_env)?.spawn()?;
+        // Created before the next await: cancellation cannot leak descendants.
+        let group = ProcessGroup::for_child(child.id().expect("spawned child"));
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let budget = AtomicUsize::new(0);
@@ -386,8 +360,6 @@ impl HostRunner {
                     .await
                     .map_err(|_| HostError::Deadline)??;
                 // Background children can inherit the pipes after bash exits.
-                // Allow a brief drain, then kill the group so readers see EOF
-                // and retain useful output rather than reporting a deadline.
                 tokio::select! {
                     _ = pipes_done.notified() => {},
                     _ = tokio::time::sleep(Duration::from_millis(100)) => group.kill(),
@@ -411,10 +383,47 @@ impl HostRunner {
             stderr,
         })
     }
+
+    pub(crate) fn command(
+        &self,
+        command: &str,
+        source_env: &BTreeMap<String, String>,
+    ) -> Result<Command, HostError> {
+        if let Some(reason) = self.block_reason(command) {
+            return Err(HostError::Blocked(reason));
+        }
+        let mut command_builder = Command::new("/bin/bash");
+        command_builder
+            .args(["--noprofile", "--norc", "-c", command])
+            .current_dir(&self.work_dir)
+            .env_clear()
+            .envs(source_env.iter().filter(|(key, _)| {
+                !key.starts_with("HX_")
+                    && !key.starts_with("FX_")
+                    && !key.starts_with("LD_")
+                    && !key.starts_with("DYLD_")
+                    && !["DATABASE_URL", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"]
+                        .contains(&key.as_str())
+            }))
+            .env("HOME", &self.home)
+            .env("PATH", self.extended_path()?)
+            .env("USER", &self.user)
+            .env("LANG", &self.lang)
+            .env("TMPDIR", &self.tmp_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        Ok(command_builder)
+    }
 }
 
-struct ProcessGroup(Pid);
+pub(crate) struct ProcessGroup(Pid);
 impl ProcessGroup {
+    pub(crate) fn for_child(id: u32) -> Self {
+        Self(Pid::from_raw(id as i32))
+    }
     fn kill(&self) {
         // ESRCH is normal when all members have already exited.
         let _ = killpg(self.0, Signal::SIGKILL);

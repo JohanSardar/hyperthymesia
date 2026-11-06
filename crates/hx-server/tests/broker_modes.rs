@@ -118,10 +118,12 @@ async fn broker_modes_enforce_tool_source_and_argument_boundaries() {
 
     // The HTTP body limit must allow setup arguments over the old 8 KB limit,
     // while each mode independently caps the serialized arguments.
-    let command = json!({"source":source.id,"command":"x".repeat(9000)});
+    let command = json!({"source":source.id,"command":format!(": #{}", "x".repeat(9000))});
     let (status, response) = rpc(&setup_app, call("source_bash", command.clone())).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(answer(&response)["error"], "source_bash not available yet");
+    let live = answer(&response);
+    assert_eq!(live["context_only"], true);
+    let live_id = live["evidence"][0]["id"].as_i64().unwrap();
     let (_, response) = rpc(&window_app, call("source_bash", command)).await;
     assert!(
         answer(&response)["error"]
@@ -260,7 +262,27 @@ async fn broker_modes_enforce_tool_source_and_argument_boundaries() {
     assert_eq!(store.generation(window).await.unwrap(), generation);
     assert_eq!(store.record_count("jobs").await.unwrap(), jobs);
     assert!(store.evidence(historical).await.unwrap().is_some());
-    assert!(broker.audit.lock().await.evidence.is_empty());
-    assert!(setup.audit.lock().await.evidence.is_empty());
+    assert_eq!(
+        broker
+            .audit
+            .lock()
+            .await
+            .evidence
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        [live_id]
+    );
+    assert_eq!(
+        setup
+            .audit
+            .lock()
+            .await
+            .evidence
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        [live_id]
+    );
     assert!(!broker.audit.lock().await.exhausted);
 }
