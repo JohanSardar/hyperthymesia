@@ -93,6 +93,7 @@ if [ "$1" = --version ]; then
     printf server >> __HX_PROBE_LOG__
     echo 'hx-server 0.1.0'; exit
 fi
+if [ "$1" = install-marker ] && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi
 [ "$1" = --state-dir ] || exit 97
 state=$2
 shift 2
@@ -249,6 +250,23 @@ esac
     sums_file.write_bytes(original_sums)
     print('ok: tampered server and missing downloads reject without writes')
 
+    # Older binaries do not implement the new marker operation. Refuse them
+    # before stopping a service or migrating state, even if their hash matches.
+    with tarfile.open(server_asset) as archive_in:
+        files = {member.name: archive_in.extractfile(member).read() for member in archive_in}
+    old_help = b'if [ "$1" = install-marker ] && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi'
+    assert old_help in files['hx-server']
+    files['hx-server'] = files['hx-server'].replace(old_help, b'if [ "$1" = install-marker ]; then exit 97; fi')
+    archive(server_asset, files)
+    sums()
+    log = root / 'commands'
+    log.write_text('')
+    fails_unchanged(installed_home, 1)
+    assert '--user stop' not in log.read_text()
+    server_asset.write_bytes(original)
+    sums()
+    print('ok: mismatched old server is refused before service stop or state changes')
+
     for legacy in ('Library/LaunchAgents/com.hyperthymesia.server.plist',
                    'Library/Application Support/Hyperthymesia/server-data',
                    'Library/Application Support/Hyperthymesia/agent.json'):
@@ -334,8 +352,26 @@ esac
     (prefix / '.upgrade.redirect').symlink_to(outside, target_is_directory=True)
     (prefix / 'pending-upgrade').symlink_to(prefix / '.upgrade.redirect')
     fails_unchanged(h, 1, '--uninstall')
+    wrapper = prefix / 'current/hx-run'
+    env = dict(os.environ, HOME=str(h))
+    result = subprocess.run(['/bin/sh', str(wrapper)], env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode != 0
     assert not (h / 'recovery-ran').exists()
-    print('ok: redirected pending recovery is not executed')
+    print('ok: redirected pending recovery is not executed by installer or startup wrapper')
+
+    (prefix / 'pending-upgrade').unlink()
+    recovery = prefix / '.upgrade.valid'
+    (recovery / 'payload').mkdir(parents=True)
+    (recovery / 'lifecycle').write_text('synthetic')
+    (recovery / 'recovery-v2').write_text('synthetic')
+    (recovery / 'progress').symlink_to(outside / 'lifecycle')
+    (recovery / 'payload/hx-server').write_text('#!/bin/sh\ntouch "$HOME/recovery-ran"\n')
+    (recovery / 'payload/hx-server').chmod(0o700)
+    (prefix / 'pending-upgrade').symlink_to(recovery)
+    fails_unchanged(h, 1, '--uninstall')
+    result = subprocess.run(['/bin/sh', str(wrapper)], env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode != 0 and not (h / 'recovery-ran').exists()
+    print('ok: redirected recovery progress is never sourced or executed')
 
     h = home()
     assert run(h).returncode == 0

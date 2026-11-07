@@ -1,7 +1,7 @@
 # Releases
 
 The owner approves a public release by pushing `v<workspace.package.version>`.
-For example, workspace version `0.1.0` requires tag `v0.1.0`. The workflow
+For example, workspace version `0.1.1` requires tag `v0.1.1`. The workflow
 rejects mismatched tags. Do not create the first tag before owner approval.
 
 The `release` workflow builds natively on Ubuntu 22.04 x86_64 and arm64

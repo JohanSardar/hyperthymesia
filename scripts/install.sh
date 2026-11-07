@@ -144,6 +144,8 @@ if exists "$prefix/pending-upgrade"; then
     case "$recovery_name" in */*) owner "$prefix/pending-upgrade" ;; esac
     [ -d "$recovery" ] && [ ! -L "$recovery" ] && \
         [ -f "$recovery/lifecycle" ] && [ ! -L "$recovery/lifecycle" ] && \
+        [ -f "$recovery/progress" ] && [ ! -L "$recovery/progress" ] && \
+        [ -f "$recovery/recovery-v2" ] && [ ! -L "$recovery/recovery-v2" ] && \
         [ -d "$recovery/payload" ] && [ ! -L "$recovery/payload" ] && \
         [ -f "$recovery/payload/hx-server" ] && [ ! -L "$recovery/payload/hx-server" ] && \
         [ -x "$recovery/payload/hx-server" ] || die 'incomplete or redirected upgrade recovery record; retained state has not been changed'
@@ -241,7 +243,7 @@ refuse_staging() {
     done
 }
 refuse_staging "$prefix"/.state-dir.???????? "$prefix"/.last-version.???????? \
-    "$prefix"/.staging.???????? "$prefix".staging.???????? \
+    "$prefix"/.staging.???????? "$prefix".staging.???????? "$prefix"/.upgrade.???????? \
     "$prefix/tools/fx-0.0.16"/.fx.???????? "$state"/.install-prefix.????????
 
 for command in curl tar sed mktemp readlink; do command -v "$command" >/dev/null 2>&1 || die "missing command: $command"; done
@@ -343,6 +345,7 @@ untar "$work/server.tar.gz" "$work/payload"
 if [ "$dry_run" = false ]; then
     actual_version=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" --version) || die 'hx-server --version failed'
     [ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
+    (cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" install-marker --help >/dev/null 2>&1) || die 'server archive is incompatible with this installer; use the install.sh from the same release'
 fi
 if [ -f "$version_dir/hx-server" ]; then
     [ "$(sha256 "$version_dir/hx-server")" = "$(sha256 "$work/payload/hx-server")" ] || die 'retained version differs from the release; version directories are immutable'
@@ -381,22 +384,35 @@ fi
 shell_quote() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
 xml_escape() { printf '%s' "$1" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
 unit_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g; s/\$/$$/g'; }
-cat > "$work/payload/hx-run" <<EOF
-#!/bin/sh
-# hyperthymesia installer N4
-set -eu
-umask 077
-export HOME=$(shell_quote "$HOME")
+{
+    printf '#!/bin/sh\n# hyperthymesia installer N4\nset -eu\numask 077\n'
+    printf 'export HOME='; shell_quote "$HOME"; printf '\n'
+    printf 'prefix='; shell_quote "$prefix"; printf '\n'
+    printf 'state='; shell_quote "$state"; printf '\n'
+    cat <<'WRAPPER'
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-if [ -L $(shell_quote "$prefix/pending-upgrade") ]; then
-    HX_INSTALL_STARTUP_RECOVERY=1 $(shell_quote "$prefix/pending-upgrade/payload/hx-server") --state-dir $(shell_quote "$state") upgrade-recover --lifecycle $(shell_quote "$prefix/pending-upgrade/lifecycle")
+if [ -e "$prefix/pending-upgrade" ] || [ -L "$prefix/pending-upgrade" ]; then
+    [ -L "$prefix/pending-upgrade" ] || { echo 'Invalid upgrade recovery record; state retained.' >&2; exit 1; }
+    recovery=$(readlink "$prefix/pending-upgrade")
+    case "$recovery" in "$prefix"/.upgrade.*) ;; *) echo 'Invalid upgrade recovery path; state retained.' >&2; exit 1 ;; esac
+    recovery_name=${recovery#"$prefix/"}
+    case "$recovery_name" in */*) echo 'Invalid upgrade recovery path; state retained.' >&2; exit 1 ;; esac
+    [ -d "$recovery" ] && [ ! -L "$recovery" ] && \
+        [ -f "$recovery/lifecycle" ] && [ ! -L "$recovery/lifecycle" ] && \
+        [ -f "$recovery/progress" ] && [ ! -L "$recovery/progress" ] && \
+        [ -f "$recovery/recovery-v2" ] && [ ! -L "$recovery/recovery-v2" ] && \
+        [ -d "$recovery/payload" ] && [ ! -L "$recovery/payload" ] && \
+        [ -f "$recovery/payload/hx-server" ] && [ ! -L "$recovery/payload/hx-server" ] && \
+        [ -x "$recovery/payload/hx-server" ] || { echo 'Incomplete or redirected upgrade recovery; state retained.' >&2; exit 1; }
+    HX_INSTALL_STARTUP_RECOVERY=1 "$recovery/payload/hx-server" --state-dir "$state" upgrade-recover --lifecycle "$recovery/lifecycle"
 fi
-exec >> $(shell_quote "$state/server.log") 2>&1
+exec >> "$state/server.log" 2>&1
 set -a
-. $(shell_quote "$state/server.env")
+. "$state/server.env"
 set +a
-exec $(shell_quote "$prefix/current/hx-server") --state-dir $(shell_quote "$state") serve --listen 127.0.0.1:7377
-EOF
+exec "$prefix/current/hx-server" --state-dir "$state" serve --listen 127.0.0.1:7377
+WRAPPER
+} > "$work/payload/hx-run"
 chmod 755 "$work/payload/hx-run"
 if [ "$platform" = macos-aarch64 ]; then
     service_name=com.hyperthymesia.server.plist
@@ -497,6 +513,7 @@ fi
 
 # Keep upgrade recovery outside /tmp and outside mutable state. A reboot or a
 # killed shell must not erase its progress, backup path or recovery executable.
+printf '%s\n' 'hyperthymesia-recovery-v2' > "$work/recovery-v2"
 if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
     durable=$(mktemp -d "$prefix/.upgrade.XXXXXXXX")
     cp -R "$work/." "$durable/"
@@ -589,17 +606,37 @@ migration_started=false
 committed=false
 recovering=false
 backup_server=$work/payload/hx-server
-if [ -n "$old" ]; then backup_server=$old/hx-server; fi
+if [ -n "$old" ]; then
+    [ -d "$old" ] && [ ! -L "$old" ] && [ -f "$old/.installed" ] && [ ! -L "$old/.installed" ] && \
+        [ -f "$old/hx-server" ] && [ ! -L "$old/hx-server" ] || { echo 'Retained recovery executable is missing or redirected; state retained.' >&2; exit 1; }
+    backup_server=$old/hx-server
+fi
 save_progress() {
-    {
-        printf 'stopped=%s\nmigration_started=%s\ncommitted=%s\n' "$stopped" "$migration_started" "$committed"
-        printf 'backup='; quote "$backup"; printf '\nfailed_state='; quote "$failed_state"; printf '\n'
-    } > "$work/progress.next"
+    printf '%s\n%s\n%s\n%s\n%s\n' "$stopped" "$migration_started" "$committed" "$backup" "$failed_state" > "$work/progress.next"
     mv "$work/progress.next" "$work/progress"
 }
 if [ "${1:-}" = --recover ]; then
     recovering=true
-    . "$work/progress"
+    [ -f "$work/progress" ] && [ ! -L "$work/progress" ] || { echo 'Invalid recovery progress; state retained.' >&2; exit 1; }
+    exec 3< "$work/progress"
+    IFS= read -r stopped <&3 && IFS= read -r migration_started <&3 && \
+        IFS= read -r committed <&3 && IFS= read -r backup <&3 && IFS= read -r failed_state <&3 || { echo 'Incomplete recovery progress; state retained.' >&2; exit 1; }
+    if IFS= read -r extra <&3; then echo 'Invalid recovery progress; state retained.' >&2; exit 1; fi
+    exec 3<&-
+    case "$stopped:$migration_started:$committed" in true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;; *) echo 'Invalid recovery progress; state retained.' >&2; exit 1 ;; esac
+    case "$backup" in
+        '') ;;
+        "$prefix"/backups/pre-upgrade.*)
+            backup_name=${backup#"$prefix/backups/pre-upgrade."}
+            case "$backup_name" in ''|*[!0-9A-Za-z]*) echo 'Invalid recovery backup path; state retained.' >&2; exit 1 ;; esac ;;
+        *) echo 'Invalid recovery backup path; state retained.' >&2; exit 1 ;;
+    esac
+    case "$failed_state" in
+        "$state".failed-*)
+            failed_suffix=${failed_state#"$state".failed-}
+            case "$failed_suffix" in ''|*[!0-9-]*) echo 'Invalid failed-state path; state retained.' >&2; exit 1 ;; esac ;;
+        *) echo 'Invalid failed-state path; state retained.' >&2; exit 1 ;;
+    esac
     if [ "$committed" = true ]; then
         rm -f "$prefix/pending-upgrade"
         exit 0
@@ -639,7 +676,14 @@ rollback() {
                     chmod 600 "$state/server.env" || restored=false
                     touch "$state/server.log" || restored=false
                     chmod 600 "$state/server.log" || restored=false
-                    next_marker=$(mktemp "$state/.install-prefix.XXXXXXXX") || restored=false
+                    next_marker=
+                    for marker_stage in "$state"/.install-prefix.????????; do
+                        if [ -e "$marker_stage" ] || [ -L "$marker_stage" ]; then
+                            printf 'Interrupted marker staging retained: %s. Move it aside before recovery.\n' "$marker_stage" >&2
+                            restored=false
+                        fi
+                    done
+                    if [ "$restored" = true ]; then next_marker=$(mktemp "$state/.install-prefix.XXXXXXXX") || restored=false; fi
                     if [ -n "${next_marker:-}" ]; then
                         if ! { printf '%s\n' "$prefix" > "$next_marker" && "$work/payload/hx-server" --state-dir "$state" install-marker --staged "$next_marker" --target "$state/.install-prefix"; }; then
                             restored=false
