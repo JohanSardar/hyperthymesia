@@ -1,7 +1,7 @@
 # Releases
 
 The owner approves a public release by pushing `v<server version>`. For example,
-server version `0.1.1` requires tag `v0.1.1`. The app version must match the
+server version `0.1.2` requires tag `v0.1.2`. The app version must match the
 server version. The workflow rejects mismatched tags. Do not create the first
 tag before owner approval.
 

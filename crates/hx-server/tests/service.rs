@@ -62,6 +62,191 @@ async fn gc_refuses_without_touching_history() {
     f.close().await;
 }
 
+#[test]
+fn recovery_probe_checks_volume_without_changing_history() {
+    let scratch = tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(state.join("history"), b"synthetic state").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .env_clear()
+        .env("HOME", scratch.path())
+        .args(["probe-recovery", "--state"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(state.join("history")).unwrap(),
+        b"synthetic state"
+    );
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn retire_state_refuses_collisions_and_never_adopts_a_failed_path() {
+    let scratch = tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let failed = scratch.path().join("state.failed-123-45");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::create_dir(&failed).unwrap();
+    std::fs::write(state.join("history"), b"synthetic state").unwrap();
+    std::fs::write(failed.join("history"), b"unrelated state").unwrap();
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+            .env_clear()
+            .env("HOME", scratch.path())
+            .args(["retire-state", "--from"])
+            .arg(&state)
+            .arg("--to")
+            .arg(&failed)
+            .output()
+            .unwrap()
+    };
+    assert!(!run().status.success());
+    assert_eq!(
+        std::fs::read(state.join("history")).unwrap(),
+        b"synthetic state"
+    );
+    assert_eq!(
+        std::fs::read(failed.join("history")).unwrap(),
+        b"unrelated state"
+    );
+    std::fs::remove_file(failed.join("history")).unwrap();
+    std::fs::remove_dir(&failed).unwrap();
+    assert!(run().status.success());
+    assert!(!state.exists());
+    assert_eq!(
+        std::fs::read(failed.join("history")).unwrap(),
+        b"synthetic state"
+    );
+    assert!(
+        !run().status.success(),
+        "a later retry must not adopt existing state"
+    );
+    assert_eq!(
+        std::fs::read(failed.join("history")).unwrap(),
+        b"synthetic state"
+    );
+}
+
+#[test]
+fn source_key_recovery_moves_without_overwriting_and_retries_safely() {
+    let scratch = tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let failed = scratch.path().join("state.failed-123-45");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::create_dir(&failed).unwrap();
+    std::fs::create_dir(failed.join("secrets")).unwrap();
+    std::fs::write(failed.join("secrets/source.key"), b"synthetic key").unwrap();
+    let partial = failed.join(".source-keys-recovery.synthetic-partial");
+    std::fs::write(&partial, b"partial").unwrap();
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+            .env_clear()
+            .env("HOME", scratch.path())
+            .args(["recover-secrets", "--from"])
+            .arg(&failed)
+            .arg("--to")
+            .arg(&state)
+            .output()
+            .unwrap()
+    };
+    assert!(run().status.success());
+    assert!(!failed.join("secrets").exists());
+    assert_eq!(std::fs::read(&partial).unwrap(), b"partial");
+    assert_eq!(
+        std::fs::read(state.join("secrets/source.key")).unwrap(),
+        b"synthetic key"
+    );
+    assert!(
+        run().status.success(),
+        "interrupted rename must be retryable"
+    );
+    let marker = failed.join(".source-keys-recovery");
+    let proof = std::fs::read(&marker).unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    assert!(
+        !run().status.success(),
+        "an unrelated target must not be adopted"
+    );
+    assert_eq!(
+        std::fs::read(state.join("secrets/source.key")).unwrap(),
+        b"synthetic key"
+    );
+    std::fs::write(&marker, proof).unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::create_dir(failed.join("secrets")).unwrap();
+    std::fs::write(failed.join("secrets/other.key"), b"other key").unwrap();
+    assert!(
+        !run().status.success(),
+        "two key directories must never be merged"
+    );
+    assert_eq!(
+        std::fs::read(failed.join("secrets/other.key")).unwrap(),
+        b"other key"
+    );
+    assert_eq!(
+        std::fs::read(state.join("secrets/source.key")).unwrap(),
+        b"synthetic key"
+    );
+}
+
+#[test]
+fn source_key_recovery_refuses_redirected_directories() {
+    let scratch = tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let failed = scratch.path().join("state.failed-123-45");
+    let outside = scratch.path().join("outside");
+    for path in [&state, &failed, &outside] {
+        std::fs::create_dir(path).unwrap();
+    }
+    std::fs::write(outside.join("untouched"), b"synthetic outside").unwrap();
+    std::os::unix::fs::symlink(&outside, failed.join("secrets")).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .env_clear()
+        .env("HOME", scratch.path())
+        .args(["recover-secrets", "--from"])
+        .arg(&failed)
+        .arg("--to")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!state.join("secrets").exists());
+    assert_eq!(
+        std::fs::read(outside.join("untouched")).unwrap(),
+        b"synthetic outside"
+    );
+    std::fs::remove_file(failed.join("secrets")).unwrap();
+    std::fs::create_dir(failed.join("secrets")).unwrap();
+    std::fs::write(failed.join("secrets/source.key"), b"synthetic source").unwrap();
+    std::os::unix::fs::symlink(&outside, state.join("secrets")).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .env_clear()
+        .env("HOME", scratch.path())
+        .args(["recover-secrets", "--from"])
+        .arg(&failed)
+        .arg("--to")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read(failed.join("secrets/source.key")).unwrap(),
+        b"synthetic source"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("untouched")).unwrap(),
+        b"synthetic outside"
+    );
+}
+
 async fn seed(store: &Store, old: bool) -> Interval {
     let w = hx_store::window_at(Utc::now() - Duration::hours(if old { 240 } else { 8 }));
     let e: Envelope = serde_json::from_value(json!({
