@@ -9,6 +9,7 @@ import io
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -67,7 +68,10 @@ esac
     fixture = root / 'release'
     fixture.mkdir()
     fx = root / 'fx.tar.gz'
-    fx_script = b'#!/bin/sh\n[ "$FX_AUTO_UPGRADE" = 0 ] || exit 81\n[ "$1" = --version ] || exit 82\nprintf "0.0.16\\n"\n'
+    probe_log = root / 'version-probes'
+    fx_script = (b'#!/bin/sh\n[ "$FX_AUTO_UPGRADE" = 0 ] || exit 81\n'
+                 b'[ "$1" = --version ] || exit 82\n[ "$PWD" = "$HOME" ] || exit 85\n' +
+                 f'printf fx >> {shlex.quote(str(probe_log))}\n'.encode() + b'printf "0.0.16\\n"\n')
     archive(fx, {'fx': fx_script})
     good_fx = fx.read_bytes()
     source = SOURCE.read_text()
@@ -82,7 +86,13 @@ esac
         archive(fixture / f'hx-server-0.1.0-{platform}.tar.gz', {
             'hx-server': b'''#!/bin/sh
 set -eu
-if [ "$1" = --version ]; then echo 'hx-server 0.1.0'; exit; fi
+if [ "$1" = --version ]; then
+    case "$HOME" in */probe-home) ;; *) echo 'version probe used owner HOME' >&2; exit 83;; esac
+    [ -z "${AI_GATEWAY_API_KEY+x}" ] || { echo 'version probe inherited credentials' >&2; exit 84; }
+    [ "$PWD" = "$HOME" ] || { echo 'version probe used owner cwd' >&2; exit 85; }
+    printf server >> __HX_PROBE_LOG__
+    echo 'hx-server 0.1.0'; exit
+fi
 [ "$1" = --state-dir ] || exit 97
 state=$2
 shift 2
@@ -109,7 +119,7 @@ install-link)
 serve) printf "%s\\n" --state-dir "$state" serve "$@" > "$TEST_SERVER_ARGS"; printf "%s\\n" "$TEST_ENV" > "$TEST_SERVER_ENV" ;;
 *) exit 97 ;;
 esac
-''',
+'''.replace(b'__HX_PROBE_LOG__', shlex.quote(str(probe_log)).encode()),
             'hx-vision-ocr': b'#!/bin/sh\nexit 0\n',
         })
     app_name = 'Hyperthymesia-0.1.0-macos-aarch64.zip'
@@ -129,16 +139,16 @@ esac
         path = root / f'''home {counter} & quote' % " $ test'''
         path.mkdir()
         return path
-    def run(h, *args, os_name='Linux', arch='x86_64', script=installer):
+    def run(h, *args, os_name='Linux', arch='x86_64', script=installer, tmpdir=None, cwd=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith(('HX_', 'FX_'))}
         env.update(HOME=str(h), PATH=str(stubs) + os.pathsep + os.environ['PATH'],
-                   TMPDIR=str(root), HX_RELEASE_BASE=fixture.as_uri(),
+                   TMPDIR=tmpdir or str(root), HX_RELEASE_BASE=fixture.as_uri(),
                    HX_FX_RELEASE_BASE=fixture.as_uri(), TEST_OS=os_name, TEST_ARCH=arch,
                    TEST_COMMAND_LOG=str(root / 'commands'),
                    AI_GATEWAY_API_KEY='synthetic-key-never-print',
                    TEST_FAIL_STEP=os.environ.get('TEST_FAIL_STEP', ''),
                    TEST_HELD_LEASE=os.environ.get('TEST_HELD_LEASE', ''))
-        result = subprocess.run(['/bin/sh', str(script), *args], env=env, text=True, capture_output=True, timeout=20)
+        result = subprocess.run(['/bin/sh', str(script), *args], env=env, cwd=cwd, text=True, capture_output=True, timeout=20)
         return result
     def fails_unchanged(h, expected, *args, **kwargs):
         before = snapshot(h)
@@ -157,6 +167,8 @@ esac
     assert state.stat().st_mode & 0o777 == 0o700
     assert (state / 'server.env').stat().st_mode & 0o777 == 0o600
     assert 'synthetic-key-never-print' not in result.stdout + result.stderr
+    assert '--prefix source:' in result.stdout and '--scopes read_raw,read_l3' in result.stdout
+    assert 'http://127.0.0.1:7377/login' in result.stdout
     original_env = (state / 'server.env').read_bytes()
     assert run(h).returncode == 0
     assert (state / 'server.env').read_bytes() == original_env
@@ -185,12 +197,27 @@ esac
     # can be credited: rejecting every invocation is not a valid installer.
     h = home()
     before = snapshot(h)
+    probe_log.unlink(missing_ok=True)
     result = run(h, '--dry-run')
     assert result.returncode == 0, result.stderr
+    assert not probe_log.exists(), 'dry-run executed a downloaded binary'
     assert 'hyperthymesia.service' in result.stdout, 'missing Linux service rendering'
     assert '127.0.0.1:7377' in result.stdout, 'missing service wrapper'
     assert snapshot(h) == before, 'dry run changed HOME'
     print('ok: Linux dry run renders without writes')
+
+    relative_work = root / 'relative-work'
+    (relative_work / 'tmp').mkdir(parents=True)
+    previous_cdpath = os.environ.get('CDPATH')
+    os.environ['CDPATH'] = '.'
+    result = run(home(), '--dry-run', tmpdir='tmp', cwd=relative_work)
+    if previous_cdpath is None:
+        os.environ.pop('CDPATH')
+    else:
+        os.environ['CDPATH'] = previous_cdpath
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not list((relative_work / 'tmp').iterdir()), 'scratch directory was not removed'
+    print('ok: relative TMPDIR with CDPATH succeeds and cleans scratch')
 
     # Hash failures must not modify even an existing managed installation.
     installed_home = home()
@@ -418,4 +445,24 @@ esac
             assert os.readlink(prefix / 'current') == str(prefix / '0.1.0'), 'restart must target the old version even if atomic switch fails'
         assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
     print('ok: recovery IO failures still attempt old-service restart and report damage')
+
+    # Run the README fx snippet against a bad download and an existing
+    # synthetic binary; checksum failure must stop before that binary runs.
+    text = Path('README.md').read_text()
+    block = text.split('Install the pinned model runner, fx 0.0.16', 1)[1].split('```sh\n', 1)[1].split('\n```', 1)[0]
+    h = home()
+    old_fx = h / '.local/share/hyperthymesia/tools/fx-0.0.16/fx'
+    old_fx.parent.mkdir(parents=True)
+    old_fx.write_text('#!/bin/sh\ntouch "$HOME/existing-fx-ran"\n')
+    old_fx.chmod(0o700)
+    old_curl = (stubs / 'curl').read_text()
+    stub('curl', '[ "$1" = -fL ] && [ "$3" = -o ] || exit 97\nprintf bad-archive > "$4"\n')
+    env = dict(os.environ, HOME=str(h), PATH=str(stubs) + os.pathsep + os.environ['PATH'],
+               TMPDIR=str(root), TEST_OS='Darwin', TEST_ARCH='arm64')
+    result = subprocess.run(['/bin/sh', '-c', 'set -e\n' + block], env=env,
+                            capture_output=True, text=True, timeout=20)
+    (stubs / 'curl').write_text(old_curl)
+    assert result.returncode != 0 and 'verification failed' in result.stderr.lower(), result.stderr
+    assert not (h / 'existing-fx-ran').exists()
+    print('ok: README checksum failure stops before any existing fx can run')
 PY

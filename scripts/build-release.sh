@@ -23,7 +23,7 @@ if [[ -n "$(ls -A "$out")" ]]; then
     echo "Release output directory must be empty: $out" >&2
     exit 1
 fi
-version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "hx-server"))')
+version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; packages={p["name"]:p["version"] for p in json.load(sys.stdin)["packages"]}; server=packages["hx-server"]; sys.exit("server and app versions must match") if packages["hx-agent-app"] != server else print(server)')
 [[ "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || { echo 'Unsafe release version' >&2; exit 1; }
 if [[ "${GITHUB_REF:-}" == refs/tags/* && "${GITHUB_REF#refs/tags/}" != "v$version" ]]; then
     echo "Tag ${GITHUB_REF#refs/tags/} does not match workspace version v$version" >&2

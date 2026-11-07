@@ -1,7 +1,7 @@
 # Automatic GC is off
 
-`serve` does not schedule `Store::gc()`. The only caller is the explicit
-`hx-server gc` command, and it has never run on real data.
+`serve` does not schedule `Store::gc()`. The `hx-server gc` command is
+currently disabled and does not delete files. It has never run on real data.
 
 GC deletes published, unpinned `chunk` blobs whose row is over 30 days old. It
 keeps `keep` blobs (including stills) and pinned blobs, and holds the row lock

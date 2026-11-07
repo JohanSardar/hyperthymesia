@@ -92,6 +92,7 @@ enum Command {
         #[arg(long)]
         to: DateTime<Utc>,
     },
+    /// Disabled: deleting old media is not yet safe for referenced evidence.
     Gc,
 }
 #[derive(Subcommand)]
@@ -163,6 +164,11 @@ async fn main() -> Result<()> {
         hx_server::fx::doctor(&hx_server::fx::Config::from_env()).await?;
         println!("ok: provider configured, fx version and login checks passed (no model call)");
         return Ok(());
+    }
+    if matches!(cli.command, Command::Gc) {
+        bail!(
+            "gc is disabled: old media can still be referenced by evidence. No files were deleted; see docs/gc-safety.md."
+        );
     }
     let dir = cli
         .state_dir
@@ -391,7 +397,7 @@ async fn main() -> Result<()> {
                 .append_pair("code", &code);
             println!("{link}");
         }
-        Command::Gc => println!("Expired {} blobs", store.gc().await?),
+        Command::Gc => unreachable!("gc is refused before opening the store"),
         Command::Compile { from, to, .. } => {
             for w in windows(from, to)? {
                 processing::compile_window(&store, w).await?;
