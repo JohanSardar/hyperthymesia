@@ -54,6 +54,14 @@ enum Command {
         #[arg(long)]
         lifecycle: PathBuf,
     },
+    /// Return retained source keys to a restored state without overwriting files.
+    #[command(hide = true)]
+    RecoverSecrets {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// Atomically replace an installer symlink without platform-specific mv flags.
     #[command(hide = true)]
     InstallLink {
@@ -123,6 +131,10 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
+    if let Command::RecoverSecrets { from, to } = &cli.command {
+        recover_secrets(from, to)?;
+        return Ok(());
+    }
     if let Command::InstallLink { link, target } = &cli.command {
         if let Ok(metadata) = std::fs::symlink_metadata(link) {
             anyhow::ensure!(
@@ -314,6 +326,7 @@ async fn main() -> Result<()> {
         | Command::Status { .. }
         | Command::UpgradeGuard { .. }
         | Command::UpgradeRecover { .. }
+        | Command::RecoverSecrets { .. }
         | Command::InstallLink { .. } => {
             unreachable!("readiness commands run before opening the store")
         }
@@ -549,6 +562,117 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+/// Move, never copy or overwrite, the private source-key directory after a
+/// restored backup is published. Both state roots must be real sibling dirs.
+fn recover_secrets(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    use rustix::fs::{
+        AtFlags, FileType, Mode, OFlags, RenameFlags, fsync, open, openat, renameat_with, statat,
+    };
+    use rustix::io::Errno;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let name = to
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("invalid state path")?;
+    let failed = from
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("invalid failed-state path")?;
+    let prefix = format!("{name}.failed-");
+    anyhow::ensure!(
+        from.parent() == to.parent()
+            && failed.strip_prefix(&prefix).is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+            }),
+        "failed state must be a sibling of the restored state"
+    );
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let source = open(from, flags, Mode::empty()).context("cannot open retained failed state")?;
+    let target = open(to, flags, Mode::empty()).context("cannot open restored state")?;
+    let directory_identity = |dir: &std::os::fd::OwnedFd| -> Result<Option<String>> {
+        match statat(dir, "secrets", AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                anyhow::ensure!(
+                    FileType::from_raw_mode(stat.st_mode) == FileType::Directory,
+                    "source-key path is not a real directory"
+                );
+                Ok(Some(format!("{}:{}\n", stat.st_dev, stat.st_ino)))
+            }
+            Err(Errno::NOENT) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let marker_name = ".source-keys-recovery";
+    let marker = match openat(
+        &source,
+        marker_name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let file: std::fs::File = fd.into();
+            let meta = file.metadata()?;
+            anyhow::ensure!(
+                meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o7777 == 0o600,
+                "invalid source-key recovery marker"
+            );
+            let mut value = String::new();
+            file.take(128).read_to_string(&mut value)?;
+            Some(value)
+        }
+        Err(Errno::NOENT) => None,
+        Err(error) => return Err(error.into()),
+    };
+    match (directory_identity(&source)?, directory_identity(&target)?) {
+        (Some(identity), None) => {
+            if let Some(marker) = &marker {
+                anyhow::ensure!(
+                    marker == &identity,
+                    "source-key recovery marker does not match"
+                );
+            } else {
+                let fd = openat(
+                    &source,
+                    marker_name,
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                )?;
+                let mut file: std::fs::File = fd.into();
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                file.write_all(identity.as_bytes())?;
+                file.sync_all()?;
+                fsync(&source)?;
+            }
+            renameat_with(
+                &source,
+                "secrets",
+                &target,
+                "secrets",
+                RenameFlags::NOREPLACE,
+            )
+            .context("could not safely restore source keys; retained copies were kept")?;
+        }
+        (Some(_), Some(_)) => bail!("source keys exist in both states; neither was changed"),
+        (None, Some(identity)) => anyhow::ensure!(
+            marker.as_deref() == Some(identity.as_str()),
+            "cannot verify previously moved source keys; neither state was changed"
+        ),
+        (None, None) => anyhow::ensure!(
+            marker.is_none(),
+            "source keys are missing; retained state was not changed"
+        ),
+    }
+    fsync(&source).context("could not sync retained state directory")?;
+    fsync(&target).context("could not sync restored state directory")?;
+    Ok(())
+}
+
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     // Register SIGTERM before starting workers; service managers don't send Ctrl-C.
     #[cfg(unix)]

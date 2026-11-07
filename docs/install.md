@@ -162,10 +162,10 @@ An upgrade:
    after the candidate starts, the candidate shuts down without admitting work.
    Its manager restarts through recovery before reopening state or accepting uploads.
 4. Keeps the previous version and backup. A failed step after stop attempts to
-   restore both databases and blobs, preserve `server.env`, switch back and restart.
-   **Source keys are not restored automatically.** If rollback moved the state
-   aside, keys remain in that failed-generation copy; otherwise they remain in
-   the active state. Check them before relying on any connected source.
+   restore both databases and blobs, preserve `server.env`, and move source keys
+   from the failed-generation state back into the restored state. It never merges
+   two key directories. If that move fails, it keeps the recovery record and
+   reports an error; inspect the retained state before restarting.
    Failed-generation state stays beside the active directory as `<state>.failed-*`
    (`server.failed-*` for the default macOS state).
    A private `<prefix>/.upgrade.*` recovery directory is published before stopping.
@@ -176,9 +176,10 @@ An upgrade:
    the guard lock, so killing an installer ancestor cannot admit worker jobs.
    Wrapper/unit refreshes and path records use atomic replacement, including
    same-version reruns.
-   Filesystem recovery errors do not skip the old-service restart attempt; the
-   installer reports incomplete recovery and retains the recovery program. If
-   atomic link replacement fails, it attempts a portable unlink/link while stopped.
+   Filesystem recovery errors are reported and the recovery program is retained.
+   A source-key recovery failure stops the rollback before restarting the old
+   service. If atomic link replacement fails, it attempts a portable unlink/link
+   while stopped.
 
 `migrate` applies every missing version, including a lower number arriving later.
 It rejects newer/unknown, dirty or changed checksums before writable access.

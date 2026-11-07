@@ -311,6 +311,7 @@ untar "$work/server.tar.gz" "$work/payload"
 if [ "$dry_run" = false ]; then
     actual_version=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" --version) || die 'hx-server --version failed'
     [ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
+    (cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" recover-secrets --help >/dev/null 2>&1) || die 'server archive is incompatible with this installer; use install.sh from the same release'
 fi
 if [ -f "$version_dir/hx-server" ]; then
     [ "$(sha256 "$version_dir/hx-server")" = "$(sha256 "$work/payload/hx-server")" ] || die 'retained version differs from the release; version directories are immutable'
@@ -584,6 +585,12 @@ rollback() {
             if [ -d "$failed_state" ] || mv "$state" "$failed_state"; then
                 if [ -f "$state/core.sqlite" ] || "$backup_server" --state-dir "$state" restore --from "$backup"; then
                     cp "$failed_state/server.env" "$state/server.env" || restored=false
+                    # The public backup deliberately omits source keys. Move
+                    # their directory back without reading or overwriting it.
+                    if ! "$work/payload/hx-server" --state-dir "$state" recover-secrets --from "$failed_state" --to "$state"; then
+                        printf 'Source-key recovery incomplete. State and failed copies were retained; do not restart until recovery succeeds.\n' >&2
+                        exit "$result"
+                    fi
                     chmod 700 "$state" || restored=false
                     chmod 600 "$state/server.env" || restored=false
                     touch "$state/server.log" || restored=false
