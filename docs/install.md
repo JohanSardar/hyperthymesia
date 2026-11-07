@@ -163,8 +163,9 @@ An upgrade:
    Its manager restarts through recovery before reopening state or accepting uploads.
 4. Keeps the previous version and backup. A failed step after stop attempts to
    restore both databases and blobs, preserve `server.env`, switch back and restart.
-   **Source keys are not restored automatically:** they remain in the retained
-   failed-generation state. Check them before relying on any connected source.
+   **Source keys are not restored automatically.** If rollback moved the state
+   aside, keys remain in that failed-generation copy; otherwise they remain in
+   the active state. Check them before relying on any connected source.
    Failed-generation state stays beside the active directory as `<state>.failed-*`
    (`server.failed-*` for the default macOS state).
    A private `<prefix>/.upgrade.*` recovery directory is published before stopping.
