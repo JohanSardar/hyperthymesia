@@ -89,7 +89,14 @@ if exists "$unit" && ! managed_link "$unit" "$prefix/current/hyperthymesia.servi
 if exists "$bin" && ! managed_link "$bin" "$prefix/current/hx-server"; then owner "$bin"; fi
 if exists "$app" && ! managed_link "$app" "$prefix/current/Hyperthymesia.app"; then owner "$app"; fi
 if exists "$prefix"; then
-    [ -d "$prefix" ] && [ ! -L "$prefix" ] && [ -f "$prefix/.installed" ] || owner "$prefix"
+    [ -d "$prefix" ] && [ ! -L "$prefix" ] && [ -f "$prefix/.installed" ] && [ ! -L "$prefix/.installed" ] || owner "$prefix"
+fi
+# A marked prefix does not make redirected descendants ours to write.
+for path in "$prefix/tools" "$prefix/tools/fx-0.0.16"; do
+    if exists "$path"; then [ -d "$path" ] && [ ! -L "$path" ] || owner "$path"; fi
+done
+if exists "$prefix/tools/fx-0.0.16/fx"; then
+    [ -f "$prefix/tools/fx-0.0.16/fx" ] && [ ! -L "$prefix/tools/fx-0.0.16/fx" ] || owner "$prefix/tools/fx-0.0.16/fx"
 fi
 if exists "$prefix/.state-dir"; then
     [ -f "$prefix/.state-dir" ] && [ ! -L "$prefix/.state-dir" ] || owner "$prefix/.state-dir"
@@ -285,7 +292,12 @@ version=${version%-"$platform".tar.gz}
 case "$version" in ''|*[!0-9A-Za-z.+-]*) die 'unsafe release version' ;; esac
 case "$version" in [0-9]*|v[0-9]*) ;; *) die 'release version must begin with a number or vNUMBER' ;; esac
 version_dir=$prefix/$version
-if exists "$version_dir" && [ ! -f "$version_dir/.installed" ]; then owner "$version_dir"; fi
+if exists "$version_dir"; then
+    [ -d "$version_dir" ] && [ ! -L "$version_dir" ] && [ -f "$version_dir/.installed" ] && [ ! -L "$version_dir/.installed" ] || owner "$version_dir"
+    for path in "$version_dir/hx-server" "$version_dir/hx-run" "$version_dir/com.hyperthymesia.server.plist" "$version_dir/hyperthymesia.service"; do
+        if exists "$path"; then [ -f "$path" ] && [ ! -L "$path" ] || owner "$path"; fi
+    done
+fi
 if [ "$app_only" = true ] && [ -f "$prefix/.state-dir" ] && [ "${current_target:-}" != "$version_dir" ]; then
     die 'use the full installer to upgrade an installation with a managed server'
 fi
@@ -302,7 +314,10 @@ fetch "$release_base/$asset" "$work/server.tar.gz"
 verify "$work/server.tar.gz" "$server_sha"
 untar "$work/server.tar.gz" "$work/payload"
 [ -f "$work/payload/hx-server" ] && [ -x "$work/payload/hx-server" ] || die 'hx-server executable missing'
-actual_version=$("$work/payload/hx-server" --version) || die 'hx-server --version failed'
+# Downloaded executables must not see the owner's HOME or inherited secrets,
+# including during --dry-run. Checksums are fetched from the release host;
+# they detect corruption but are not an independent signature.
+actual_version=$(env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" --version) || die 'hx-server --version failed'
 [ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
 if [ -f "$version_dir/hx-server" ]; then
     [ "$(sha256 "$version_dir/hx-server")" = "$(sha256 "$work/payload/hx-server")" ] || die 'retained version differs from the release; version directories are immutable'
@@ -671,17 +686,22 @@ if [ ! -e "$version_dir" ]; then
 fi
 # Refresh rendering atomically even on a same-version rerun. A killed copy must
 # never truncate the wrapper or unit that the previous service needs to restart.
-cp "$work/payload/hx-run" "$version_dir/.hx-run.next"
-mv "$version_dir/.hx-run.next" "$version_dir/hx-run"
-cp "$work/payload/$service_name" "$version_dir/.service.next"
-mv "$version_dir/.service.next" "$version_dir/$service_name"
-cp "$work/fx/fx" "$prefix/tools/fx-0.0.16/.fx.staging"
-chmod 755 "$prefix/tools/fx-0.0.16/.fx.staging"
-mv "$prefix/tools/fx-0.0.16/.fx.staging" "$prefix/tools/fx-0.0.16/fx"
+next_wrapper=$(mktemp "$version_dir/.hx-run.XXXXXXXX")
+cp "$work/payload/hx-run" "$next_wrapper"
+chmod 755 "$next_wrapper"
+mv "$next_wrapper" "$version_dir/hx-run"
+next_service=$(mktemp "$version_dir/.service.XXXXXXXX")
+cp "$work/payload/$service_name" "$next_service"
+mv "$next_service" "$version_dir/$service_name"
+next_fx=$(mktemp "$prefix/tools/fx-0.0.16/.fx.XXXXXXXX")
+cp "$work/fx/fx" "$next_fx"
+chmod 755 "$next_fx"
+mv "$next_fx" "$prefix/tools/fx-0.0.16/fx"
 switch_current "$version_dir"
 if [ "$app_only" = false ]; then
-    printf '%s\n' "$state" > "$prefix/.state-dir.next"
-    mv "$prefix/.state-dir.next" "$prefix/.state-dir"
+    next_state=$(mktemp "$prefix/.state-dir.XXXXXXXX")
+    printf '%s\n' "$state" > "$next_state"
+    mv "$next_state" "$prefix/.state-dir"
     mkdir -p "$state"
     chmod 700 "$state"
     new_env=false
@@ -722,8 +742,9 @@ if [ "$install_app" = true ]; then
     mkdir -p "$HOME/Applications"
     [ -L "$app" ] || ln -s "$prefix/current/Hyperthymesia.app" "$app"
 fi
-printf '%s\n' "$version_dir" > "$prefix/.last-version.next"
-mv "$prefix/.last-version.next" "$prefix/.last-version"
+next_version=$(mktemp "$prefix/.last-version.XXXXXXXX")
+printf '%s\n' "$version_dir" > "$next_version"
+mv "$next_version" "$prefix/.last-version"
 committed=true
 save_progress
 if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then rm -f "$prefix/pending-upgrade"; fi
@@ -742,7 +763,9 @@ if [ "$app_only" = false ]; then
     fi
     printf 'Then: hx-server --state-dir "%s" doctor (load server.env first).\n' "$state"
     printf 'Pair a device: hx-server --state-dir "%s" pair --url http://127.0.0.1:7377 --name DEVICE.\n' "$state"
-    printf 'Dashboard: create a read_l3 token with token create --name dashboard --prefix CONNECTOR --scopes read_l3. Keep the token private.\n'
+    printf 'Dashboard: '; quote "$bin"; printf ' --state-dir '; quote "$state"
+    printf ' token create --name dashboard --prefix source: --prefix macos-agent: --prefix macos-media: --prefix companion: --scopes read_raw,read_l3\n'
+    printf 'Keep the printed token private: it can read raw evidence and manage sources. Open http://127.0.0.1:7377/login. Add other connector prefixes when needed.\n'
     printf 'Remote access: tailscale serve --bg 7377, or ssh -N -L 7377:127.0.0.1:7377 user@host.\n'
     printf 'Automatic GC is off. A login delayed past 24 hours leaves old windows on the daily paid sweep cap.\n'
 fi

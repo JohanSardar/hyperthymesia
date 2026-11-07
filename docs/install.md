@@ -47,8 +47,8 @@ The single active state folder is:
 
 State is 0700; `core.sqlite`, `agent.sqlite`, `server.env` and `server.log`
 are 0600. Blobs and locks stay inside it. `Store::create` enforces privacy
-independently of umask. Automatic GC stays **off**; read
-[GC safety](gc-safety.md) before running `hx-server gc`.
+independently of umask. Automatic GC stays **off**, and `hx-server gc` is
+disabled because deleting old chunks is not yet safe. See [GC safety](gc-safety.md).
 
 macOS uses the LaunchAgent `com.hyperthymesia.server` in `gui/$(id -u)`.
 A desktop login is required; it restarts at login, not boot. Linux uses

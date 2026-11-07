@@ -68,7 +68,6 @@ versions arriving later. Back up and stop an existing server before migrating.
 
     cargo run -p hx-server -- compile --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
     cargo run -p hx-server -- interpret --from 2026-01-01T00:00:00Z --to 2026-01-02T00:00:00Z
-    cargo run -p hx-server -- gc
 
 Use the same `--state-dir` for `serve`, `compile` and `interpret`. Provider runs
 hold OS locks in `<state-dir>/locks/interpret-<window-start>` so a manual run and
@@ -91,10 +90,9 @@ at four-hour UTC boundaries, and enqueues a second interpretation at window end
 plus 24 hours. Late data dirties affected windows, including the next window when
 its thirty-minute input overlap is affected. The prior canonical revision remains
 readable while new work runs. Changed entity memory invalidates existing windows;
-changed carried tasks invalidate later windows. Automatic GC is off; read
-[GC safety](../../docs/gc-safety.md) before running it with the same
-state folder as serve. Eligible chunk files expire after thirty days; stills remain,
-and pins prevent deletion. Raw envelopes and expired blob manifests remain.
+changed carried tasks invalidate later windows. Automatic GC is off and the
+manual GC command is disabled because deleting old chunks is not yet safe.
+See [GC safety](../../docs/gc-safety.md).
 
 ## Server-owner disclosure policy
 

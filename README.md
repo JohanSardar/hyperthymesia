@@ -61,9 +61,13 @@ fx_dir="$HOME/.local/share/hyperthymesia/tools/fx-0.0.16"
 download_dir="$(mktemp -d)"
 curl -fL "https://github.com/vercel-labs/fx/releases/download/v0.0.16/fx-$platform.tar.gz" \
   -o "$download_dir/fx.tar.gz"
-python3 -c 'import hashlib,pathlib,sys; actual=hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); sys.exit(0 if actual==sys.argv[2] else "fx checksum mismatch")' \
-  "$download_dir/fx.tar.gz" "$checksum" &&
-mkdir -p "$fx_dir" &&
+if ! python3 -c 'import hashlib,pathlib,sys; actual=hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); sys.exit(0 if actual==sys.argv[2] else "fx checksum mismatch")' \
+  "$download_dir/fx.tar.gz" "$checksum"; then
+  rm -rf "$download_dir"
+  echo 'Download verification failed. Nothing was installed; retry the download.' >&2
+  exit 1
+fi
+mkdir -p "$fx_dir"
 tar -xzf "$download_dir/fx.tar.gz" -C "$fx_dir"
 rm -rf "$download_dir"
 export HX_FX_BINARY="$fx_dir/fx"

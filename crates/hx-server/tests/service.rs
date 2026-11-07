@@ -16,6 +16,22 @@ fn executable(path: &Path, script: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+#[test]
+fn gc_refuses_without_touching_history() {
+    let scratch = tempfile::tempdir().unwrap();
+    let sentinel = scratch.path().join("history");
+    std::fs::write(&sentinel, b"synthetic evidence").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .env_clear()
+        .env("HOME", scratch.path())
+        .args(["--state-dir", scratch.path().to_str().unwrap(), "gc"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("gc is disabled"));
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"synthetic evidence");
+}
+
 async fn seed(store: &Store, old: bool) -> Interval {
     let w = hx_store::window_at(Utc::now() - Duration::hours(if old { 240 } else { 8 }));
     let e: Envelope = serde_json::from_value(json!({

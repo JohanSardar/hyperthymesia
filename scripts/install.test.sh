@@ -82,7 +82,11 @@ esac
         archive(fixture / f'hx-server-0.1.0-{platform}.tar.gz', {
             'hx-server': b'''#!/bin/sh
 set -eu
-if [ "$1" = --version ]; then echo 'hx-server 0.1.0'; exit; fi
+if [ "$1" = --version ]; then
+    case "$HOME" in */probe-home) ;; *) echo 'version probe used owner HOME' >&2; exit 83;; esac
+    [ -z "${AI_GATEWAY_API_KEY+x}" ] || { echo 'version probe inherited credentials' >&2; exit 84; }
+    echo 'hx-server 0.1.0'; exit
+fi
 [ "$1" = --state-dir ] || exit 97
 state=$2
 shift 2
@@ -157,6 +161,8 @@ esac
     assert state.stat().st_mode & 0o777 == 0o700
     assert (state / 'server.env').stat().st_mode & 0o777 == 0o600
     assert 'synthetic-key-never-print' not in result.stdout + result.stderr
+    assert '--prefix source:' in result.stdout and '--scopes read_raw,read_l3' in result.stdout
+    assert 'http://127.0.0.1:7377/login' in result.stdout
     original_env = (state / 'server.env').read_bytes()
     assert run(h).returncode == 0
     assert (state / 'server.env').read_bytes() == original_env
@@ -246,6 +252,34 @@ esac
         assert before_paths == sorted(str(path.relative_to(h)) for path in h.rglob('*'))
     print('ok: owner files are checked by existence only, also on uninstall')
 
+    # Managed markers do not grant ownership of redirected version/tool paths.
+    for redirected in ('version', 'server-binary', 'wrapper', 'tools', 'fx-dir', 'fx'):
+        h = home()
+        assert run(h).returncode == 0
+        prefix = h / '.local/share/hyperthymesia'
+        outside = root / ('outside-' + redirected)
+        outside.mkdir()
+        (outside / 'sentinel').write_text('do not change')
+        if redirected == 'version':
+            (outside / '.installed').write_text('marker')
+            target = prefix / '0.1.0'
+        elif redirected == 'server-binary':
+            target = prefix / '0.1.0/hx-server'
+        elif redirected == 'wrapper':
+            target = prefix / '0.1.0/hx-run'
+        elif redirected == 'tools':
+            target = prefix / 'tools'
+        elif redirected == 'fx-dir':
+            target = prefix / 'tools/fx-0.0.16'
+        else:
+            target = prefix / 'tools/fx-0.0.16/fx'
+        was_dir = target.is_dir()
+        target.rename(target.with_name(target.name + '.saved'))
+        target.symlink_to(outside if was_dir else outside / 'sentinel')
+        fails_unchanged(h, 3)
+        assert (outside / 'sentinel').read_text() == 'do not change'
+    print('ok: redirected version and tool paths are refused without touching targets')
+
     fails_unchanged(home(), 1, '--dry-run', os_name='Darwin', arch='x86_64')
     fails_unchanged(home(), 1, '--dry-run', arch='riscv64')
     print('ok: unsupported platforms reject without writes')
@@ -263,6 +297,7 @@ esac
             if p.is_file() or p.is_symlink():
                 assert str(p) in dry.stdout, f'dry run omitted {p}'
         wrapper = prefix / 'current/hx-run'
+        assert os.access(wrapper, os.X_OK), 'service wrapper must be executable'
         assert subprocess.run(['/bin/sh', '-n', str(wrapper)]).returncode == 0
         if os_name == 'Darwin':
             service = h / 'Library/LaunchAgents/com.hyperthymesia.server.plist'
@@ -418,4 +453,24 @@ esac
             assert os.readlink(prefix / 'current') == str(prefix / '0.1.0'), 'restart must target the old version even if atomic switch fails'
         assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
     print('ok: recovery IO failures still attempt old-service restart and report damage')
+
+    # Exercise the README's real fx snippet with a bad download and an existing
+    # synthetic binary. A failed check must not continue into that binary.
+    text = Path('README.md').read_text()
+    block = text.split('Install the pinned model runner, fx 0.0.16', 1)[1].split('```sh\n', 1)[1].split('\n```', 1)[0]
+    h = home()
+    old_fx = h / '.local/share/hyperthymesia/tools/fx-0.0.16/fx'
+    old_fx.parent.mkdir(parents=True)
+    old_fx.write_text('#!/bin/sh\ntouch "$HOME/existing-fx-ran"\n')
+    old_fx.chmod(0o700)
+    old_curl = (stubs / 'curl').read_text()
+    stub('curl', '[ "$1" = -fL ] && [ "$3" = -o ] || exit 97\nprintf bad-archive > "$4"\n')
+    env = dict(os.environ, HOME=str(h), PATH=str(stubs) + os.pathsep + os.environ['PATH'],
+               TMPDIR=str(root), TEST_OS='Darwin', TEST_ARCH='arm64')
+    result = subprocess.run(['/bin/sh', '-c', 'set -e\n' + block], env=env,
+                            capture_output=True, text=True, timeout=20)
+    (stubs / 'curl').write_text(old_curl)
+    assert result.returncode != 0 and 'verification failed' in result.stderr.lower(), result.stderr
+    assert not (h / 'existing-fx-ran').exists()
+    print('ok: README checksum failure stops before any existing fx can run')
 PY
