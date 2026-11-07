@@ -100,14 +100,14 @@ if exists "$prefix/.last-version"; then
     case "$last_version" in "$prefix/"*) ;; *) owner "$prefix/.last-version" ;; esac
     last_name=${last_version#"$prefix/"}
     case "$last_name" in ''|*/*|.|..) owner "$prefix/.last-version" ;; esac
-    [ -f "$last_version/.installed" ] && [ ! -L "$last_version" ] || owner "$prefix/.last-version"
+    [ -d "$last_version" ] && [ ! -L "$last_version" ] && [ -f "$last_version/.installed" ] && [ ! -L "$last_version/.installed" ] || owner "$prefix/.last-version"
 fi
 if exists "$prefix/current"; then
     [ -L "$prefix/current" ] || owner "$prefix/current"
     current_target=$(readlink "$prefix/current")
     current_version=${current_target#"$prefix/"}
     case "$current_version" in ''|*/*|.|..) owner "$prefix/current" ;; esac
-    [ "$current_target" = "$prefix/$current_version" ] && [ -f "$current_target/.installed" ] || owner "$prefix/current"
+    [ "$current_target" = "$prefix/$current_version" ] && [ -d "$current_target" ] && [ ! -L "$current_target" ] && [ -f "$current_target/.installed" ] && [ ! -L "$current_target/.installed" ] || owner "$prefix/current"
 fi
 
 state=$HOME/.local/state/hyperthymesia
@@ -142,7 +142,11 @@ if exists "$prefix/pending-upgrade"; then
     case "$recovery" in "$prefix"/.upgrade.*) ;; *) owner "$prefix/pending-upgrade" ;; esac
     recovery_name=${recovery#"$prefix/"}
     case "$recovery_name" in */*) owner "$prefix/pending-upgrade" ;; esac
-    [ -f "$recovery/lifecycle" ] && [ -x "$recovery/payload/hx-server" ] || die 'incomplete upgrade recovery record; retained state has not been changed'
+    [ -d "$recovery" ] && [ ! -L "$recovery" ] && \
+        [ -f "$recovery/lifecycle" ] && [ ! -L "$recovery/lifecycle" ] && \
+        [ -d "$recovery/payload" ] && [ ! -L "$recovery/payload" ] && \
+        [ -f "$recovery/payload/hx-server" ] && [ ! -L "$recovery/payload/hx-server" ] && \
+        [ -x "$recovery/payload/hx-server" ] || die 'incomplete or redirected upgrade recovery record; retained state has not been changed'
     if [ "$dry_run" = false ]; then
         "$recovery/payload/hx-server" --state-dir "$state" upgrade-recover --lifecycle "$recovery/lifecycle" || die 'interrupted upgrade recovery failed; retained copies kept'
         ! exists "$prefix/pending-upgrade" || die 'another upgrade is still running; no changes made'
@@ -237,6 +241,7 @@ refuse_staging() {
     done
 }
 refuse_staging "$prefix"/.state-dir.???????? "$prefix"/.last-version.???????? \
+    "$prefix"/.staging.???????? "$prefix".staging.???????? \
     "$prefix/tools/fx-0.0.16"/.fx.???????? "$state"/.install-prefix.????????
 
 for command in curl tar sed mktemp readlink; do command -v "$command" >/dev/null 2>&1 || die "missing command: $command"; done
@@ -469,8 +474,11 @@ if [ -L "$prefix/current" ]; then old=$(readlink "$prefix/current"); fi
 if [ -z "$old" ] && [ -n "${last_version:-}" ]; then old=$last_version; fi
 if [ -z "$old" ]; then
     for retained in "$prefix"/*; do
-        if [ -d "$retained" ] && [ ! -L "$retained" ] && [ -f "$retained/.installed" ] && [ -x "$retained/hx-server" ]; then
-            if [ ! -f "$state/core.sqlite" ] || "$retained/hx-server" --state-dir "$state" doctor --state-only >/dev/null 2>&1; then old=$retained; fi
+        if [ -d "$retained" ] && [ ! -L "$retained" ] && [ -f "$retained/.installed" ] && [ ! -L "$retained/.installed" ]; then
+            if exists "$retained/hx-server"; then
+                [ -f "$retained/hx-server" ] && [ ! -L "$retained/hx-server" ] || owner "$retained/hx-server"
+                if [ -x "$retained/hx-server" ] && { [ ! -f "$state/core.sqlite" ] || "$retained/hx-server" --state-dir "$state" doctor --state-only >/dev/null 2>&1; }; then old=$retained; fi
+            fi
         fi
     done
 fi
@@ -605,6 +613,12 @@ rollback() {
     for staged in "${next_wrapper:-}" "${next_service:-}" "${next_fx:-}" "${next_state:-}" "${next_marker:-}" "${next_version:-}"; do
         if [ -n "$staged" ] && [ -f "$staged" ] && [ ! -L "$staged" ]; then rm -f "$staged" || :; fi
     done
+    # The prefix stage contains only our ownership marker. Never recursively
+    # remove an unexpected directory or contents.
+    if [ -n "${prefix_stage:-}" ] && [ -d "$prefix_stage" ] && [ ! -L "$prefix_stage" ]; then
+        if [ -f "$prefix_stage/.installed" ] && [ ! -L "$prefix_stage/.installed" ]; then rm -f "$prefix_stage/.installed" || :; fi
+        rmdir "$prefix_stage" 2>/dev/null || :
+    fi
     # Recovery must attempt every step, even when storage itself is failing.
     set +e
     # The durable commit is the boundary: a cleanup error after it must not
@@ -627,7 +641,10 @@ rollback() {
                     chmod 600 "$state/server.log" || restored=false
                     next_marker=$(mktemp "$state/.install-prefix.XXXXXXXX") || restored=false
                     if [ -n "${next_marker:-}" ]; then
-                        { printf '%s\n' "$prefix" > "$next_marker" && mv "$next_marker" "$state/.install-prefix"; } || restored=false
+                        if ! { printf '%s\n' "$prefix" > "$next_marker" && "$work/payload/hx-server" --state-dir "$state" install-marker --staged "$next_marker" --target "$state/.install-prefix"; }; then
+                            restored=false
+                            if [ -f "$next_marker" ] && [ ! -L "$next_marker" ]; then rm -f "$next_marker" || :; fi
+                        fi
                     fi
                 else
                     restored=false
@@ -762,7 +779,7 @@ if [ "$app_only" = false ]; then
     server migrate
     next_marker=$(mktemp "$state/.install-prefix.XXXXXXXX")
     printf '%s\n' "$prefix" > "$next_marker"
-    mv "$next_marker" "$state/.install-prefix"
+    "$work/payload/hx-server" --state-dir "$state" install-marker --staged "$next_marker" --target "$state/.install-prefix"
     mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
     [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
     [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"

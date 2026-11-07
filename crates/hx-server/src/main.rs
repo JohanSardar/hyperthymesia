@@ -62,6 +62,14 @@ enum Command {
         #[arg(long)]
         target: PathBuf,
     },
+    /// Atomically publish the install-prefix marker without following its target.
+    #[command(hide = true)]
+    InstallMarker {
+        #[arg(long)]
+        staged: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+    },
     Serve {
         #[arg(long, default_value = "127.0.0.1:7377")]
         listen: SocketAddr,
@@ -137,6 +145,35 @@ async fn main() -> Result<()> {
         let next = stage.path().join("current");
         std::os::unix::fs::symlink(target, &next)?;
         std::fs::rename(&next, link)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        return Ok(());
+    }
+    if let Command::InstallMarker { staged, target } = &cli.command {
+        let parent = target.parent().context("installer marker parent")?;
+        anyhow::ensure!(
+            staged.parent() == Some(parent)
+                && target
+                    .file_name()
+                    .is_some_and(|name| name == ".install-prefix")
+                && staged
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".install-prefix.")),
+            "invalid installer marker path"
+        );
+        anyhow::ensure!(
+            std::fs::symlink_metadata(staged)?.file_type().is_file(),
+            "installer marker staging path must be a regular file"
+        );
+        match std::fs::symlink_metadata(target) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "installer marker target must be a regular file"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::File::open(staged)?.sync_all()?;
+        std::fs::rename(staged, target)?;
         std::fs::File::open(parent)?.sync_all()?;
         return Ok(());
     }
@@ -314,7 +351,8 @@ async fn main() -> Result<()> {
         | Command::Status { .. }
         | Command::UpgradeGuard { .. }
         | Command::UpgradeRecover { .. }
-        | Command::InstallLink { .. } => {
+        | Command::InstallLink { .. }
+        | Command::InstallMarker { .. } => {
             unreachable!("readiness commands run before opening the store")
         }
         Command::Migrate => unreachable!("migrate runs before opening the store"),

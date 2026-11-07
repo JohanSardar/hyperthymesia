@@ -62,6 +62,51 @@ async fn gc_refuses_without_touching_history() {
     f.close().await;
 }
 
+#[test]
+fn installer_marker_never_follows_a_directory_or_symlink() {
+    let scratch = tempfile::tempdir().unwrap();
+    let staged = scratch.path().join(".install-prefix.synthetic");
+    let target = scratch.path().join(".install-prefix");
+    let outside = scratch.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    for symlink in [false, true] {
+        std::fs::write(&staged, b"synthetic marker").unwrap();
+        if symlink {
+            std::os::unix::fs::symlink(&outside, &target).unwrap();
+        } else {
+            std::fs::create_dir(&target).unwrap();
+        }
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+            .env_clear()
+            .env("HOME", scratch.path())
+            .args(["install-marker", "--staged"])
+            .arg(&staged)
+            .arg("--target")
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"synthetic marker");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        if symlink {
+            std::fs::remove_file(&target).unwrap();
+        } else {
+            std::fs::remove_dir(&target).unwrap();
+        }
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .env_clear()
+        .env("HOME", scratch.path())
+        .args(["install-marker", "--staged"])
+        .arg(&staged)
+        .arg("--target")
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(std::fs::read(&target).unwrap(), b"synthetic marker");
+}
+
 async fn seed(store: &Store, old: bool) -> Interval {
     let w = hx_store::window_at(Utc::now() - Duration::hours(if old { 240 } else { 8 }));
     let e: Envelope = serde_json::from_value(json!({

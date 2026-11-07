@@ -111,6 +111,13 @@ doctor)
         *--state-only*) [ "${TEST_FAIL_STEP:-}" != post-doctor ] || exit 1 ;;
         *) [ "${TEST_FAIL_STEP:-}" != provider ] || exit 1 ;;
     esac ;;
+install-marker)
+    [ "$1" = --staged ] && [ "$3" = --target ] || exit 97
+    if [ "${TEST_ROLLBACK_FAIL:-}" = marker ]; then
+        for failed in "$state".failed-*; do [ ! -d "$failed" ] || exit 1; done
+    fi
+    [ ! -L "$4" ] && { [ ! -e "$4" ] || [ -f "$4" ]; } || exit 97
+    exec python3 -c 'import os,sys; os.replace(sys.argv[1],sys.argv[2])' "$2" "$4" ;;
 install-link)
     [ "$1" = --link ] && [ "$3" = --target ] || exit 97
     if [ "${TEST_ROLLBACK_FAIL:-}" = switch ] && [ "${4##*/}" = 0.1.0 ]; then exit 1; fi
@@ -316,6 +323,35 @@ esac
     assert outside.read_text() == 'do not truncate'
     print('ok: redirected state ownership marker is not overwritten')
 
+    h = home()
+    assert run(h).returncode == 0
+    prefix = h / '.local/share/hyperthymesia'
+    outside = root / 'outside-recovery'
+    (outside / 'payload').mkdir(parents=True)
+    (outside / 'lifecycle').write_text('synthetic')
+    (outside / 'payload/hx-server').write_text('#!/bin/sh\ntouch "$HOME/recovery-ran"\n')
+    (outside / 'payload/hx-server').chmod(0o700)
+    (prefix / '.upgrade.redirect').symlink_to(outside, target_is_directory=True)
+    (prefix / 'pending-upgrade').symlink_to(prefix / '.upgrade.redirect')
+    fails_unchanged(h, 1, '--uninstall')
+    assert not (h / 'recovery-ran').exists()
+    print('ok: redirected pending recovery is not executed')
+
+    h = home()
+    assert run(h).returncode == 0
+    prefix = h / '.local/share/hyperthymesia'
+    (prefix / 'current').unlink()
+    (prefix / '.last-version').unlink()
+    old_binary = prefix / '0.1.0/hx-server'
+    old_binary.rename(old_binary.with_name('hx-server.saved'))
+    outside = root / 'outside-fallback-server'
+    outside.write_text('#!/bin/sh\ntouch "$HOME/fallback-ran"\nexit 0\n')
+    outside.chmod(0o700)
+    old_binary.symlink_to(outside)
+    fails_unchanged(h, 3, '--server-only')
+    assert not (h / 'fallback-ran').exists()
+    print('ok: fallback scan refuses a redirected retained binary before execution')
+
     fails_unchanged(home(), 1, '--dry-run', os_name='Darwin', arch='x86_64')
     fails_unchanged(home(), 1, '--dry-run', arch='riscv64')
     print('ok: unsupported platforms reject without writes')
@@ -383,6 +419,17 @@ esac
     assert not (h / '.local/share/hyperthymesia').exists()
     assert run(h).returncode == 0
     print('ok: ownership marker is published atomically with prefix')
+
+    h = home()
+    stub('cp', 'case "$*" in *"/.staging."*) printf retained > "$3/partial"; exit 1;; esac\nexec /bin/cp "$@"\n')
+    failed = run(h)
+    (stubs / 'cp').unlink()
+    assert failed.returncode != 0
+    stages = list((h / '.local/share/hyperthymesia').glob('.staging.????????'))
+    assert len(stages) == 1 and (stages[0] / 'partial').read_text() == 'retained'
+    fails_unchanged(h, 1)
+    assert len(list((h / '.local/share/hyperthymesia').glob('.staging.????????'))) == 1
+    print('ok: partial payload staging is retained and blocks accumulation')
 
     # A disk-full or interrupted first install must stay ours to retry; the owner
     # refusal has no override, so a marker-less prefix would be a dead end.
@@ -480,7 +527,7 @@ esac
     print('ok: reinstall without current backs up existing evidence')
 
     # Failed recovery IO must never short-circuit the attempt to restart old.
-    for fault in ('move', 'copy', 'switch'):
+    for fault in ('move', 'copy', 'switch', 'marker'):
         h = home()
         # Reuse the earlier retained version as a fixture of an old install.
         prefix = h / '.local/share/hyperthymesia'
@@ -513,6 +560,8 @@ esac
         if fault == 'switch':
             assert os.readlink(prefix / 'current') == str(prefix / '0.1.0'), 'restart must target the old version even if atomic switch fails'
         assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
+        if fault == 'marker':
+            assert not list(state.glob('.install-prefix.????????')), 'rollback left marker staging behind'
     print('ok: recovery IO failures still attempt old-service restart and report damage')
 
     # Exercise the README's real fx snippet with a bad download and an existing
