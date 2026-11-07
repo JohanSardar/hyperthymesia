@@ -139,16 +139,16 @@ esac
         path = root / f'''home {counter} & quote' % " $ test'''
         path.mkdir()
         return path
-    def run(h, *args, os_name='Linux', arch='x86_64', script=installer):
+    def run(h, *args, os_name='Linux', arch='x86_64', script=installer, tmpdir=None, cwd=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith(('HX_', 'FX_'))}
         env.update(HOME=str(h), PATH=str(stubs) + os.pathsep + os.environ['PATH'],
-                   TMPDIR=str(root), HX_RELEASE_BASE=fixture.as_uri(),
+                   TMPDIR=tmpdir or str(root), HX_RELEASE_BASE=fixture.as_uri(),
                    HX_FX_RELEASE_BASE=fixture.as_uri(), TEST_OS=os_name, TEST_ARCH=arch,
                    TEST_COMMAND_LOG=str(root / 'commands'),
                    AI_GATEWAY_API_KEY='synthetic-key-never-print',
                    TEST_FAIL_STEP=os.environ.get('TEST_FAIL_STEP', ''),
                    TEST_HELD_LEASE=os.environ.get('TEST_HELD_LEASE', ''))
-        result = subprocess.run(['/bin/sh', str(script), *args], env=env, text=True, capture_output=True, timeout=20)
+        result = subprocess.run(['/bin/sh', str(script), *args], env=env, cwd=cwd, text=True, capture_output=True, timeout=20)
         return result
     def fails_unchanged(h, expected, *args, **kwargs):
         before = snapshot(h)
@@ -205,6 +205,19 @@ esac
     assert '127.0.0.1:7377' in result.stdout, 'missing service wrapper'
     assert snapshot(h) == before, 'dry run changed HOME'
     print('ok: Linux dry run renders without writes')
+
+    relative_work = root / 'relative-work'
+    (relative_work / 'tmp').mkdir(parents=True)
+    previous_cdpath = os.environ.get('CDPATH')
+    os.environ['CDPATH'] = '.'
+    result = run(home(), '--dry-run', tmpdir='tmp', cwd=relative_work)
+    if previous_cdpath is None:
+        os.environ.pop('CDPATH')
+    else:
+        os.environ['CDPATH'] = previous_cdpath
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not list((relative_work / 'tmp').iterdir()), 'scratch directory was not removed'
+    print('ok: relative TMPDIR with CDPATH succeeds and cleans scratch')
 
     # Hash failures must not modify even an existing managed installation.
     installed_home = home()

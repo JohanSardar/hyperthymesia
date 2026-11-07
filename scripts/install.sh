@@ -227,7 +227,7 @@ else
     die 'requires sha256sum or shasum'
 fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/hx-install.XXXXXXXX")
-work=$(cd "$work" && pwd -P)
+work=$(CDPATH= cd "$work" && pwd -P)
 cleanup() {
     # Never erase the only recovery program after an incomplete rollback.
     if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then
