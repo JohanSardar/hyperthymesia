@@ -25,9 +25,13 @@ Options: `--provider codex|grok|gateway`, `--model M`, `--effort E`,
 Grok/gateway users should select their supported model. Real logins beyond
 Codex still need owner validation; see [unknowns](specs/unknowns.md).
 
-Dry runs verify downloads and list files/service contents without initializing
-state or contacting service managers. Release archives use SHA256SUMS; private
-fx 0.0.16 uses hashes pinned in the script. Your own fx is kept.
+Dry runs verify downloads and list files/service contents without executing
+downloaded binaries, initializing state or contacting service managers. Release
+archives use SHA256SUMS from the same GitHub release, which detects corruption
+but is not an independent signature. Private fx 0.0.16 uses hashes pinned in
+the script. Your own fx is kept. A normal install runs downloaded programs as
+your user; the version probes use an empty environment and scratch home, not an
+OS sandbox.
 
 ## State and service
 

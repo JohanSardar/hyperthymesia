@@ -9,6 +9,7 @@ import io
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -67,7 +68,10 @@ esac
     fixture = root / 'release'
     fixture.mkdir()
     fx = root / 'fx.tar.gz'
-    fx_script = b'#!/bin/sh\n[ "$FX_AUTO_UPGRADE" = 0 ] || exit 81\n[ "$1" = --version ] || exit 82\nprintf "0.0.16\\n"\n'
+    probe_log = root / 'version-probes'
+    fx_script = (b'#!/bin/sh\n[ "$FX_AUTO_UPGRADE" = 0 ] || exit 81\n'
+                 b'[ "$1" = --version ] || exit 82\n[ "$PWD" = "$HOME" ] || exit 85\n' +
+                 f'printf fx >> {shlex.quote(str(probe_log))}\n'.encode() + b'printf "0.0.16\\n"\n')
     archive(fx, {'fx': fx_script})
     good_fx = fx.read_bytes()
     source = SOURCE.read_text()
@@ -85,6 +89,8 @@ set -eu
 if [ "$1" = --version ]; then
     case "$HOME" in */probe-home) ;; *) echo 'version probe used owner HOME' >&2; exit 83;; esac
     [ -z "${AI_GATEWAY_API_KEY+x}" ] || { echo 'version probe inherited credentials' >&2; exit 84; }
+    [ "$PWD" = "$HOME" ] || { echo 'version probe used owner cwd' >&2; exit 85; }
+    printf server >> __HX_PROBE_LOG__
     echo 'hx-server 0.1.0'; exit
 fi
 [ "$1" = --state-dir ] || exit 97
@@ -113,7 +119,7 @@ install-link)
 serve) printf "%s\\n" --state-dir "$state" serve "$@" > "$TEST_SERVER_ARGS"; printf "%s\\n" "$TEST_ENV" > "$TEST_SERVER_ENV" ;;
 *) exit 97 ;;
 esac
-''',
+'''.replace(b'__HX_PROBE_LOG__', shlex.quote(str(probe_log)).encode()),
             'hx-vision-ocr': b'#!/bin/sh\nexit 0\n',
         })
     app_name = 'Hyperthymesia-0.1.0-macos-aarch64.zip'
@@ -191,8 +197,10 @@ esac
     # can be credited: rejecting every invocation is not a valid installer.
     h = home()
     before = snapshot(h)
+    probe_log.unlink(missing_ok=True)
     result = run(h, '--dry-run')
     assert result.returncode == 0, result.stderr
+    assert not probe_log.exists(), 'dry-run executed a downloaded binary'
     assert 'hyperthymesia.service' in result.stdout, 'missing Linux service rendering'
     assert '127.0.0.1:7377' in result.stdout, 'missing service wrapper'
     assert snapshot(h) == before, 'dry run changed HOME'
@@ -280,6 +288,34 @@ esac
         assert (outside / 'sentinel').read_text() == 'do not change'
     print('ok: redirected version and tool paths are refused without touching targets')
 
+    h = home()
+    assert run(h).returncode == 0
+    prefix = h / '.local/share/hyperthymesia'
+    outside = root / 'outside-uninstall-fx'
+    outside.write_text('do not change')
+    fx_path = prefix / 'tools/fx-0.0.16/fx'
+    fx_path.unlink()
+    fx_path.symlink_to(outside)
+    log = root / 'commands'
+    log.write_text('')
+    result = run(h, '--uninstall')
+    assert result.returncode == 0, result.stderr
+    assert '--user stop hyperthymesia.service' in log.read_text()
+    assert outside.read_text() == 'do not change'
+    print('ok: redirected tool path does not prevent service uninstall')
+
+    h = home()
+    assert run(h).returncode == 0
+    state = h / '.local/state/hyperthymesia'
+    outside = root / 'outside-install-prefix'
+    outside.write_text('do not truncate')
+    marker = state / '.install-prefix'
+    marker.unlink()
+    marker.symlink_to(outside)
+    fails_unchanged(h, 3)
+    assert outside.read_text() == 'do not truncate'
+    print('ok: redirected state ownership marker is not overwritten')
+
     fails_unchanged(home(), 1, '--dry-run', os_name='Darwin', arch='x86_64')
     fails_unchanged(home(), 1, '--dry-run', arch='riscv64')
     print('ok: unsupported platforms reject without writes')
@@ -355,10 +391,22 @@ esac
     failed = run(h)
     (stubs / 'cp').unlink()
     assert failed.returncode != 0, 'stubbed cp failure was not reached'
+    fx_dir = h / '.local/share/hyperthymesia/tools/fx-0.0.16'
+    assert not list(fx_dir.glob('.fx.????????')), 'failed copy left staging files'
     retry = run(h)
     assert retry.returncode == 0, (retry.returncode, retry.stderr)
-    assert (h / '.local/share/hyperthymesia/tools/fx-0.0.16/fx').is_file()
-    print('ok: an interrupted first install can be retried')
+    assert (fx_dir / 'fx').is_file()
+    # Simulate a SIGKILL that left an unverified staging file: keep it, and
+    # refuse before a second attempt can accumulate another partial copy.
+    stale = fx_dir / '.fx.ABCDEFGH'
+    stale.write_text('unknown retained bytes')
+    log = root / 'commands'
+    log.write_text('')
+    result = fails_unchanged(h, 1)
+    assert 'staging retained' in result.stderr
+    assert stale.read_text() == 'unknown retained bytes'
+    assert '--user stop' not in log.read_text()
+    print('ok: failed copies clean their staging; killed staging is retained and blocks retry safely')
 
     h = home()
     assert run(h).returncode == 0
@@ -384,6 +432,13 @@ esac
     (state / 'core.sqlite').write_text('synthetic seeded evidence')
     env_before = (state / 'server.env').read_bytes()
     old = os.readlink(h / '.local/share/hyperthymesia/current')
+    h_cross = home()
+    assert run(h_cross).returncode == 0
+    old_binary = h_cross / '.local/share/hyperthymesia/0.1.0/hx-server'
+    old_binary.rename(old_binary.with_name('hx-server.saved'))
+    outside = root / 'outside-old-server'
+    outside.write_text('do not execute or overwrite')
+    old_binary.symlink_to(outside)
     for platform in ('linux-x86_64', 'linux-aarch64', 'macos-aarch64'):
         asset = fixture / f'hx-server-0.1.0-{platform}.tar.gz'
         files = {}
@@ -393,6 +448,12 @@ esac
         archive(fixture / f'hx-server-0.1.1-{platform}.tar.gz', files)
         asset.unlink()
     sums()
+    log = root / 'commands'
+    log.write_text('')
+    fails_unchanged(h_cross, 3, '--server-only')
+    assert outside.read_text() == 'do not execute or overwrite'
+    assert '--user stop' not in log.read_text()
+    print('ok: cross-version upgrade refuses redirected old backup executable')
     os.environ['TEST_FAIL_STEP'] = 'post-doctor'
     result = run(h, '--server-only')
     os.environ.pop('TEST_FAIL_STEP')

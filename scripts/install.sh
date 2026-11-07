@@ -91,13 +91,6 @@ if exists "$app" && ! managed_link "$app" "$prefix/current/Hyperthymesia.app"; t
 if exists "$prefix"; then
     [ -d "$prefix" ] && [ ! -L "$prefix" ] && [ -f "$prefix/.installed" ] && [ ! -L "$prefix/.installed" ] || owner "$prefix"
 fi
-# A marked prefix does not make redirected descendants ours to write.
-for path in "$prefix/tools" "$prefix/tools/fx-0.0.16"; do
-    if exists "$path"; then [ -d "$path" ] && [ ! -L "$path" ] || owner "$path"; fi
-done
-if exists "$prefix/tools/fx-0.0.16/fx"; then
-    [ -f "$prefix/tools/fx-0.0.16/fx" ] && [ ! -L "$prefix/tools/fx-0.0.16/fx" ] || owner "$prefix/tools/fx-0.0.16/fx"
-fi
 if exists "$prefix/.state-dir"; then
     [ -f "$prefix/.state-dir" ] && [ ! -L "$prefix/.state-dir" ] || owner "$prefix/.state-dir"
 fi
@@ -225,6 +218,27 @@ if [ "$uninstall" = true ]; then
     exit 0
 fi
 
+# These checks protect writes; they must not prevent uninstall or recovery
+# from stopping an already-running service.
+for path in "$prefix/tools" "$prefix/tools/fx-0.0.16"; do
+    if exists "$path"; then [ -d "$path" ] && [ ! -L "$path" ] || owner "$path"; fi
+done
+if exists "$prefix/tools/fx-0.0.16/fx"; then
+    [ -f "$prefix/tools/fx-0.0.16/fx" ] && [ ! -L "$prefix/tools/fx-0.0.16/fx" ] || owner "$prefix/tools/fx-0.0.16/fx"
+fi
+if exists "$state/.install-prefix"; then
+    [ -f "$state/.install-prefix" ] && [ ! -L "$state/.install-prefix" ] || owner "$state/.install-prefix"
+fi
+# Never delete an unrecognized file after SIGKILL. Refuse another attempt
+# before stopping a service rather than accumulating more staging files.
+refuse_staging() {
+    for staged in "$@"; do
+        if exists "$staged"; then die "interrupted installer staging retained at $staged; move it aside and retry"; fi
+    done
+}
+refuse_staging "$prefix"/.state-dir.???????? "$prefix"/.last-version.???????? \
+    "$prefix/tools/fx-0.0.16"/.fx.???????? "$state"/.install-prefix.????????
+
 for command in curl tar sed mktemp readlink; do command -v "$command" >/dev/null 2>&1 || die "missing command: $command"; done
 if command -v sha256sum >/dev/null 2>&1; then
     sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
@@ -234,6 +248,7 @@ else
     die 'requires sha256sum or shasum'
 fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/hx-install.XXXXXXXX")
+work=$(cd "$work" && pwd -P)
 cleanup() {
     # Never erase the only recovery program after an incomplete rollback.
     if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then
@@ -298,6 +313,7 @@ if exists "$version_dir"; then
         if exists "$path"; then [ -f "$path" ] && [ ! -L "$path" ] || owner "$path"; fi
     done
 fi
+refuse_staging "$version_dir"/.hx-run.???????? "$version_dir"/.service.????????
 if [ "$app_only" = true ] && [ -f "$prefix/.state-dir" ] && [ "${current_target:-}" != "$version_dir" ]; then
     die 'use the full installer to upgrade an installation with a managed server'
 fi
@@ -306,19 +322,23 @@ fetch "$fx_base/fx-$platform.tar.gz" "$work/fx.tar.gz"
 verify "$work/fx.tar.gz" "$fx_sha"
 untar "$work/fx.tar.gz" "$work/fx"
 [ -f "$work/fx/fx" ] && [ -x "$work/fx/fx" ] || die 'fx executable missing'
-# Even the version probe gets a disposable HOME, so fx cannot modify logins.
+# A dry run does not execute downloaded binaries. A normal install probes in
+# a disposable HOME/cwd with no inherited environment; this is not a sandbox.
 mkdir "$work/probe-home"
-fx_version=$(env -i HOME="$work/probe-home" PATH=/usr/bin:/bin FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 FX_NO_OPEN_BROWSER=1 "$work/fx/fx" --version) || die 'fx --version failed'
-[ "$fx_version" = 0.0.16 ] || die "expected fx 0.0.16, got: $fx_version"
+if [ "$dry_run" = false ]; then
+    fx_version=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 FX_NO_OPEN_BROWSER=1 "$work/fx/fx" --version) || die 'fx --version failed'
+    [ "$fx_version" = 0.0.16 ] || die "expected fx 0.0.16, got: $fx_version"
+fi
 fetch "$release_base/$asset" "$work/server.tar.gz"
 verify "$work/server.tar.gz" "$server_sha"
 untar "$work/server.tar.gz" "$work/payload"
 [ -f "$work/payload/hx-server" ] && [ -x "$work/payload/hx-server" ] || die 'hx-server executable missing'
-# Downloaded executables must not see the owner's HOME or inherited secrets,
-# including during --dry-run. Checksums are fetched from the release host;
-# they detect corruption but are not an independent signature.
-actual_version=$(env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" --version) || die 'hx-server --version failed'
-[ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
+# Checksums are fetched from the release host; they detect corruption but
+# are not an independent signature. Normal probes run as the current user.
+if [ "$dry_run" = false ]; then
+    actual_version=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" --version) || die 'hx-server --version failed'
+    [ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
+fi
 if [ -f "$version_dir/hx-server" ]; then
     [ "$(sha256 "$version_dir/hx-server")" = "$(sha256 "$work/payload/hx-server")" ] || die 'retained version differs from the release; version directories are immutable'
 fi
@@ -454,6 +474,11 @@ if [ -z "$old" ]; then
         fi
     done
 fi
+# A retained version may be used for backup and rollback. Refuse redirected
+# executables even when upgrading to a different version.
+if [ -n "$old" ]; then
+    [ -f "$old/hx-server" ] && [ ! -L "$old/hx-server" ] || owner "$old/hx-server"
+fi
 # status and the guard are read-only with respect to the databases. The guard
 # prevents the service worker from claiming work until this lifecycle returns.
 if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
@@ -575,6 +600,11 @@ fi
 rollback() {
     result=$?
     trap - 0 HUP INT TERM
+    # Remove only staging paths created by this lifecycle. A SIGKILL can leave
+    # them behind; the next install refuses them without deleting user files.
+    for staged in "${next_wrapper:-}" "${next_service:-}" "${next_fx:-}" "${next_state:-}" "${next_marker:-}" "${next_version:-}"; do
+        if [ -n "$staged" ] && [ -f "$staged" ] && [ ! -L "$staged" ]; then rm -f "$staged" || :; fi
+    done
     # Recovery must attempt every step, even when storage itself is failing.
     set +e
     # The durable commit is the boundary: a cleanup error after it must not
@@ -595,7 +625,10 @@ rollback() {
                     chmod 600 "$state/server.env" || restored=false
                     touch "$state/server.log" || restored=false
                     chmod 600 "$state/server.log" || restored=false
-                    printf '%s\n' "$prefix" > "$state/.install-prefix" || restored=false
+                    next_marker=$(mktemp "$state/.install-prefix.XXXXXXXX") || restored=false
+                    if [ -n "${next_marker:-}" ]; then
+                        { printf '%s\n' "$prefix" > "$next_marker" && mv "$next_marker" "$state/.install-prefix"; } || restored=false
+                    fi
                 else
                     restored=false
                 fi
@@ -727,7 +760,9 @@ if [ "$app_only" = false ]; then
     migration_started=true
     save_progress
     server migrate
-    printf '%s\n' "$prefix" > "$state/.install-prefix"
+    next_marker=$(mktemp "$state/.install-prefix.XXXXXXXX")
+    printf '%s\n' "$prefix" > "$next_marker"
+    mv "$next_marker" "$state/.install-prefix"
     mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
     [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
     [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"
