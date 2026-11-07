@@ -16,6 +16,52 @@ fn executable(path: &Path, script: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+#[tokio::test]
+async fn gc_refuses_without_touching_history() {
+    let f = Fixture::new().await;
+    let bytes = b"synthetic video";
+    let sha = hx_store::hash(bytes);
+    f.store.upload_blob(&sha, bytes).await.unwrap();
+    let event: Envelope = serde_json::from_value(json!({
+        "envelope_version":1,"observation_id":ulid::Ulid::generate(),
+        "connector_instance":"test:gc","source_key":"chunk","revision":"1",
+        "operation":"observe","kind":"media.chunk","schema_version":1,
+        "time":hx_schema::ObservationTime::point(Utc::now()),
+        "sensitivity":"normal","payload":{},
+        "blobs":[{"sha256":sha,"media_type":"video/mp4","bytes":bytes.len()}]
+    }))
+    .unwrap();
+    f.store
+        .ingest(
+            UploadBatch {
+                batch_id: ulid::Ulid::generate(),
+                envelopes: vec![event],
+            },
+            &Token {
+                prefixes: vec!["test:".into()],
+                scopes: vec!["ingest".into()],
+            },
+        )
+        .await
+        .unwrap();
+    f.store
+        .age_blobs_for_retention("no-synthetic-still")
+        .await
+        .unwrap();
+    let blob = f.store.blob_path(&sha).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .env_clear()
+        .env("HOME", &f.store.data_dir)
+        .args(["--state-dir", f.store.data_dir.to_str().unwrap(), "gc"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("gc is disabled"));
+    assert_eq!(std::fs::read(blob).unwrap(), bytes);
+    assert_eq!(f.store.record_count("events").await.unwrap(), 1);
+    f.close().await;
+}
+
 async fn seed(store: &Store, old: bool) -> Interval {
     let w = hx_store::window_at(Utc::now() - Duration::hours(if old { 240 } else { 8 }));
     let e: Envelope = serde_json::from_value(json!({

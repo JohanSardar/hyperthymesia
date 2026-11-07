@@ -25,9 +25,13 @@ Options: `--provider codex|grok|gateway`, `--model M`, `--effort E`,
 Grok/gateway users should select their supported model. Real logins beyond
 Codex still need owner validation; see [unknowns](specs/unknowns.md).
 
-Dry runs verify downloads and list files/service contents without initializing
-state or contacting service managers. Release archives use SHA256SUMS; private
-fx 0.0.16 uses hashes pinned in the script. Your own fx is kept.
+Dry runs verify downloads and list files/service contents without executing
+downloaded binaries, initializing state or contacting service managers. Release
+archives use SHA256SUMS from the same GitHub release, which detects corruption
+but is not an independent signature. Private fx 0.0.16 uses hashes pinned in
+the script. Your own fx is kept. A normal install runs downloaded programs as
+your user; the version probes use an empty environment and scratch home, not an
+OS sandbox.
 
 ## State and service
 
@@ -47,8 +51,8 @@ The single active state folder is:
 
 State is 0700; `core.sqlite`, `agent.sqlite`, `server.env` and `server.log`
 are 0600. Blobs and locks stay inside it. `Store::create` enforces privacy
-independently of umask. Automatic GC stays **off**; read
-[GC safety](gc-safety.md) before running `hx-server gc`.
+independently of umask. Automatic GC stays **off**, and `hx-server gc` is
+disabled because deleting old chunks is not yet safe. See [GC safety](gc-safety.md).
 
 macOS uses the LaunchAgent `com.hyperthymesia.server` in `gui/$(id -u)`.
 A desktop login is required; it restarts at login, not boot. Linux uses
@@ -157,8 +161,10 @@ An upgrade:
    record blocks admission; agents retain retryable uploads. If the installer dies
    after the candidate starts, the candidate shuts down without admitting work.
    Its manager restarts through recovery before reopening state or accepting uploads.
-4. Keeps the previous version and backup. A failed step after stop restores
-   both databases and blobs, preserves `server.env`, switches back and restarts.
+4. Keeps the previous version and backup. A failed step after stop attempts to
+   restore both databases and blobs, preserve `server.env`, switch back and restart.
+   **Source keys are not restored automatically:** they remain in the retained
+   failed-generation state. Check them before relying on any connected source.
    Failed-generation state stays beside the active directory as `<state>.failed-*`
    (`server.failed-*` for the default macOS state).
    A private `<prefix>/.upgrade.*` recovery directory is published before stopping.
@@ -199,16 +205,20 @@ and use `--start-fresh` with an absent or empty target. This never adopts an
 unmanaged installation and never deletes retained evidence. Keep backups and
 failed copies until recovery is verified; `status` reports their paths/sizes.
 
-If the entire installer process tree or machine stops, start the managed user
-service again. Its wrapper completes any pending rollback before loading the
-state environment or opening history; rerunning the installer also resumes it.
+If the installer process tree stops, the service wrapper attempts pending
+rollback before opening history; rerunning the installer also attempts recovery.
+Process interruption has been tested, but recovery after a real power loss has
+not. Keep independent backups before upgrading.
 Do not delete `pending-upgrade`, its private `.upgrade.*` directory or the
 `.hx-upgrade-lock-*` anchor beside state while recovery
 is pending. Retained binaries, backups and failed state are never pruned automatically.
 A server SIGKILL also closes fx's lifetime pipe: an independent watcher kills its
 process group, including descendants, without relying on service-manager cleanup.
-`--uninstall` stops/disables the managed user service and unlinks entry points;
-it never deletes state, credentials, backups or retained versions.
+`--uninstall` stops/disables the managed **server** service and unlinks entry
+points; it never deletes state, credentials, backups or retained versions.
+**It does not yet stop or unregister the separately running Mac capture agent.**
+Do not rely on it to stop recording. Stop capture and disable its login startup
+separately until this is fixed.
 
 ## Verification
 

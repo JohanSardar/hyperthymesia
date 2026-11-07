@@ -227,6 +227,7 @@ else
     die 'requires sha256sum or shasum'
 fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/hx-install.XXXXXXXX")
+work=$(cd "$work" && pwd -P)
 cleanup() {
     # Never erase the only recovery program after an incomplete rollback.
     if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then
@@ -294,16 +295,23 @@ fetch "$fx_base/fx-$platform.tar.gz" "$work/fx.tar.gz"
 verify "$work/fx.tar.gz" "$fx_sha"
 untar "$work/fx.tar.gz" "$work/fx"
 [ -f "$work/fx/fx" ] && [ -x "$work/fx/fx" ] || die 'fx executable missing'
-# Even the version probe gets a disposable HOME, so fx cannot modify logins.
+# Dry runs do not execute downloaded binaries. Normal probes use a disposable
+# home and working directory with no inherited environment; this is not a sandbox.
 mkdir "$work/probe-home"
-fx_version=$(env -i HOME="$work/probe-home" PATH=/usr/bin:/bin FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 FX_NO_OPEN_BROWSER=1 "$work/fx/fx" --version) || die 'fx --version failed'
-[ "$fx_version" = 0.0.16 ] || die "expected fx 0.0.16, got: $fx_version"
+if [ "$dry_run" = false ]; then
+    fx_version=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 FX_NO_OPEN_BROWSER=1 "$work/fx/fx" --version) || die 'fx --version failed'
+    [ "$fx_version" = 0.0.16 ] || die "expected fx 0.0.16, got: $fx_version"
+fi
 fetch "$release_base/$asset" "$work/server.tar.gz"
 verify "$work/server.tar.gz" "$server_sha"
 untar "$work/server.tar.gz" "$work/payload"
 [ -f "$work/payload/hx-server" ] && [ -x "$work/payload/hx-server" ] || die 'hx-server executable missing'
-actual_version=$("$work/payload/hx-server" --version) || die 'hx-server --version failed'
-[ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
+# The archive and its checksum share a release host: this checks corruption,
+# not an independent signature. Normal probes still run as the current user.
+if [ "$dry_run" = false ]; then
+    actual_version=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" --version) || die 'hx-server --version failed'
+    [ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
+fi
 if [ -f "$version_dir/hx-server" ]; then
     [ "$(sha256 "$version_dir/hx-server")" = "$(sha256 "$work/payload/hx-server")" ] || die 'retained version differs from the release; version directories are immutable'
 fi
@@ -742,7 +750,9 @@ if [ "$app_only" = false ]; then
     fi
     printf 'Then: hx-server --state-dir "%s" doctor (load server.env first).\n' "$state"
     printf 'Pair a device: hx-server --state-dir "%s" pair --url http://127.0.0.1:7377 --name DEVICE.\n' "$state"
-    printf 'Dashboard: create a read_l3 token with token create --name dashboard --prefix CONNECTOR --scopes read_l3. Keep the token private.\n'
+    printf 'Dashboard: '; quote "$bin"; printf ' --state-dir '; quote "$state"
+    printf ' token create --name dashboard --prefix source: --prefix macos-agent: --prefix macos-media: --prefix companion: --scopes read_raw,read_l3\n'
+    printf 'Keep the printed token private: it can read raw evidence and manage sources. Open http://127.0.0.1:7377/login. Add other connector prefixes when needed.\n'
     printf 'Remote access: tailscale serve --bg 7377, or ssh -N -L 7377:127.0.0.1:7377 user@host.\n'
     printf 'Automatic GC is off. A login delayed past 24 hours leaves old windows on the daily paid sweep cap.\n'
 fi
