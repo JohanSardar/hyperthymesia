@@ -286,7 +286,7 @@ esac
     print('ok: owner files are checked by existence only, also on uninstall')
 
     # Managed markers do not grant ownership of redirected version/tool paths.
-    for redirected in ('version', 'server-binary', 'wrapper', 'tools', 'fx-dir', 'fx'):
+    for redirected in ('version', 'server-binary', 'wrapper', 'tools', 'fx-dir', 'fx', 'backups'):
         h = home()
         assert run(h).returncode == 0
         prefix = h / '.local/share/hyperthymesia'
@@ -300,6 +300,9 @@ esac
             target = prefix / '0.1.0/hx-server'
         elif redirected == 'wrapper':
             target = prefix / '0.1.0/hx-run'
+        elif redirected == 'backups':
+            target = prefix / 'backups'
+            target.mkdir()
         elif redirected == 'tools':
             target = prefix / 'tools'
         elif redirected == 'fx-dir':
@@ -372,6 +375,23 @@ esac
     result = subprocess.run(['/bin/sh', str(wrapper)], env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode != 0 and not (h / 'recovery-ran').exists()
     print('ok: redirected recovery progress is never sourced or executed')
+
+    h = home()
+    assert run(h).returncode == 0
+    prefix = h / '.local/share/hyperthymesia'
+    recovery = prefix / '.upgrade.ABCDEFGH'
+    (recovery / 'payload').mkdir(parents=True)
+    (recovery / 'lifecycle').write_text('synthetic')
+    (recovery / 'progress').write_text('synthetic')
+    (recovery / 'recovery-v2').write_text('synthetic')
+    (recovery / 'payload/hx-server').write_text('#!/bin/sh\nrm "$HOME/.local/share/hyperthymesia/pending-upgrade"\n')
+    (recovery / 'payload/hx-server').chmod(0o700)
+    (prefix / 'pending-upgrade').symlink_to(recovery)
+    result = run(h)
+    assert result.returncode == 0, result.stderr
+    assert (recovery / 'recovery-complete').is_file() and not (prefix / 'pending-upgrade').exists()
+    assert run(h).returncode == 0, 'completed retained recovery blocked a later rerun'
+    print('ok: completed recovery is retained without blocking reruns')
 
     h = home()
     assert run(h).returncode == 0
@@ -563,7 +583,7 @@ esac
     print('ok: reinstall without current backs up existing evidence')
 
     # Failed recovery IO must never short-circuit the attempt to restart old.
-    for fault in ('move', 'copy', 'switch', 'marker'):
+    for fault in ('move', 'copy', 'switch', 'marker', 'stale-marker'):
         h = home()
         # Reuse the earlier retained version as a fixture of an old install.
         prefix = h / '.local/share/hyperthymesia'
@@ -582,6 +602,8 @@ esac
             stub('mv', 'case "$*" in *failed-*) exit 1;; esac\nexec /bin/mv "$@"\n')
         if fault == 'copy':
             stub('cp', 'case "$*" in *failed-*/server.env*) exit 1;; esac\nexec /bin/cp "$@"\n')
+        if fault == 'stale-marker':
+            stub('cp', 'case "$*" in *failed-*/server.env*) dir=${2%/server.env}; printf retained > "$dir/.install-prefix.ABCDEFGH";; esac\nexec /bin/cp "$@"\n')
         log = root / 'commands'
         log.write_text('')
         os.environ['TEST_FAIL_STEP'] = 'post-doctor'
@@ -592,13 +614,20 @@ esac
         for command in ('mv', 'cp'):
             if (stubs / command).exists(): (stubs / command).unlink()
         assert result.returncode != 0
-        assert log.read_text().count('enable --now hyperthymesia.service') == 2, result.stderr
+        starts = log.read_text().count('enable --now hyperthymesia.service')
+        assert starts == (2 if fault == 'switch' else 1), result.stderr
         if fault == 'switch':
             assert os.readlink(prefix / 'current') == str(prefix / '0.1.0'), 'restart must target the old version even if atomic switch fails'
+        else:
+            assert 'previous service was not restarted' in result.stderr
         assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
         if fault == 'marker':
             assert not list(state.glob('.install-prefix.????????')), 'rollback left marker staging behind'
-    print('ok: recovery IO failures still attempt old-service restart and report damage')
+        if fault == 'stale-marker':
+            assert (state / '.install-prefix.ABCDEFGH').read_text() == 'retained'
+            assert not (state / '.install-prefix').exists()
+            assert (prefix / 'pending-upgrade').is_symlink()
+    print('ok: incomplete recovery keeps service stopped and reports retained state')
 
     # Exercise the README's real fx snippet with a bad download and an existing
     # synthetic binary. A failed check must not continue into that binary.

@@ -142,16 +142,19 @@ if exists "$prefix/pending-upgrade"; then
     case "$recovery" in "$prefix"/.upgrade.*) ;; *) owner "$prefix/pending-upgrade" ;; esac
     recovery_name=${recovery#"$prefix/"}
     case "$recovery_name" in */*) owner "$prefix/pending-upgrade" ;; esac
-    [ -d "$recovery" ] && [ ! -L "$recovery" ] && \
-        [ -f "$recovery/lifecycle" ] && [ ! -L "$recovery/lifecycle" ] && \
+    [ -d "$recovery" ] && [ ! -L "$recovery" ] || die 'redirected upgrade recovery directory; retained state has not been changed'
+    [ -f "$recovery/recovery-v2" ] && [ ! -L "$recovery/recovery-v2" ] || die 'older or incomplete recovery record; keep all copies and use the earlier installer or see docs/install.md'
+    [ -f "$recovery/lifecycle" ] && [ ! -L "$recovery/lifecycle" ] && \
         [ -f "$recovery/progress" ] && [ ! -L "$recovery/progress" ] && \
-        [ -f "$recovery/recovery-v2" ] && [ ! -L "$recovery/recovery-v2" ] && \
         [ -d "$recovery/payload" ] && [ ! -L "$recovery/payload" ] && \
         [ -f "$recovery/payload/hx-server" ] && [ ! -L "$recovery/payload/hx-server" ] && \
         [ -x "$recovery/payload/hx-server" ] || die 'incomplete or redirected upgrade recovery record; retained state has not been changed'
     if [ "$dry_run" = false ]; then
         "$recovery/payload/hx-server" --state-dir "$state" upgrade-recover --lifecycle "$recovery/lifecycle" || die 'interrupted upgrade recovery failed; retained copies kept'
         ! exists "$prefix/pending-upgrade" || die 'another upgrade is still running; no changes made'
+        if ! exists "$recovery/recovery-complete"; then
+            (set -C; printf '%s\n' 'hyperthymesia-recovery-complete' > "$recovery/recovery-complete") || die 'recovery succeeded but its retained directory could not be marked; state kept'
+        fi
     fi
 fi
 
@@ -226,7 +229,7 @@ fi
 
 # These checks protect writes; they must not prevent uninstall or recovery
 # from stopping an already-running service.
-for path in "$prefix/tools" "$prefix/tools/fx-0.0.16"; do
+for path in "$prefix/tools" "$prefix/tools/fx-0.0.16" "$prefix/backups"; do
     if exists "$path"; then [ -d "$path" ] && [ ! -L "$path" ] || owner "$path"; fi
 done
 if exists "$prefix/tools/fx-0.0.16/fx"; then
@@ -239,7 +242,13 @@ fi
 # before stopping a service rather than accumulating more staging files.
 refuse_staging() {
     for staged in "$@"; do
-        if exists "$staged"; then die "interrupted installer staging retained at $staged; move it aside and retry"; fi
+        if exists "$staged"; then
+            case "$staged" in
+                "$prefix"/.upgrade.*)
+                    if [ -d "$staged" ] && [ ! -L "$staged" ] && [ -f "$staged/recovery-complete" ] && [ ! -L "$staged/recovery-complete" ] && [ "$(cat "$staged/recovery-complete")" = 'hyperthymesia-recovery-complete' ]; then continue; fi ;;
+            esac
+            die "interrupted installer staging retained at $staged; move it aside and retry"
+        fi
     done
 }
 refuse_staging "$prefix"/.state-dir.???????? "$prefix"/.last-version.???????? \
@@ -405,6 +414,9 @@ if [ -e "$prefix/pending-upgrade" ] || [ -L "$prefix/pending-upgrade" ]; then
         [ -f "$recovery/payload/hx-server" ] && [ ! -L "$recovery/payload/hx-server" ] && \
         [ -x "$recovery/payload/hx-server" ] || { echo 'Incomplete or redirected upgrade recovery; state retained.' >&2; exit 1; }
     HX_INSTALL_STARTUP_RECOVERY=1 "$recovery/payload/hx-server" --state-dir "$state" upgrade-recover --lifecycle "$recovery/lifecycle"
+    if [ ! -e "$prefix/pending-upgrade" ] && [ ! -L "$prefix/pending-upgrade" ] && [ ! -e "$recovery/recovery-complete" ] && [ ! -L "$recovery/recovery-complete" ]; then
+        (set -C; printf '%s\n' 'hyperthymesia-recovery-complete' > "$recovery/recovery-complete") || { echo 'Could not mark completed recovery; state retained.' >&2; exit 1; }
+    fi
 fi
 exec >> "$state/server.log" 2>&1
 set -a
@@ -722,19 +734,20 @@ rollback() {
                 # that wrapper will exec the restored binary when we return.
                 rm -f "$prefix/pending-upgrade" || restored=false
             fi
-            # Always try the old service after link restoration, including after
-            # a failed copy/rename. Its exact-schema open refuses unsafe state.
-            mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
-            [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
-            [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"
-            if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" = 1 ] || { service_start && healthy; }; then
-                if [ "$restored" = true ]; then
+            # Never reopen admission on an incomplete restore. The restored
+            # directory has a different lock inode, so a running service could
+            # otherwise accept data while pending recovery is still present.
+            if [ "$restored" = true ]; then
+                mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
+                [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
+                [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"
+                if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" = 1 ] || { service_start && healthy; }; then
                     printf 'Previous service restarted.\n' >&2
                 else
-                    printf 'Service responded, but state recovery is incomplete; inspect the retained copies.\n' >&2
+                    printf 'Previous service did not recover. Retained binary: %s; state: %s; backup: %s.\n' "$old" "$state" "$backup" >&2
                 fi
             else
-                printf 'Previous service did not recover. Retained binary: %s; state: %s; backup: %s.\n' "$old" "$state" "$backup" >&2
+                printf 'Recovery is incomplete; the previous service was not restarted. Keep the pending record and retained copies.\n' >&2
             fi
         fi
     fi

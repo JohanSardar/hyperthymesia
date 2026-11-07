@@ -173,9 +173,10 @@ An upgrade:
    the guard lock, so killing an installer ancestor cannot admit worker jobs.
    Wrapper/unit refreshes and path records use atomic replacement, including
    same-version reruns.
-   Filesystem recovery errors do not skip the old-service restart attempt; the
-   installer reports incomplete recovery and retains the recovery program. If
-   atomic link replacement fails, it attempts a portable unlink/link while stopped.
+   If filesystem recovery is incomplete, the installer leaves the old service
+   stopped and retains the recovery program and state copies. This prevents a
+   partially restored state from accepting new work. If atomic link replacement
+   fails, it attempts a portable unlink/link while stopped.
 
 `migrate` applies every missing version, including a lower number arriving later.
 It rejects newer/unknown, dirty or changed checksums before writable access.
@@ -207,8 +208,13 @@ If the entire installer process tree or machine stops, start the managed user
 service again. Its wrapper completes any pending rollback before loading the
 state environment or opening history; rerunning the installer also resumes it.
 Do not delete `pending-upgrade`, its private `.upgrade.*` directory or the
-`.hx-upgrade-lock-*` anchor beside state while recovery
-is pending. Retained binaries, backups and failed state are never pruned automatically.
+`.hx-upgrade-lock-*` anchor beside state while recovery is pending. A recovery
+record created by an older installer may require the exact earlier installer;
+the new installer refuses an unrecognized recovery format rather than running
+it. Keep all state, backups and recovery files, and contact the maintainers if
+the earlier installer is unavailable. Completed recovery directories are retained
+and do not block later installs. Retained binaries, backups and failed state are
+never pruned automatically.
 A server SIGKILL also closes fx's lifetime pipe: an independent watcher kills its
 process group, including descendants, without relying on service-manager cleanup.
 `--uninstall` stops/disables the managed user service and unlinks entry points;

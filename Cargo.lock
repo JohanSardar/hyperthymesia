@@ -982,7 +982,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hx-agent"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "hx-compile"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "hx-schema",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "hx-connector-apple-bridge"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "hx-connector-claude-code"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1059,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "hx-connector-codex"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "hx-connector-git"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "hx-connector-sdk"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "hx-connector-t3code"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "hx-interpret"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "hx-jobs"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "hx-macos-sys"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "block2",
  "crossbeam-queue",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "hx-move"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "hx-schema"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "hex",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "hx-sources"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1267,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "hx-store"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "hx-visual"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
