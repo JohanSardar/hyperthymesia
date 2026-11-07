@@ -107,6 +107,46 @@ fn installer_marker_never_follows_a_directory_or_symlink() {
     assert_eq!(std::fs::read(&target).unwrap(), b"synthetic marker");
 }
 
+#[test]
+fn startup_recovery_never_restores_without_a_live_guard() {
+    let scratch = tempfile::tempdir().unwrap();
+    let lifecycle = scratch.path().join("lifecycle");
+    let ran = scratch.path().join("recovered");
+    std::fs::write(&lifecycle, "#!/bin/sh\ntouch \"$HOME/recovered\"\n").unwrap();
+    let lock_path = scratch.path().join("guard.lock");
+    let guard = std::fs::File::create(&lock_path).unwrap();
+    let run = |maintenance_only: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"));
+        command
+            .env_clear()
+            .env("HOME", scratch.path())
+            .env("PATH", "/usr/bin:/bin")
+            .arg("--state-dir")
+            .arg(scratch.path())
+            .args(["upgrade-recover", "--lifecycle"])
+            .arg(&lifecycle);
+        if maintenance_only {
+            command.arg("--maintenance-only");
+        }
+        command.output().unwrap()
+    };
+    let idle = run(true);
+    assert!(!idle.status.success());
+    assert!(!ran.exists());
+    guard.try_lock().unwrap();
+    assert!(
+        run(true).status.success(),
+        "a guarded candidate may start in maintenance"
+    );
+    assert!(!ran.exists());
+    drop(guard);
+    assert!(
+        run(false).status.success(),
+        "explicit recovery should run when idle"
+    );
+    assert!(ran.exists());
+}
+
 async fn seed(store: &Store, old: bool) -> Interval {
     let w = hx_store::window_at(Utc::now() - Duration::hours(if old { 240 } else { 8 }));
     let e: Envelope = serde_json::from_value(json!({

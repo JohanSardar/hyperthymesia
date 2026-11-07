@@ -94,6 +94,7 @@ if [ "$1" = --version ]; then
     echo 'hx-server 0.1.0'; exit
 fi
 if [ "$1" = install-marker ] && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi
+if [ "$1" = upgrade-recover ] && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; echo --maintenance-only; exit 0; fi
 [ "$1" = --state-dir ] || exit 97
 state=$2
 shift 2
@@ -109,7 +110,11 @@ restore) mkdir -p "$state/blobs" "$state/locks"; cp "$2/core.sqlite" "$2/agent.s
 doctor)
     case "$*" in
         *--allow-older-schema*) : ;;
-        *--state-only*) [ "${TEST_FAIL_STEP:-}" != post-doctor ] || exit 1 ;;
+        *--state-only*)
+            if [ "${TEST_FAIL_STEP:-}" = post-doctor ]; then
+                if [ "${TEST_ROLLBACK_FAIL:-}" = manifest ]; then rm -f "$HOME/.local/share/hyperthymesia/backups/"*/manifest.json; fi
+                exit 1
+            fi ;;
         *) [ "${TEST_FAIL_STEP:-}" != provider ] || exit 1 ;;
     esac ;;
 install-marker)
@@ -362,6 +367,16 @@ esac
     assert not (h / 'recovery-ran').exists()
     print('ok: redirected pending recovery is not executed by installer or startup wrapper')
 
+    # Even when recovery is unsafe to inspect, uninstall must stop the server.
+    backups = prefix / 'backups'
+    backups.symlink_to(outside, target_is_directory=True)
+    log = root / 'commands'
+    log.write_text('')
+    fails_unchanged(h, 3, '--uninstall')
+    assert '--user stop hyperthymesia.service' in log.read_text()
+    backups.unlink()
+    print('ok: uninstall stops the server before refusing redirected recovery backup')
+
     (prefix / 'pending-upgrade').unlink()
     recovery = prefix / '.upgrade.valid'
     (recovery / 'payload').mkdir(parents=True)
@@ -608,7 +623,7 @@ esac
     print('ok: reinstall without current backs up existing evidence')
 
     # Failed recovery IO must never short-circuit the attempt to restart old.
-    for fault in ('move', 'copy', 'switch', 'marker', 'stale-marker', 'stop'):
+    for fault in ('move', 'copy', 'switch', 'marker', 'stale-marker', 'stop', 'manifest'):
         h = home()
         # Reuse the earlier retained version as a fixture of an old install.
         prefix = h / '.local/share/hyperthymesia'
@@ -649,6 +664,11 @@ esac
             assert not list(state.parent.glob(state.name + '.failed-*'))
             assert (state / 'core.sqlite').read_text() == 'saved'
             continue
+        if fault == 'manifest':
+            assert 'backup manifest is missing' in result.stderr
+            assert (prefix / 'pending-upgrade').is_symlink()
+            assert not list(state.parent.glob(state.name + '.failed-*'))
+            assert (state / 'core.sqlite').read_text() == 'saved'
         starts = log.read_text().count('enable --now hyperthymesia.service')
         assert starts == (2 if fault == 'switch' else 1), result.stderr
         if fault == 'switch':

@@ -53,6 +53,9 @@ enum Command {
     UpgradeRecover {
         #[arg(long)]
         lifecycle: PathBuf,
+        /// Do not perform recovery; only let a guarded candidate start.
+        #[arg(long)]
+        maintenance_only: bool,
     },
     /// Atomically replace an installer symlink without platform-specific mv flags.
     #[command(hide = true)]
@@ -226,7 +229,11 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if let Command::UpgradeRecover { lifecycle } = &cli.command {
+    if let Command::UpgradeRecover {
+        lifecycle,
+        maintenance_only,
+    } = &cli.command
+    {
         // The hard link keeps the original guard inode reachable even if
         // rollback has already moved the state directory aside. Never create
         // empty replacement state just to acquire a recovery lock.
@@ -238,6 +245,11 @@ async fn main() -> Result<()> {
         )?;
         match lock.try_lock() {
             Ok(()) => {
+                if *maintenance_only {
+                    bail!(
+                        "upgrade recovery is pending; rerun the installer after stopping the server"
+                    );
+                }
                 let status = tokio::process::Command::new("/bin/sh")
                     .arg(lifecycle)
                     .arg("--recover")

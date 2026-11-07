@@ -160,7 +160,7 @@ An upgrade:
    requests return 503 while either the guard lock or durable `pending-upgrade`
    record blocks admission; agents retain retryable uploads. If the installer dies
    after the candidate starts, the candidate shuts down without admitting work.
-   Its manager restarts through recovery before reopening state or accepting uploads.
+   Rerun the installer to stop the service and complete recovery before reopening state.
 4. Keeps the previous version and backup. A failed step after stop attempts to
    restore both databases and blobs, preserve `server.env`, switch back and restart.
    **Source keys are not restored automatically:** they remain in the retained
@@ -206,10 +206,11 @@ and use `--start-fresh` with an absent or empty target. This never adopts an
 unmanaged installation and never deletes retained evidence. Keep backups and
 failed copies until recovery is verified; `status` reports their paths/sizes.
 
-If the installer process tree stops, the service wrapper attempts pending
-rollback before opening history; rerunning the installer also attempts recovery.
-Process interruption has been tested, but recovery after a real power loss has
-not. Keep independent backups before upgrading.
+If the installer process tree stops, rerun the installer. The service wrapper
+will not perform recovery while a server may still be running; it refuses to
+open history until the installer can stop the service and recover. Process
+interruption has been tested, but recovery after a real power loss has not.
+Keep independent backups before upgrading.
 Do not delete `pending-upgrade`, its private `.upgrade.*` directory or the
 `.hx-upgrade-lock-*` anchor beside state while recovery is pending. A recovery
 record created by an older installer may require the exact earlier installer;

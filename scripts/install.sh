@@ -133,10 +133,39 @@ if exists "$state"; then
     done
 fi
 
+service_stop() {
+    case "$platform" in
+        macos-*)
+            if launchctl print "gui/$(id -u)/com.hyperthymesia.server" >/dev/null 2>&1; then
+                pid=$(launchctl print "gui/$(id -u)/com.hyperthymesia.server" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p')
+                launchctl bootout "gui/$(id -u)/com.hyperthymesia.server" || return
+                count=0
+                while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
+                    [ "$count" -lt 60 ] || return 1
+                    count=$((count + 1))
+                    sleep 1
+                done
+            fi ;;
+        linux-*)
+            systemctl --user stop hyperthymesia.service || { [ "$?" -eq 5 ]; } ;;
+    esac
+}
+service_start() {
+    case "$platform" in
+        macos-*) launchctl bootstrap "gui/$(id -u)" "$plist" ;;
+        linux-*) systemctl --user daemon-reload && systemctl --user enable --now hyperthymesia.service ;;
+    esac
+}
+
 # Recover a killed lifecycle before checking for a missing registered core: a
 # rollback may have been interrupted between moving state aside and publishing
 # the verified restore. Only installer-owned, durable scratch is executable here.
 if exists "$prefix/pending-upgrade"; then
+    # Uninstall must still stop the server even if the recovery record itself
+    # is invalid. It must not try to restore or delete any untrusted files.
+    if [ "$uninstall" = true ] && [ "$dry_run" = false ] && [ -f "$prefix/.state-dir" ]; then
+        service_stop || die 'could not stop user service; entry points kept'
+    fi
     [ -L "$prefix/pending-upgrade" ] || owner "$prefix/pending-upgrade"
     recovery=$(readlink "$prefix/pending-upgrade")
     case "$recovery" in "$prefix"/.upgrade.*) ;; *) owner "$prefix/pending-upgrade" ;; esac
@@ -175,35 +204,6 @@ fi
 case "$state/" in *'/../'*|*'/./'*|*'//'*) die 'state directory must use a normalized absolute path' ;; esac
 case "$state/" in "$prefix/"*) die 'state directory must be outside the program prefix' ;; esac
 case "$prefix/" in "$state/"*) die 'state directory must not contain the program prefix' ;; esac
-
-service_stop() {
-    case "$platform" in
-        macos-*)
-            if launchctl print "gui/$(id -u)/com.hyperthymesia.server" >/dev/null 2>&1; then
-                pid=$(launchctl print "gui/$(id -u)/com.hyperthymesia.server" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p')
-                launchctl bootout "gui/$(id -u)/com.hyperthymesia.server" || return
-                # bootout can return before graceful shutdown has finished.
-                count=0
-                while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
-                    [ "$count" -lt 60 ] || return 1
-                    count=$((count + 1))
-                    sleep 1
-                done
-            fi ;;
-        linux-*)
-            systemctl --user stop hyperthymesia.service || {
-                # Exit 5 means not installed, as after a managed uninstall.
-                # No other manager failure may be mistaken for a stopped unit.
-                [ "$?" -eq 5 ]
-            } ;;
-    esac
-}
-service_start() {
-    case "$platform" in
-        macos-*) launchctl bootstrap "gui/$(id -u)" "$plist" ;;
-        linux-*) systemctl --user daemon-reload && systemctl --user enable --now hyperthymesia.service ;;
-    esac
-}
 
 if [ "$uninstall" = true ]; then
     if [ "$dry_run" = false ] && [ -f "$prefix/.state-dir" ]; then
@@ -356,6 +356,8 @@ if [ "$dry_run" = false ]; then
     actual_version=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" --version) || die 'hx-server --version failed'
     [ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
     (cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" install-marker --help >/dev/null 2>&1) || die 'server archive is incompatible with this installer; use the install.sh from the same release'
+    recover_help=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" upgrade-recover --help) || die 'server recovery capability check failed'
+    case "$recover_help" in *--maintenance-only*) ;; *) die 'server archive is incompatible with this installer; use the install.sh from the same release' ;; esac
 fi
 if [ -f "$version_dir/hx-server" ]; then
     [ "$(sha256 "$version_dir/hx-server")" = "$(sha256 "$work/payload/hx-server")" ] || die 'retained version differs from the release; version directories are immutable'
@@ -417,7 +419,10 @@ if [ -e "$prefix/pending-upgrade" ] || [ -L "$prefix/pending-upgrade" ]; then
         [ -d "$recovery/payload" ] && [ ! -L "$recovery/payload" ] && \
         [ -f "$recovery/payload/hx-server" ] && [ ! -L "$recovery/payload/hx-server" ] && \
         [ -x "$recovery/payload/hx-server" ] || { echo 'Incomplete or redirected upgrade recovery; state retained.' >&2; exit 1; }
-    HX_INSTALL_STARTUP_RECOVERY=1 "$recovery/payload/hx-server" --state-dir "$state" upgrade-recover --lifecycle "$recovery/lifecycle"
+    # Startup may only serve maintenance health while a live installer holds
+    # the guard. If the guard is free, rerun the installer to stop the service
+    # and recover; a duplicate wrapper must never restore under a live server.
+    "$recovery/payload/hx-server" --state-dir "$state" upgrade-recover --lifecycle "$recovery/lifecycle" --maintenance-only
     if [ ! -e "$prefix/pending-upgrade" ] && [ ! -L "$prefix/pending-upgrade" ] && [ ! -e "$recovery/recovery-complete" ] && [ ! -L "$recovery/recovery-complete" ]; then
         (set -C; printf '%s\n' 'hyperthymesia-recovery-complete' > "$recovery/recovery-complete") || { echo 'Could not mark completed recovery; state retained.' >&2; exit 1; }
     fi
@@ -662,6 +667,7 @@ if [ "${1:-}" = --recover ]; then
         if [ ! -e "$work/recovery-complete" ] && [ ! -L "$work/recovery-complete" ]; then
             (set -C; printf '%s\n' 'hyperthymesia-recovery-complete' > "$work/recovery-complete") || exit 1
         fi
+        [ -f "$work/recovery-complete" ] && [ ! -L "$work/recovery-complete" ] && [ "$(cat "$work/recovery-complete")" = 'hyperthymesia-recovery-complete' ] || exit 1
         rm -f "$prefix/pending-upgrade"
         exit 0
     fi
@@ -686,12 +692,20 @@ rollback() {
     # roll back a version that the recovery program already considers committed.
     if [ "$committed" = true ]; then exit "$result"; fi
     if [ "$result" -ne 0 ] && [ "$stopped" = true ]; then
-        if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" != 1 ] && ! service_stop; then
+        if ! service_stop; then
             printf 'Could not stop candidate service during recovery; state and pending record were retained.\n' >&2
             exit "$result"
         fi
         restored=true
-        if [ -n "$backup" ] && [ -f "$backup/manifest.json" ] && [ "$migration_started" = true ]; then
+        if [ "$migration_started" = true ] && { [ -z "$backup" ] || [ ! -f "$backup/manifest.json" ] || [ -L "$backup/manifest.json" ]; }; then
+            printf 'Recovery incomplete: the verified backup manifest is missing. State and pending record retained.\n' >&2
+            restored=false
+        fi
+        if [ "$migration_started" = true ] && { [ ! -d "$prefix/backups" ] || [ -L "$prefix/backups" ]; }; then
+            printf 'Recovery incomplete: the backup directory is missing or redirected. State and pending record retained.\n' >&2
+            restored=false
+        fi
+        if [ "$restored" = true ] && [ -n "$backup" ] && [ -f "$backup/manifest.json" ] && [ "$migration_started" = true ]; then
             # The original failed generation is never moved twice. Restore
             # publishes atomically, so a killed recovery can resume after rename.
             if [ -d "$failed_state" ] || mv "$state" "$failed_state"; then
@@ -725,7 +739,7 @@ rollback() {
                 printf 'Recovery incomplete. Backup: %s; retained failed state: %s. Restore into an absent/empty state folder before restarting.\n' "$backup" "$failed_state" >&2
             fi
         fi
-        if [ -n "$old" ]; then
+        if [ -n "$old" ] && [ "$restored" = true ]; then
             if ! switch_current "$old"; then
                 printf 'Could not restore current link atomically to %s; trying portable recovery.\n' "$old" >&2
                 # Recovery already has the service stopped. If rename itself
@@ -743,9 +757,11 @@ rollback() {
                 fi
             fi
             if [ "$restored" = true ]; then
-                # Startup recovery calls us from the service wrapper itself;
-                # that wrapper will exec the restored binary when we return.
-                rm -f "$prefix/pending-upgrade" || restored=false
+                if [ ! -e "$work/recovery-complete" ] && [ ! -L "$work/recovery-complete" ]; then
+                    (set -C; printf '%s\n' 'hyperthymesia-recovery-complete' > "$work/recovery-complete") || restored=false
+                fi
+                [ -f "$work/recovery-complete" ] && [ ! -L "$work/recovery-complete" ] && [ "$(cat "$work/recovery-complete")" = 'hyperthymesia-recovery-complete' ] || restored=false
+                if [ "$restored" = true ]; then rm -f "$prefix/pending-upgrade" || restored=false; fi
             fi
             # Never reopen admission on an incomplete restore. The restored
             # directory has a different lock inode, so a running service could
@@ -754,7 +770,7 @@ rollback() {
                 mkdir -p "$(dirname "$bin")" "$(dirname "$service")"
                 [ -L "$bin" ] || ln -s "$prefix/current/hx-server" "$bin"
                 [ -L "$service" ] || ln -s "$prefix/current/$service_name" "$service"
-                if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" = 1 ] || { service_start && healthy; }; then
+                if service_start && healthy; then
                     printf 'Previous service restarted.\n' >&2
                 else
                     printf 'Previous service did not recover. Retained binary: %s; state: %s; backup: %s.\n' "$old" "$state" "$backup" >&2
@@ -762,6 +778,8 @@ rollback() {
             else
                 printf 'Recovery is incomplete; the previous service was not restarted. Keep the pending record and retained copies.\n' >&2
             fi
+        elif [ "$restored" = false ]; then
+            printf 'Recovery is incomplete; the previous service was not restarted. Keep the pending record and retained copies.\n' >&2
         fi
     fi
     if [ "$stopped" = false ]; then
