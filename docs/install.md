@@ -161,8 +161,10 @@ An upgrade:
    record blocks admission; agents retain retryable uploads. If the installer dies
    after the candidate starts, the candidate shuts down without admitting work.
    Its manager restarts through recovery before reopening state or accepting uploads.
-4. Keeps the previous version and backup. A failed step after stop restores
-   both databases and blobs, preserves `server.env`, switches back and restarts.
+4. Keeps the previous version and backup. A failed step after stop attempts to
+   restore both databases and blobs, preserve `server.env`, switch back and restart.
+   **Source keys are not restored automatically:** they remain in the retained
+   failed-generation state. Check them before relying on any connected source.
    Failed-generation state stays beside the active directory as `<state>.failed-*`
    (`server.failed-*` for the default macOS state).
    A private `<prefix>/.upgrade.*` recovery directory is published before stopping.
@@ -204,21 +206,27 @@ and use `--start-fresh` with an absent or empty target. This never adopts an
 unmanaged installation and never deletes retained evidence. Keep backups and
 failed copies until recovery is verified; `status` reports their paths/sizes.
 
-If the entire installer process tree or machine stops, start the managed user
-service again. Its wrapper completes any pending rollback before loading the
-state environment or opening history; rerunning the installer also resumes it.
+If the installer process tree stops, the service wrapper attempts pending
+rollback before opening history; rerunning the installer also attempts recovery.
+Process interruption has been tested, but recovery after a real power loss has
+not. Keep independent backups before upgrading.
 Do not delete `pending-upgrade`, its private `.upgrade.*` directory or the
 `.hx-upgrade-lock-*` anchor beside state while recovery is pending. A recovery
 record created by an older installer may require the exact earlier installer;
 the new installer refuses an unrecognized recovery format rather than running
 it. Keep all state, backups and recovery files, and contact the maintainers if
-the earlier installer is unavailable. Completed recovery directories are retained
+the earlier installer is unavailable. Once the earlier installer reports successful
+recovery and no pending record remains, move its old recovery directory aside
+without deleting it before retrying. New completed recovery directories are retained
 and do not block later installs. Retained binaries, backups and failed state are
 never pruned automatically.
 A server SIGKILL also closes fx's lifetime pipe: an independent watcher kills its
 process group, including descendants, without relying on service-manager cleanup.
-`--uninstall` stops/disables the managed user service and unlinks entry points;
-it never deletes state, credentials, backups or retained versions.
+`--uninstall` stops/disables the managed **server** service and unlinks entry
+points; it never deletes state, credentials, backups or retained versions.
+**It does not yet stop or unregister the separately running Mac capture agent.**
+Do not rely on it to stop recording. Stop capture and disable its login startup
+separately until this is fixed.
 
 ## Verification
 

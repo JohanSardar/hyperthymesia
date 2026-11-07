@@ -379,6 +379,25 @@ esac
     h = home()
     assert run(h).returncode == 0
     prefix = h / '.local/share/hyperthymesia'
+    state = h / '.local/state/hyperthymesia'
+    recovery = prefix / '.upgrade.busyguard'
+    (recovery / 'payload').mkdir(parents=True)
+    (recovery / 'lifecycle').write_text('synthetic')
+    (recovery / 'progress').write_text('synthetic')
+    (recovery / 'recovery-v2').write_text('synthetic')
+    (recovery / 'payload/hx-server').write_text('#!/bin/sh\nexit 0\n')
+    (recovery / 'payload/hx-server').chmod(0o700)
+    (prefix / 'pending-upgrade').symlink_to(recovery)
+    (state / '.install-prefix').unlink()
+    result = subprocess.run(['/bin/sh', str(prefix / 'current/hx-run')], env=dict(os.environ, HOME=str(h)),
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode != 0 and 'still pending' in result.stderr
+    assert (prefix / 'pending-upgrade').is_symlink()
+    print('ok: busy recovery cannot start a service without the admission marker')
+
+    h = home()
+    assert run(h).returncode == 0
+    prefix = h / '.local/share/hyperthymesia'
     recovery = prefix / '.upgrade.ABCDEFGH'
     (recovery / 'payload').mkdir(parents=True)
     (recovery / 'lifecycle').write_text('synthetic')
@@ -566,9 +585,15 @@ esac
     assert (state / 'server.env').read_bytes() == env_before
     assert (state / 'server.log').stat().st_mode & 0o777 == 0o600
     os.environ['TEST_FAIL_STEP'] = 'provider'
+    # Simulate process death after commit but before the outer scratch cleanup.
+    stub('rm', 'case "$*" in *"/.upgrade."*) exit 0;; esac\nexec /bin/rm "$@"\n')
     provider_warning = run(h, '--server-only')
+    (stubs / 'rm').unlink()
     os.environ.pop('TEST_FAIL_STEP')
     assert provider_warning.returncode == 0, provider_warning.stderr
+    retained = list((h / '.local/share/hyperthymesia').glob('.upgrade.????????'))
+    assert retained and all((path / 'recovery-complete').is_file() for path in retained)
+    assert run(h, '--server-only').returncode == 0, 'completed recovery blocked rerun'
     assert 'provider setup is incomplete' in provider_warning.stderr
     assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
     assert Path(old).is_dir(), 'previous version was removed'
@@ -583,7 +608,7 @@ esac
     print('ok: reinstall without current backs up existing evidence')
 
     # Failed recovery IO must never short-circuit the attempt to restart old.
-    for fault in ('move', 'copy', 'switch', 'marker', 'stale-marker'):
+    for fault in ('move', 'copy', 'switch', 'marker', 'stale-marker', 'stop'):
         h = home()
         # Reuse the earlier retained version as a fixture of an old install.
         prefix = h / '.local/share/hyperthymesia'
@@ -604,6 +629,8 @@ esac
             stub('cp', 'case "$*" in *failed-*/server.env*) exit 1;; esac\nexec /bin/cp "$@"\n')
         if fault == 'stale-marker':
             stub('cp', 'case "$*" in *failed-*/server.env*) dir=${2%/server.env}; printf retained > "$dir/.install-prefix.ABCDEFGH";; esac\nexec /bin/cp "$@"\n')
+        if fault == 'stop':
+            stub('systemctl', 'printf "%s\\n" "$*" >> "$TEST_COMMAND_LOG"; if [ "$*" = "--user stop hyperthymesia.service" ] && grep -q "enable --now hyperthymesia.service" "$TEST_COMMAND_LOG"; then exit 1; fi\n')
         log = root / 'commands'
         log.write_text('')
         os.environ['TEST_FAIL_STEP'] = 'post-doctor'
@@ -613,7 +640,15 @@ esac
         os.environ.pop('TEST_ROLLBACK_FAIL')
         for command in ('mv', 'cp'):
             if (stubs / command).exists(): (stubs / command).unlink()
+        if fault == 'stop':
+            stub('systemctl', 'printf "%s\\n" "$*" >> "$TEST_COMMAND_LOG"; [ "$1" = --user ] || exit 97\n')
         assert result.returncode != 0
+        if fault == 'stop':
+            assert 'Could not stop candidate' in result.stderr
+            assert (prefix / 'pending-upgrade').is_symlink()
+            assert not list(state.parent.glob(state.name + '.failed-*'))
+            assert (state / 'core.sqlite').read_text() == 'saved'
+            continue
         starts = log.read_text().count('enable --now hyperthymesia.service')
         assert starts == (2 if fault == 'switch' else 1), result.stderr
         if fault == 'switch':

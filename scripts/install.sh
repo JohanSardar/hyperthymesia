@@ -142,6 +142,7 @@ if exists "$prefix/pending-upgrade"; then
     case "$recovery" in "$prefix"/.upgrade.*) ;; *) owner "$prefix/pending-upgrade" ;; esac
     recovery_name=${recovery#"$prefix/"}
     case "$recovery_name" in */*) owner "$prefix/pending-upgrade" ;; esac
+    if exists "$prefix/backups"; then [ -d "$prefix/backups" ] && [ ! -L "$prefix/backups" ] || owner "$prefix/backups"; fi
     [ -d "$recovery" ] && [ ! -L "$recovery" ] || die 'redirected upgrade recovery directory; retained state has not been changed'
     [ -f "$recovery/recovery-v2" ] && [ ! -L "$recovery/recovery-v2" ] || die 'older or incomplete recovery record; keep all copies and use the earlier installer or see docs/install.md'
     [ -f "$recovery/lifecycle" ] && [ ! -L "$recovery/lifecycle" ] && \
@@ -406,6 +407,9 @@ if [ -e "$prefix/pending-upgrade" ] || [ -L "$prefix/pending-upgrade" ]; then
     case "$recovery" in "$prefix"/.upgrade.*) ;; *) echo 'Invalid upgrade recovery path; state retained.' >&2; exit 1 ;; esac
     recovery_name=${recovery#"$prefix/"}
     case "$recovery_name" in */*) echo 'Invalid upgrade recovery path; state retained.' >&2; exit 1 ;; esac
+    if [ -e "$prefix/backups" ] || [ -L "$prefix/backups" ]; then
+        [ -d "$prefix/backups" ] && [ ! -L "$prefix/backups" ] || { echo 'Redirected backup directory; state retained.' >&2; exit 1; }
+    fi
     [ -d "$recovery" ] && [ ! -L "$recovery" ] && \
         [ -f "$recovery/lifecycle" ] && [ ! -L "$recovery/lifecycle" ] && \
         [ -f "$recovery/progress" ] && [ ! -L "$recovery/progress" ] && \
@@ -416,6 +420,11 @@ if [ -e "$prefix/pending-upgrade" ] || [ -L "$prefix/pending-upgrade" ]; then
     HX_INSTALL_STARTUP_RECOVERY=1 "$recovery/payload/hx-server" --state-dir "$state" upgrade-recover --lifecycle "$recovery/lifecycle"
     if [ ! -e "$prefix/pending-upgrade" ] && [ ! -L "$prefix/pending-upgrade" ] && [ ! -e "$recovery/recovery-complete" ] && [ ! -L "$recovery/recovery-complete" ]; then
         (set -C; printf '%s\n' 'hyperthymesia-recovery-complete' > "$recovery/recovery-complete") || { echo 'Could not mark completed recovery; state retained.' >&2; exit 1; }
+    fi
+    # A busy guard can allow the candidate to start in maintenance mode. The
+    # state marker must exist first, or it could miss the pending fence entirely.
+    if [ -e "$prefix/pending-upgrade" ] || [ -L "$prefix/pending-upgrade" ]; then
+        [ -f "$state/.install-prefix" ] && [ ! -L "$state/.install-prefix" ] && [ "$(cat "$state/.install-prefix")" = "$prefix" ] || { echo 'Upgrade recovery is still pending; state retained.' >&2; exit 1; }
     fi
 fi
 exec >> "$state/server.log" 2>&1
@@ -650,6 +659,9 @@ if [ "${1:-}" = --recover ]; then
         *) echo 'Invalid failed-state path; state retained.' >&2; exit 1 ;;
     esac
     if [ "$committed" = true ]; then
+        if [ ! -e "$work/recovery-complete" ] && [ ! -L "$work/recovery-complete" ]; then
+            (set -C; printf '%s\n' 'hyperthymesia-recovery-complete' > "$work/recovery-complete") || exit 1
+        fi
         rm -f "$prefix/pending-upgrade"
         exit 0
     fi
@@ -674,8 +686,9 @@ rollback() {
     # roll back a version that the recovery program already considers committed.
     if [ "$committed" = true ]; then exit "$result"; fi
     if [ "$result" -ne 0 ] && [ "$stopped" = true ]; then
-        if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" != 1 ]; then
-            service_stop || printf 'Could not stop candidate service during recovery.\n' >&2
+        if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" != 1 ] && ! service_stop; then
+            printf 'Could not stop candidate service during recovery; state and pending record were retained.\n' >&2
+            exit "$result"
         fi
         restored=true
         if [ -n "$backup" ] && [ -f "$backup/manifest.json" ] && [ "$migration_started" = true ]; then
@@ -856,6 +869,9 @@ printf '%s\n' "$version_dir" > "$next_version"
 mv "$next_version" "$prefix/.last-version"
 committed=true
 save_progress
+if [ ! -e "$work/recovery-complete" ] && [ ! -L "$work/recovery-complete" ]; then
+    (set -C; printf '%s\n' 'hyperthymesia-recovery-complete' > "$work/recovery-complete")
+fi
 if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then rm -f "$prefix/pending-upgrade"; fi
 stopped=false
 trap - 0 HUP INT TERM
