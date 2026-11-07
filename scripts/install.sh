@@ -311,7 +311,12 @@ untar "$work/server.tar.gz" "$work/payload"
 if [ "$dry_run" = false ]; then
     actual_version=$(cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" --version) || die 'hx-server --version failed'
     [ "$actual_version" = "hx-server ${version#v}" ] || die 'server version does not match release asset'
-    (cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" recover-secrets --help >/dev/null 2>&1) || die 'server archive is incompatible with this installer; use install.sh from the same release'
+    for operation in recover-secrets retire-state probe-recovery; do
+        (cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" "$operation" --help >/dev/null 2>&1) || die 'server archive is incompatible with this installer; use install.sh from the same release'
+    done
+    if [ -d "$state" ]; then
+        (cd "$work/probe-home" && env -i HOME="$work/probe-home" PATH=/usr/bin:/bin "$work/payload/hx-server" probe-recovery --state "$state") || die 'state volume does not support safe recovery renames; no service was stopped'
+    fi
 fi
 if [ -f "$version_dir/hx-server" ]; then
     [ "$(sha256 "$version_dir/hx-server")" = "$(sha256 "$work/payload/hx-server")" ] || die 'retained version differs from the release; version directories are immutable'
@@ -364,6 +369,7 @@ exec >> $(shell_quote "$state/server.log") 2>&1
 set -a
 . $(shell_quote "$state/server.env")
 set +a
+export HX_MANAGED_PREFIX=$(shell_quote "$prefix")
 exec $(shell_quote "$prefix/current/hx-server") --state-dir $(shell_quote "$state") serve --listen 127.0.0.1:7377
 EOF
 chmod 755 "$work/payload/hx-run"
@@ -575,14 +581,23 @@ rollback() {
     # roll back a version that the recovery program already considers committed.
     if [ "$committed" = true ]; then exit "$result"; fi
     if [ "$result" -ne 0 ] && [ "$stopped" = true ]; then
-        if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" != 1 ]; then
-            service_stop || printf 'Could not stop candidate service during recovery.\n' >&2
+        if [ "${HX_INSTALL_STARTUP_RECOVERY:-0}" = 1 ]; then
+            printf 'Recovery needs a stopped service. Rerun the installer; state and pending record were retained.\n' >&2
+            exit "$result"
+        fi
+        if ! service_stop; then
+            printf 'Could not stop candidate service; state and pending record were retained.\n' >&2
+            exit "$result"
         fi
         restored=true
+        if [ "$migration_started" = true ] && { [ -z "$backup" ] || [ ! -d "$prefix/backups" ] || [ -L "$prefix/backups" ] || [ ! -d "$backup" ] || [ -L "$backup" ] || [ ! -f "$backup/manifest.json" ] || [ -L "$backup/manifest.json" ]; }; then
+            printf 'Recovery requires a verified backup. State and pending record were retained.\n' >&2
+            exit "$result"
+        fi
         if [ -n "$backup" ] && [ -f "$backup/manifest.json" ] && [ "$migration_started" = true ]; then
-            # The original failed generation is never moved twice. Restore
-            # publishes atomically, so a killed recovery can resume after rename.
-            if [ -d "$failed_state" ] || mv "$state" "$failed_state"; then
+            # Never adopt an existing failed-state path. A retry after an
+            # interrupted move needs manual inspection rather than a guess.
+            if "$work/payload/hx-server" --state-dir "$state" retire-state --from "$state" --to "$failed_state"; then
                 if [ -f "$state/core.sqlite" ] || "$backup_server" --state-dir "$state" restore --from "$backup"; then
                     cp "$failed_state/server.env" "$state/server.env" || restored=false
                     # The public backup deliberately omits source keys. Move
@@ -604,6 +619,7 @@ rollback() {
             fi
             if [ "$restored" = false ]; then
                 printf 'Recovery incomplete. Backup: %s; retained failed state: %s. Restore into an absent/empty state folder before restarting.\n' "$backup" "$failed_state" >&2
+                exit "$result"
             fi
         fi
         if [ -n "$old" ]; then

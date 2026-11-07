@@ -177,9 +177,8 @@ An upgrade:
    Wrapper/unit refreshes and path records use atomic replacement, including
    same-version reruns.
    Filesystem recovery errors are reported and the recovery program is retained.
-   A source-key recovery failure stops the rollback before restarting the old
-   service. If atomic link replacement fails, it attempts a portable unlink/link
-   while stopped.
+   Incomplete recovery does not restart the old service. If atomic link
+   replacement fails, it attempts a portable unlink/link while stopped.
 
 `migrate` applies every missing version, including a lower number arriving later.
 It rejects newer/unknown, dirty or changed checksums before writable access.
@@ -207,10 +206,13 @@ and use `--start-fresh` with an absent or empty target. This never adopts an
 unmanaged installation and never deletes retained evidence. Keep backups and
 failed copies until recovery is verified; `status` reports their paths/sizes.
 
-If the installer process tree stops, the service wrapper attempts pending
-rollback before opening history; rerunning the installer also attempts recovery.
-Process interruption has been tested, but recovery after a real power loss has
-not. Keep independent backups before upgrading.
+If the installer process tree stops, rerun the installer. The service wrapper
+will refuse automatic rollback because it cannot prove the old server has stopped.
+The installer attempts recovery only after stopping the managed service. If a
+failed-state directory already exists, recovery refuses to guess whether it is
+the right history: keep all copies and inspect them before manually restoring.
+Recovery after a real power loss has not been tested. Keep independent backups
+before upgrading.
 Do not delete `pending-upgrade`, its private `.upgrade.*` directory or the
 `.hx-upgrade-lock-*` anchor beside state while recovery
 is pending. Retained binaries, backups and failed state are never pruned automatically.

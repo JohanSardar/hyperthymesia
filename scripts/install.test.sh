@@ -93,7 +93,8 @@ if [ "$1" = --version ]; then
     printf server >> __HX_PROBE_LOG__
     echo 'hx-server 0.1.0'; exit
 fi
-if [ "$1" = recover-secrets ] && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi
+if { [ "$1" = recover-secrets ] || [ "$1" = retire-state ] || [ "$1" = probe-recovery ]; } && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi
+if [ "$1" = probe-recovery ] && [ "${2:-}" = --state ]; then [ ! -e "$3/.probe-deny" ] || exit 1; exit 0; fi
 [ "$1" = --state-dir ] || exit 97
 state=$2
 shift 2
@@ -106,6 +107,10 @@ status) [ "${TEST_HELD_LEASE:-}" != yes ] || exit 1; echo '{"running_interpret_l
 upgrade-guard) exec "$@" ;;
 backup) mkdir -p "$2"; cp "$state/core.sqlite" "$state/agent.sqlite" "$2/"; echo '{}' > "$2/manifest.json" ;;
 restore) mkdir -p "$state/blobs" "$state/locks"; cp "$2/core.sqlite" "$2/agent.sqlite" "$state/" ;;
+retire-state)
+    [ "$1" = --from ] && [ "$3" = --to ] || exit 97
+    [ ! -e "$4" ] && [ ! -L "$4" ] || exit 1
+    mv "$2" "$4" ;;
 recover-secrets)
     [ "$1" = --from ] && [ "$3" = --to ] || exit 97
     [ "${TEST_ROLLBACK_FAIL:-}" != secrets ] || exit 1
@@ -267,7 +272,7 @@ esac
     # before stopping a service or touching existing state.
     with tarfile.open(server_asset) as archive_in:
         files = {member.name: archive_in.extractfile(member).read() for member in archive_in}
-    old_help = b'if [ "$1" = recover-secrets ] && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi'
+    old_help = b'if { [ "$1" = recover-secrets ] || [ "$1" = retire-state ] || [ "$1" = probe-recovery ]; } && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi'
     assert old_help in files['hx-server']
     files['hx-server'] = files['hx-server'].replace(old_help, b'if [ "$1" = recover-secrets ]; then exit 97; fi')
     archive(server_asset, files)
@@ -279,6 +284,14 @@ esac
     server_asset.write_bytes(original)
     sums()
     print('ok: incompatible server payload is refused before stopping or migrating')
+
+    probe_denied = installed_home / '.local/state/hyperthymesia/.probe-deny'
+    probe_denied.write_text('synthetic')
+    log.write_text('')
+    fails_unchanged(installed_home, 1)
+    assert '--user stop' not in log.read_text()
+    probe_denied.unlink()
+    print('ok: unsupported recovery rename refuses before stopping the service')
 
     for legacy in ('Library/LaunchAgents/com.hyperthymesia.server.plist',
                    'Library/Application Support/Hyperthymesia/server-data',
@@ -474,18 +487,21 @@ esac
         for command in ('mv', 'cp'):
             if (stubs / command).exists(): (stubs / command).unlink()
         assert result.returncode != 0
-        if fault == 'secrets':
+        if fault != 'switch':
             assert log.read_text().count('enable --now hyperthymesia.service') == 1, result.stderr
-            retained = list(state.parent.glob(state.name + '.failed-*'))
-            assert len(retained) == 1 and (retained[0] / 'secrets/source.key').read_text() == 'retained-synthetic-key'
             assert (prefix / 'pending-upgrade').is_symlink()
-            assert 'Source-key recovery incomplete' in result.stderr
+            if fault == 'secrets':
+                retained = list(state.parent.glob(state.name + '.failed-*'))
+                assert len(retained) == 1 and (retained[0] / 'secrets/source.key').read_text() == 'retained-synthetic-key'
+                assert 'Source-key recovery incomplete' in result.stderr
+            else:
+                assert 'Recovery incomplete' in result.stderr
             continue
         assert log.read_text().count('enable --now hyperthymesia.service') == 2, result.stderr
         if fault == 'switch':
             assert os.readlink(prefix / 'current') == str(prefix / '0.1.0'), 'restart must target the old version even if atomic switch fails'
         assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
-    print('ok: recovery IO failures still attempt old-service restart and report damage')
+    print('ok: incomplete recovery retains its record and does not restart the old service')
 
     # Run the README fx snippet against a bad download and an existing
     # synthetic binary; checksum failure must stop before that binary runs.

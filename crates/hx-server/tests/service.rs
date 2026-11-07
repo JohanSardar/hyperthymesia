@@ -63,6 +63,79 @@ async fn gc_refuses_without_touching_history() {
 }
 
 #[test]
+fn recovery_probe_checks_volume_without_changing_history() {
+    let scratch = tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(state.join("history"), b"synthetic state").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+        .env_clear()
+        .env("HOME", scratch.path())
+        .args(["probe-recovery", "--state"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(state.join("history")).unwrap(),
+        b"synthetic state"
+    );
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn retire_state_refuses_collisions_and_never_adopts_a_failed_path() {
+    let scratch = tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    let failed = scratch.path().join("state.failed-123-45");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::create_dir(&failed).unwrap();
+    std::fs::write(state.join("history"), b"synthetic state").unwrap();
+    std::fs::write(failed.join("history"), b"unrelated state").unwrap();
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
+            .env_clear()
+            .env("HOME", scratch.path())
+            .args(["retire-state", "--from"])
+            .arg(&state)
+            .arg("--to")
+            .arg(&failed)
+            .output()
+            .unwrap()
+    };
+    assert!(!run().status.success());
+    assert_eq!(
+        std::fs::read(state.join("history")).unwrap(),
+        b"synthetic state"
+    );
+    assert_eq!(
+        std::fs::read(failed.join("history")).unwrap(),
+        b"unrelated state"
+    );
+    std::fs::remove_file(failed.join("history")).unwrap();
+    std::fs::remove_dir(&failed).unwrap();
+    assert!(run().status.success());
+    assert!(!state.exists());
+    assert_eq!(
+        std::fs::read(failed.join("history")).unwrap(),
+        b"synthetic state"
+    );
+    assert!(
+        !run().status.success(),
+        "a later retry must not adopt existing state"
+    );
+    assert_eq!(
+        std::fs::read(failed.join("history")).unwrap(),
+        b"synthetic state"
+    );
+}
+
+#[test]
 fn source_key_recovery_moves_without_overwriting_and_retries_safely() {
     let scratch = tempfile::tempdir().unwrap();
     let state = scratch.path().join("state");
@@ -71,6 +144,8 @@ fn source_key_recovery_moves_without_overwriting_and_retries_safely() {
     std::fs::create_dir(&failed).unwrap();
     std::fs::create_dir(failed.join("secrets")).unwrap();
     std::fs::write(failed.join("secrets/source.key"), b"synthetic key").unwrap();
+    let partial = failed.join(".source-keys-recovery.synthetic-partial");
+    std::fs::write(&partial, b"partial").unwrap();
     let run = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_hx-server"))
             .env_clear()
@@ -84,6 +159,7 @@ fn source_key_recovery_moves_without_overwriting_and_retries_safely() {
     };
     assert!(run().status.success());
     assert!(!failed.join("secrets").exists());
+    assert_eq!(std::fs::read(&partial).unwrap(), b"partial");
     assert_eq!(
         std::fs::read(state.join("secrets/source.key")).unwrap(),
         b"synthetic key"
