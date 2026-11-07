@@ -93,6 +93,7 @@ if [ "$1" = --version ]; then
     printf server >> __HX_PROBE_LOG__
     echo 'hx-server 0.1.0'; exit
 fi
+if [ "$1" = recover-secrets ] && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi
 [ "$1" = --state-dir ] || exit 97
 state=$2
 shift 2
@@ -105,6 +106,13 @@ status) [ "${TEST_HELD_LEASE:-}" != yes ] || exit 1; echo '{"running_interpret_l
 upgrade-guard) exec "$@" ;;
 backup) mkdir -p "$2"; cp "$state/core.sqlite" "$state/agent.sqlite" "$2/"; echo '{}' > "$2/manifest.json" ;;
 restore) mkdir -p "$state/blobs" "$state/locks"; cp "$2/core.sqlite" "$2/agent.sqlite" "$state/" ;;
+recover-secrets)
+    [ "$1" = --from ] && [ "$3" = --to ] || exit 97
+    [ "${TEST_ROLLBACK_FAIL:-}" != secrets ] || exit 1
+    if [ -d "$2/secrets" ]; then
+        [ ! -L "$2/secrets" ] && [ ! -e "$4/secrets" ] && [ ! -L "$4/secrets" ] || exit 1
+        mv "$2/secrets" "$4/secrets"
+    fi ;;
 doctor)
     case "$*" in
         *--allow-older-schema*) : ;;
@@ -255,6 +263,23 @@ esac
     sums_file.write_bytes(original_sums)
     print('ok: tampered server and missing downloads reject without writes')
 
+    # An earlier payload cannot perform the new recovery step. Reject it
+    # before stopping a service or touching existing state.
+    with tarfile.open(server_asset) as archive_in:
+        files = {member.name: archive_in.extractfile(member).read() for member in archive_in}
+    old_help = b'if [ "$1" = recover-secrets ] && [ "${2:-}" = --help ]; then [ "$PWD" = "$HOME" ] || exit 85; exit 0; fi'
+    assert old_help in files['hx-server']
+    files['hx-server'] = files['hx-server'].replace(old_help, b'if [ "$1" = recover-secrets ]; then exit 97; fi')
+    archive(server_asset, files)
+    sums()
+    log = root / 'commands'
+    log.write_text('')
+    fails_unchanged(installed_home, 1)
+    assert '--user stop' not in log.read_text()
+    server_asset.write_bytes(original)
+    sums()
+    print('ok: incompatible server payload is refused before stopping or migrating')
+
     for legacy in ('Library/LaunchAgents/com.hyperthymesia.server.plist',
                    'Library/Application Support/Hyperthymesia/server-data',
                    'Library/Application Support/Hyperthymesia/agent.json'):
@@ -374,6 +399,9 @@ esac
     # An upgraded payload must survive rollback with its old evidence/env intact.
     state = h / '.local/state/hyperthymesia'
     (state / 'core.sqlite').write_text('synthetic seeded evidence')
+    (state / 'secrets').mkdir(mode=0o700)
+    (state / 'secrets/source.key').write_text('synthetic-source-key')
+    (state / 'secrets/source.key').chmod(0o600)
     env_before = (state / 'server.env').read_bytes()
     old = os.readlink(h / '.local/share/hyperthymesia/current')
     for platform in ('linux-x86_64', 'linux-aarch64', 'macos-aarch64'):
@@ -392,6 +420,8 @@ esac
     assert os.readlink(h / '.local/share/hyperthymesia/current') == old
     assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
     assert (state / 'server.env').read_bytes() == env_before
+    assert (state / 'secrets/source.key').read_text() == 'synthetic-source-key'
+    assert (state / 'secrets/source.key').stat().st_mode & 0o777 == 0o600
     assert (state / 'server.log').stat().st_mode & 0o777 == 0o600
     os.environ['TEST_FAIL_STEP'] = 'provider'
     provider_warning = run(h, '--server-only')
@@ -411,7 +441,7 @@ esac
     print('ok: reinstall without current backs up existing evidence')
 
     # Failed recovery IO must never short-circuit the attempt to restart old.
-    for fault in ('move', 'copy', 'switch'):
+    for fault in ('move', 'copy', 'switch', 'secrets'):
         h = home()
         # Reuse the earlier retained version as a fixture of an old install.
         prefix = h / '.local/share/hyperthymesia'
@@ -426,6 +456,10 @@ esac
         for name in ('core.sqlite', 'agent.sqlite', 'server.env', 'server.log'):
             (state / name).write_text('' if name != 'core.sqlite' else 'saved')
             (state / name).chmod(0o600)
+        if fault == 'secrets':
+            (state / 'secrets').mkdir(mode=0o700)
+            (state / 'secrets/source.key').write_text('retained-synthetic-key')
+            (state / 'secrets/source.key').chmod(0o600)
         if fault == 'move':
             stub('mv', 'case "$*" in *failed-*) exit 1;; esac\nexec /bin/mv "$@"\n')
         if fault == 'copy':
@@ -440,6 +474,13 @@ esac
         for command in ('mv', 'cp'):
             if (stubs / command).exists(): (stubs / command).unlink()
         assert result.returncode != 0
+        if fault == 'secrets':
+            assert log.read_text().count('enable --now hyperthymesia.service') == 1, result.stderr
+            retained = list(state.parent.glob(state.name + '.failed-*'))
+            assert len(retained) == 1 and (retained[0] / 'secrets/source.key').read_text() == 'retained-synthetic-key'
+            assert (prefix / 'pending-upgrade').is_symlink()
+            assert 'Source-key recovery incomplete' in result.stderr
+            continue
         assert log.read_text().count('enable --now hyperthymesia.service') == 2, result.stderr
         if fault == 'switch':
             assert os.readlink(prefix / 'current') == str(prefix / '0.1.0'), 'restart must target the old version even if atomic switch fails'
