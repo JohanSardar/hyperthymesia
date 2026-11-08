@@ -28,6 +28,7 @@ jobs:
         run: |
           sh scripts/install.test.sh
           python3 scripts/installer-launcher.test.py
+          python3 scripts/readme-commands.test.py
 
   rust-linux:
     name: Rust (Linux, server side)

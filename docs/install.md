@@ -1,7 +1,7 @@
 # Install Hyperthymesia
 
 For a source build and foreground server, start with the
-[README quickstart](../README.md#install-from-source). This page describes the
+[source guide](setup.md). This page describes the
 managed-service installer. Both use SQLite and a single local state folder;
 neither needs Docker or a database service.
 
@@ -9,15 +9,19 @@ The installer starts a loopback user service without sudo. Supported: Apple
 Silicon macOS and Linux x86_64/aarch64 (glibc 2.35+). Intel Macs are refused.
 State must live on a local disk; SQLite WAL is unsuitable for network storage.
 
-The first public tag requires the owner's approval. Until then, extract the
-`hyperthymesia-release` artifact from a successful PR or `workflow_dispatch`
-release workflow and set `HX_RELEASE_BASE=file:///absolute/artifact/directory`.
-Testing needs no tag or release. After an owner-approved release exists:
+Requires curl and Python 3. The public launcher pins a release version and the
+SHA-256 of its checksum manifest. It verifies that manifest, then the lifecycle
+installer, before executing downloaded code:
 
 ```sh
-curl -fsSL https://github.com/JohanSardar/hyperthymesia/releases/latest/download/install.sh |
-  sh -s -- --provider codex
+curl -fsSL https://johansardar.github.io/hyperthymesia/install | sh
 ```
+
+To forward options, replace `| sh` with, for example,
+`| sh -s -- --provider grok --model YOUR_MODEL`. Never substitute a mutable
+latest-release installer for the reviewed pin. For workflow-artifact testing,
+run its local install.sh with `HX_RELEASE_BASE=file:///absolute/artifact/directory`;
+that developer path is not the independent public pin or clean-machine proof.
 
 Options: `--provider codex|grok|gateway`, `--model M`, `--effort E`,
 `--state-dir /absolute/local/path`, `--server-only`, `--app-only`, `--dry-run`,
@@ -27,8 +31,9 @@ Codex still need owner validation; see [provider limitations](provider-limitatio
 
 Dry runs verify downloads and list files/service contents without executing
 downloaded binaries, initializing state or contacting service managers. Release
-archives use SHA256SUMS from the same GitHub release, which detects corruption
-but is not an independent signature. Private fx 0.0.16 uses hashes pinned in
+archives use SHA256SUMS from the same GitHub release. The public launcher's
+separate reviewed manifest pin binds all platforms and install.sh; it is not a
+publisher signature or OS sandbox. Private fx 0.0.16 uses hashes pinned in
 the script. Your own fx is kept. A normal install runs downloaded programs as
 your user; the version probes use an empty environment and scratch home, not an
 OS sandbox.
@@ -36,7 +41,11 @@ OS sandbox.
 ## State and service
 
 Versions live at `~/.local/share/hyperthymesia/<version>` with a `current`
-symlink and `~/.local/bin/hx-server`. Add `~/.local/bin` to PATH. macOS also
+symlink and `~/.local/bin/hx-server`. The installer appends an idempotent PATH
+block to .zshrc for zsh (or an existing .zshrc), otherwise the first existing
+.bash_profile, .bash_login, .profile or .bashrc, defaulting to .profile.
+It refuses symlink/non-regular startup files before installing. Open a new shell
+or use the README's guarded PATH setup. Uninstall retains that block. macOS also
 installs `~/Applications/Hyperthymesia.app` unless `--server-only` is supplied.
 The installer never opens the app or requests capture permissions.
 `--app-only` cannot switch a managed server to a different version; use the

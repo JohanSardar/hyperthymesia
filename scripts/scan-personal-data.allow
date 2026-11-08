@@ -4,7 +4,7 @@
 # metadata:commit-message mean commit metadata.
 metadata:commit-author	identity-name	*	the owner's name as commit author
 scripts/build-release.sh	identity-name	1	the public repository URL required in release source notices
-README.md	identity-name	1	the public repository clone URL
+README.md	identity-name	1	the public project clone URL or Pages installation URL
 scripts/install.sh	identity-name	1	the public repository release URL
 docs/install	identity-name	1	the public repository release URL in the pinned Pages launcher
 scripts/live-install-smoke.py	identity-name	2	the public Pages install URL and repository clone URL for clean-VM acceptance
