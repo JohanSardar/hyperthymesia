@@ -1,9 +1,7 @@
 #!/bin/bash
 # Raw private data streams only through memory into a deny-by-default anonymizer.
 set -euo pipefail
-source "$HOME/.cargo/env"
 cd "$(dirname "$0")/.."
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/Hyperthymesia/.target-main}"
 anonymizer=$(cat <<'PY'
 import sys,json,hashlib,hmac,os,re
 # Keyed so a published hash can't be confirmed by hashing a guessed path or title.
@@ -50,6 +48,8 @@ export HX_FIXTURE_KEY_FILE="$key_file"
 if [[ "${1:-}" == "--anonymize" ]]; then
     exec python3 -c "$anonymizer"
 fi
+command -v cargo >/dev/null || { echo 'Fixture extraction requires cargo on PATH' >&2; exit 1; }
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 for connector in t3code codex claude-code git apple-bridge; do
     destination="fixtures/sources/$connector/envelopes.ndjson"
     # Only anonymized data reaches the temporary file, atomically replacing the sample.
