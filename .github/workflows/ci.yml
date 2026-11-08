@@ -48,6 +48,8 @@ jobs:
         run: cargo build --locked --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
       - name: test
         run: cargo test --locked --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+      - name: Real CLI, loopback API, backup and restore
+        run: python3 scripts/quickstart.test.py
 
   mover-postgres:
     name: Mover (synthetic Postgres cutover)
