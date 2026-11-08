@@ -15,7 +15,7 @@ Versions before this first public binary release were source-only checkpoints.
   including license/source/dependency notices and SHA256SUMS.
 - A checksum-pinned GitHub Pages installer using the existing owned user-service
   installation, stop-before-swap, backup and rollback lifecycle.
-- Idempotent Bash/zsh PATH setup and tamper/interrupted-upgrade tests.
+- Atomic, idempotent Bash/zsh PATH setup and tamper/interrupted-upgrade tests.
 - Contributor, conduct and private security-reporting guidance; issue/PR templates.
 - Current architecture, task guides, troubleshooting, generated CLI/options,
   environment/route inventories, MCP tool schemas and Rust API reference checks.
