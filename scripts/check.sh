@@ -10,6 +10,7 @@ if [[ "$(uname -s)" != Darwin ]]; then
 fi
 # SQLite writes must take the writer lock before reading any state.
 python3 scripts/check-store-transactions.py
+python3 scripts/check-tooling.py
 cargo fmt --all -- --check
 cargo clippy "${packages[@]}" --all-targets -- -D warnings
 cargo check "${packages[@]}" --all-targets
