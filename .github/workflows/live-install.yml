@@ -1,0 +1,36 @@
+name: Live release acceptance
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Expected installed server version
+        required: true
+        default: 0.1.3
+permissions:
+  contents: read
+jobs:
+  clean-vm:
+    name: Real curl and fresh clone (new hosted VM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: clippy, rustfmt
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.12
+      - name: Provision the disposable VM user manager and test prerequisites
+        run: |
+          sudo -n apt-get update -qq
+          sudo -n apt-get install -y -qq zsh
+          sudo -n loginctl enable-linger "$(id -un)"
+          sudo -n systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Install from live Pages and release, then verify as a new contributor
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: python3 scripts/live-install-smoke.py

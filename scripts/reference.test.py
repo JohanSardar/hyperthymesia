@@ -11,6 +11,10 @@ import reference
 
 
 class ReferenceTest(unittest.TestCase):
+    def test_config_and_standard_environment_not_unrelated_uppercase_values(self):
+        code = 'env::var("HOME"); command.env("SOURCE_KEY", key); "HX_PROVIDER"; "GET"; "HX_TEST_CASE";'
+        self.assertEqual(reference.env_names(code), {"HOME", "SOURCE_KEY", "HX_PROVIDER"})
+
     def test_balanced_nested_call_and_quoted_parentheses(self):
         source = 'prefix("/api", get(handler).post(other(")")))suffix'
         self.assertEqual(reference.balanced(source, 6),

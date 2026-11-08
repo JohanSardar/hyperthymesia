@@ -1,0 +1,40 @@
+#!/bin/sh
+VERSION=0.0.0
+SHA256=0000000000000000000000000000000000000000000000000000000000000000
+# Pin the release manifest, which binds the lifecycle installer and every asset.
+set -eu
+umask 077
+die() { printf 'install: %s\n' "$*" >&2; exit 1; }
+for command in curl mktemp awk tar; do
+    command -v "$command" >/dev/null 2>&1 || die "missing command: $command"
+done
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+else
+    die 'requires sha256sum or shasum'
+fi
+work=$(mktemp -d "${TMPDIR:-/tmp}/hx-launcher.XXXXXXXX")
+trap 'rm -rf "$work"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+base=https://github.com/JohanSardar/hyperthymesia/releases/download/v$VERSION
+curl -fsSL "$base/SHA256SUMS" -o "$work/SHA256SUMS" || die 'release manifest download failed'
+[ "$(sha256 "$work/SHA256SUMS")" = "$SHA256" ] || die 'SHA-256 mismatch: release manifest; nothing installed'
+expected=$(awk '
+    $2 == "install.sh" {
+        if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || found++) exit 1
+        sum = $1
+    }
+    END { if (found != 1) exit 1; print sum }
+' "$work/SHA256SUMS") || die 'invalid installer checksum entry'
+curl -fsSL "$base/install.sh" -o "$work/install.sh" || die 'lifecycle installer download failed'
+[ "$(sha256 "$work/install.sh")" = "$expected" ] || die 'SHA-256 mismatch: installer; nothing installed'
+# Execute the verified bytes in the same process, so signals reach its rollback
+# supervisor directly. Remove launcher scratch before replacing this shell.
+installer=$(cat "$work/install.sh")
+rm -rf "$work"
+trap - EXIT INT TERM
+export HX_RELEASE_BASE="$base" HX_RELEASE_SHA256="$SHA256"
+exec /bin/sh -c "$installer" install.sh "$@"

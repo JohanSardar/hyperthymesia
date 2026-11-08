@@ -16,6 +16,10 @@ Errors normally contain `{"error":"message"}`: 400 invalid input, 401 missing or
 invalid credentials, 403 missing scope, 404 absent/out-of-namespace evidence.
 Pairing deliberately returns uniform 410 refusals and empty 503 on internal
 failure. Size-limit errors use 413. Upgrade guards can temporarily return 503.
+Framework query/JSON extraction errors can be plain-text 400/422 rather than
+the application's JSON error object. Default request bodies are capped at
+64 MiB, with smaller route-specific limits below; oversized decoded zstd event
+batches are rejected with 400.
 Do not put tokens in URLs, browser links, logs or issue reports.
 
 ## Evidence and readers
@@ -28,7 +32,7 @@ Do not put tokens in URLs, browser links, logs or issue reports.
 | PUT `/v1/blobs/{sha256}` | `ingest`; raw bytes, verified hash | 201 new, 200 already published; no prefix/quota check on paired uploads |
 | GET `/v1/blobs/{sha256}` | `read_raw`, namespace-authorized referencing evidence | Attachment bytes; 410 expired |
 | GET `/v1/device` | `ingest` | Negotiated OCR capability |
-| PUT `/v1/ocr/{sha}` | `ingest`; paired image namespace; OCR result JSON, 1 MiB limit | Device OCR receipt; server validates source lineage |
+| PUT `/v1/ocr/{sha}` | `ingest`; paired image namespace; OCR result JSON, 1 MiB limit | 200 receipt; 409 when server OCR is selected or there is no authorized still; lineage is validated |
 | GET `/v1/timeline` | `from`, `to` RFC3339; positive range ≤31 days; `level=raw|lanes|episodes|tasks` (default episodes) | Coverage, watermarks, revisions; raw observations or compiled lanes for those levels |
 | GET `/v1/now` | `read_l3` (or raw) | Last four hours of episode-level timeline |
 | GET `/v1/search` | `q`; `read_l3` (or raw) | `results`; namespace/sensitivity filtered FTS |
@@ -55,7 +59,7 @@ Source keys stay in private files, never SQLite/public response fields.
 | Endpoint | Input | Result |
 | --- | --- | --- |
 | GET `/v1/sources` | None | Scrubbed source/configuration metadata, never keys |
-| POST `/v1/sources` | `name` (1–200 control-free characters), `description` (≤16384 bytes), optional `key`, `probe`, `probe_json`, `cli_home`, `cli_executable`, `history_days` (0–30, default 1) | Creates/enables source; asynchronous paid setup |
+| POST `/v1/sources` | `name` (nonblank, ≤200 UTF-8 bytes, no control characters), `description` (≤16384 bytes), optional `key`, `probe`, `probe_json`, `cli_home`, `cli_executable`, `history_days` (0–30, default 1) | Creates/enables source; asynchronous paid setup |
 | PATCH `/v1/sources/{id}` | At least one of `enabled`, `key` | Updated switch state; key rotation validates saved config |
 | POST `/v1/sources/{id}/setup` | No body required | 202 with `setup_generation` and `status` |
 | GET `/v1/recipes`, `/v1/addons`, `/v1/agent-tables` | Optional `source` query | Scrubbed configured objects and status |

@@ -45,4 +45,4 @@ All public route registrations, including dashboard forms. See [API contracts](a
 | GET | `/v1/addons` | [sources.rs:442](../../crates/hx-server/src/sources.rs#L442) |
 | PATCH | `/v1/addons/{id}` | [sources.rs:443](../../crates/hx-server/src/sources.rs#L443) |
 | GET | `/v1/agent-tables` | [sources.rs:444](../../crates/hx-server/src/sources.rs#L444) |
-| POST | `/mcp` | [mcp.rs:1179](../../crates/hx-server/src/mcp.rs#L1179) |
+| POST | `/mcp` | [mcp.rs:1037](../../crates/hx-server/src/mcp.rs#L1037) |
