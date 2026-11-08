@@ -11,16 +11,16 @@ Installer-only server commands are included separately; do not invoke them manua
 Usage: hx-server [OPTIONS] <COMMAND>
 
 Commands:
-  migrate    
+  migrate
   backup     Snapshot both databases and published blobs while the server stays online
   restore    Verify a backup and restore it into an absent or empty state directory
   doctor     Check state privacy/schema and provider readiness without calling a model
   status     Read schema compatibility and the number of live interpret leases
-  serve      
-  token      
+  serve
+  token
   pair       Print a single-use pairing link, valid for 15 minutes
-  compile    
-  interpret  
+  compile
+  interpret
   gc         Disabled: deleting old media is not yet safe for referenced evidence
   help       Print this message or the help of the given subcommand(s)
 
@@ -38,7 +38,7 @@ Hold the service worker idle throughout an installer lifecycle
 Usage: hx-server upgrade-guard [OPTIONS] <COMMAND>...
 
 Arguments:
-  <COMMAND>...  
+  <COMMAND>...
 
 Options:
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
@@ -53,7 +53,7 @@ Resume interrupted installer rollback before a managed service starts
 Usage: hx-server upgrade-recover [OPTIONS] --lifecycle <LIFECYCLE>
 
 Options:
-      --lifecycle <LIFECYCLE>  
+      --lifecycle <LIFECYCLE>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
   -h, --help                   Print help
 ```
@@ -66,7 +66,7 @@ Check whether the state volume supports safe recovery renames
 Usage: hx-server probe-recovery [OPTIONS] --state <STATE>
 
 Options:
-      --state <STATE>          
+      --state <STATE>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
   -h, --help                   Print help
 ```
@@ -79,9 +79,9 @@ Move a failed generation aside without replacing an existing path
 Usage: hx-server retire-state [OPTIONS] --from <FROM> --to <TO>
 
 Options:
-      --from <FROM>            
+      --from <FROM>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
-      --to <TO>                
+      --to <TO>
   -h, --help                   Print help
 ```
 
@@ -93,9 +93,9 @@ Return retained source keys to a restored state without overwriting files
 Usage: hx-server recover-secrets [OPTIONS] --from <FROM> --to <TO>
 
 Options:
-      --from <FROM>            
+      --from <FROM>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
-      --to <TO>                
+      --to <TO>
   -h, --help                   Print help
 ```
 
@@ -107,9 +107,9 @@ Atomically replace an installer symlink without platform-specific mv flags
 Usage: hx-server install-link [OPTIONS] --link <LINK> --target <TARGET>
 
 Options:
-      --link <LINK>            
+      --link <LINK>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
-      --target <TARGET>        
+      --target <TARGET>
   -h, --help                   Print help
 ```
 
@@ -132,7 +132,7 @@ Usage: hx-server backup [OPTIONS] --to <TO>
 
 Options:
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
-      --to <TO>                
+      --to <TO>
   -h, --help                   Print help
 ```
 
@@ -144,7 +144,7 @@ Verify a backup and restore it into an absent or empty state directory
 Usage: hx-server restore [OPTIONS] --from <FROM>
 
 Options:
-      --from <FROM>            
+      --from <FROM>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
   -h, --help                   Print help
 ```
@@ -171,7 +171,7 @@ Read schema compatibility and the number of live interpret leases
 Usage: hx-server status [OPTIONS]
 
 Options:
-      --require-idle           
+      --require-idle
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
   -h, --help                   Print help
 ```
@@ -195,7 +195,7 @@ Usage: hx-server token [OPTIONS] <COMMAND>
 Commands:
   list    List token IDs, names, scopes, prefixes and revocation state (no secrets)
   revoke  Revoke the full token ID printed by token list. Effective next request
-  create  
+  create
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -219,7 +219,7 @@ Commands:
 Options:
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
       --url <URL>              [default: http://127.0.0.1:7377]
-      --name <NAME>            
+      --name <NAME>
   -h, --help                   Print help
 ```
 
@@ -229,9 +229,9 @@ Options:
 Usage: hx-server compile [OPTIONS] --from <FROM> --to <TO>
 
 Options:
-      --from <FROM>            
+      --from <FROM>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
-      --to <TO>                
+      --to <TO>
   -h, --help                   Print help
 ```
 
@@ -241,9 +241,9 @@ Options:
 Usage: hx-server interpret [OPTIONS] --from <FROM> --to <TO>
 
 Options:
-      --from <FROM>            
+      --from <FROM>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
-      --to <TO>                
+      --to <TO>
   -h, --help                   Print help
 ```
 
@@ -279,7 +279,7 @@ Revoke the full token ID printed by token list. Effective next request
 Usage: hx-server token revoke [OPTIONS] <ID>
 
 Arguments:
-  <ID>  
+  <ID>
 
 Options:
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
@@ -292,10 +292,10 @@ Options:
 Usage: hx-server token create [OPTIONS] --name <NAME> --prefix <PREFIX> --scopes <SCOPES>
 
 Options:
-      --name <NAME>            
+      --name <NAME>
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
-      --prefix <PREFIX>        
-      --scopes <SCOPES>        
+      --prefix <PREFIX>
+      --scopes <SCOPES>
   -h, --help                   Print help
 ```
 
@@ -319,7 +319,7 @@ Revoke a full code ID from pair list. Does not revoke an issued token
 Usage: hx-server pair revoke [OPTIONS] <ID>
 
 Arguments:
-  <ID>  
+  <ID>
 
 Options:
       --state-dir <STATE_DIR>  Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
@@ -354,8 +354,8 @@ Options:
 Usage: hx-connector-apple-bridge [OPTIONS] <COMMAND>
 
 Commands:
-  describe  
-  sync      
+  describe
+  sync
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -363,7 +363,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -380,7 +380,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -393,14 +393,14 @@ Options:
 Usage: hx-connector-apple-bridge sync [OPTIONS]
 
 Options:
-      --dry-run                    
+      --dry-run
       --limit <LIMIT>              [default: 1000]
       --server <SERVER>            [env: HX_SERVER=]
-      --since <SINCE>              
+      --since <SINCE>
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -413,8 +413,8 @@ Options:
 Usage: hx-connector-claude-code [OPTIONS] <COMMAND>
 
 Commands:
-  describe  
-  sync      
+  describe
+  sync
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -422,7 +422,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -439,7 +439,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -452,14 +452,14 @@ Options:
 Usage: hx-connector-claude-code sync [OPTIONS]
 
 Options:
-      --dry-run                    
+      --dry-run
       --limit <LIMIT>              [default: 1000]
       --server <SERVER>            [env: HX_SERVER=]
-      --since <SINCE>              
+      --since <SINCE>
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -472,8 +472,8 @@ Options:
 Usage: hx-connector-codex [OPTIONS] <COMMAND>
 
 Commands:
-  describe  
-  sync      
+  describe
+  sync
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -481,7 +481,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -498,7 +498,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -511,14 +511,14 @@ Options:
 Usage: hx-connector-codex sync [OPTIONS]
 
 Options:
-      --dry-run                    
+      --dry-run
       --limit <LIMIT>              [default: 1000]
       --server <SERVER>            [env: HX_SERVER=]
-      --since <SINCE>              
+      --since <SINCE>
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -531,8 +531,8 @@ Options:
 Usage: hx-connector-git [OPTIONS] <COMMAND>
 
 Commands:
-  describe  
-  sync      
+  describe
+  sync
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -540,7 +540,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -557,7 +557,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -570,14 +570,14 @@ Options:
 Usage: hx-connector-git sync [OPTIONS]
 
 Options:
-      --dry-run                    
+      --dry-run
       --limit <LIMIT>              [default: 1000]
       --server <SERVER>            [env: HX_SERVER=]
-      --since <SINCE>              
+      --since <SINCE>
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -590,8 +590,8 @@ Options:
 Usage: hx-connector-t3code [OPTIONS] <COMMAND>
 
 Commands:
-  describe  
-  sync      
+  describe
+  sync
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -599,7 +599,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -616,7 +616,7 @@ Options:
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
@@ -629,17 +629,16 @@ Options:
 Usage: hx-connector-t3code sync [OPTIONS]
 
 Options:
-      --dry-run                    
+      --dry-run
       --limit <LIMIT>              [default: 1000]
       --server <SERVER>            [env: HX_SERVER=]
-      --since <SINCE>              
+      --since <SINCE>
       --token <TOKEN>              [env: HX_TOKEN]
       --instance <INSTANCE>        [env: HX_INSTANCE=]
       --source <SOURCE>            Override the source database, directory, or Apple Bridge base URL [env: HX_SOURCE=]
-      --state-dir <STATE_DIR>      
+      --state-dir <STATE_DIR>
       --root <ROOT>                Git discovery roots; repeat for multiple roots
       --depth <DEPTH>              [default: 3]
       --apple-token <APPLE_TOKEN>  [env: HX_APPLE_TOKEN]
   -h, --help                       Print help
 ```
-

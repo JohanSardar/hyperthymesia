@@ -79,6 +79,7 @@ def generated():
                     [str(target / "debug" / binary), *command, "--help"],
                     env=env, cwd=home, text=True, timeout=10,
                 )
+                help_text = "\n".join(line.rstrip() for line in help_text.splitlines())
                 name = " ".join([binary, *command])
                 cli += "## " + name + "\n\n```text\n" + help_text.rstrip() + "\n```\n\n"
                 section = help_text.split("Commands:\n", 1)
@@ -86,7 +87,7 @@ def generated():
                     for child in re.findall(r"(?m)^  ([a-z][a-z0-9-]*)\s", section[1].split("Options:", 1)[0]):
                         if child != "help":
                             queue.append((*command, child))
-        pages["cli.md"] = cli
+        pages["cli.md"] = cli.rstrip() + "\n"
         schemas = subprocess.check_output(
             [str(target / "debug/examples/export-reference")], env=env, cwd=home, timeout=10)
         pages["mcp-tools.json"] = json.dumps(json.loads(schemas), indent=2, sort_keys=True) + "\n"
