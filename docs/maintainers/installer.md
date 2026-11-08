@@ -18,8 +18,10 @@ service entries are refused. Previous versions and backups are retained.
 
 PATH setup prefers an existing .zshrc or a zsh login shell, otherwise the first
 existing .bash_profile, .bash_login, .profile or .bashrc; with none, it creates
-.profile. It appends a marked, idempotent block without replacing existing
-content. Sourcing repeatedly does not duplicate the bin directory. A symlink or
+.profile. It preserves existing content/mode, stages the marked idempotent block
+beside the startup file, then atomically renames it. Partial-write failure leaves
+the original untouched and removes the private stage during rollback.
+Sourcing repeatedly does not duplicate the bin directory. A symlink or
 non-regular startup path is refused before changing destinations rather than
 writing into an unexpected external dotfiles target. Uninstall retains PATH
 configuration and all state.
@@ -29,7 +31,7 @@ configuration and all state.
 `sh scripts/install.test.sh` uses scratch homes, real hashes/archives and stubbed
 service managers. It covers fresh installation, update, tampered runner/server,
 unrelated commands/folders, Bash-only startup, zsh startup, failed upgrades,
-and INT/TERM delivered immediately after the atomic current-link swap. Both
+partial startup-file writes, and INT/TERM immediately after the atomic current-link swap. Both
 signals restore the old version, evidence, environment and source keys.
 
 `python3 scripts/installer-launcher.test.py` pipes the real launcher through sh.
