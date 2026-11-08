@@ -41,7 +41,7 @@ jobs:
       - name: Isolate release build and output directories
         shell: bash
         run: |
-          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/hx-release-target" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target/release-workflow" >> "$GITHUB_ENV"
           echo "HX_RELEASE_DIR=$RUNNER_TEMP/release-assets" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -49,6 +49,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.platform }}
+          workspaces: ". -> target/release-workflow"
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
         with:
           tool: cargo-about@0.9.3
@@ -197,6 +198,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Release note integrity and refusal tests
+        run: python3 scripts/release-notes.test.py
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
@@ -226,6 +230,7 @@ jobs:
                       sums.write(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n')
           PY
           (cd release && sha256sum --check SHA256SUMS)
+          python3 scripts/release-notes.py "v$(python3 -c 'import re; print(re.search(r"(?m)^version = \"([^\"]+)\"$", open("crates/hx-server/Cargo.toml").read())[1])')" release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hyperthymesia-release
@@ -241,6 +246,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: hyperthymesia-release
@@ -250,4 +256,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" release/* --verify-tag --title "Hyperthymesia $TAG" --generate-notes
+        run: |
+          python3 scripts/release-notes.py "$TAG" release > release-notes.md
+          gh release create "$TAG" release/* --verify-tag --title "Hyperthymesia $TAG" --notes-file release-notes.md

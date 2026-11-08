@@ -1,9 +1,10 @@
 # Releases
 
-The owner approves a public release by pushing `v<server version>`. For example,
-server version `0.1.2` requires tag `v0.1.2`. The app version must match the
-server version. The workflow rejects mismatched tags. Do not create the first
-tag before owner approval.
+Only a maintainer-approved `v<server version>` tag publishes a public release.
+Server version `0.1.3` requires tag `v0.1.3`; the app version must match.
+The workflow rejects mismatched tags. Never publish a registry package or
+rewrite an existing release tag as part of this process. Library crates keep
+their own workspace version; they are not independently published.
 
 The `release` workflow builds natively on Ubuntu 22.04 x86_64 and arm64
 (glibc 2.35), and macOS 15 Apple Silicon. Manual dispatch and pull requests
@@ -36,6 +37,32 @@ or fx, extract the server and assert
 its `--version` output with an empty environment. The combined artifact is
 assembled only after those checks pass. Its checksums use bare filenames and
 exactly two spaces between hash and filename.
+Release notes include the dated Keep a Changelog entry, every asset checksum
+and the independently computed SHA256SUMS hash. Their generator verifies all
+five payload assets again before publication.
+
+## Release and public-install sequence
+
+1. Merge all area PRs and matching server/app version/lockfile/changelog updates,
+   only after every check is green against current main.
+2. Review that final main commit, create its approved annotated version tag and
+   push that tag. A source change after a published tag requires a new patch
+   version, not force-updating the old tag.
+3. Require all native builds, pristine Linux version tests, real-service smoke,
+   asset assembly and publication to pass. Check the six GitHub release assets
+   against the checksum manifest and notes.
+4. Serve main `/docs` with branch-based GitHub Pages and `.nojekyll`.
+5. Open a separate PR that changes only VERSION and SHA256 at the top of
+   `docs/install`. SHA256 is the final release manifest's hash, not a platform
+   archive hash. Bootstrap pins must fail closed until this step.
+6. Merge that green pin PR, let Pages deploy it, then dispatch
+   `Live release acceptance` for the released version. It runs public curl and
+   the README checks on a new VM, then all contributor checks from a fresh
+   public clone. Record the workflow URL, commit/version and result.
+
+Never substitute fixture tests for step 6. Logins, paid requests, real capture
+permissions/reboot and Developer ID signing remain separate owner-controlled
+checks; the login-free path proves none of them.
 
 ## Apple signing
 
