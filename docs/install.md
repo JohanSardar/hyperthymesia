@@ -162,10 +162,10 @@ An upgrade:
    after the candidate starts, the candidate shuts down without admitting work.
    Its manager restarts through recovery before reopening state or accepting uploads.
 4. Keeps the previous version and backup. A failed step after stop attempts to
-   restore both databases and blobs, preserve `server.env`, switch back and restart.
-   **Source keys are not restored automatically.** If rollback moved the state
-   aside, keys remain in that failed-generation copy; otherwise they remain in
-   the active state. Check them before relying on any connected source.
+   restore both databases and blobs, preserve `server.env`, and move source keys
+   from the failed-generation state back into the restored state. It never merges
+   two key directories. If that move fails, it keeps the recovery record and
+   reports an error; inspect the retained state before restarting.
    Failed-generation state stays beside the active directory as `<state>.failed-*`
    (`server.failed-*` for the default macOS state).
    A private `<prefix>/.upgrade.*` recovery directory is published before stopping.
@@ -176,9 +176,9 @@ An upgrade:
    the guard lock, so killing an installer ancestor cannot admit worker jobs.
    Wrapper/unit refreshes and path records use atomic replacement, including
    same-version reruns.
-   Filesystem recovery errors do not skip the old-service restart attempt; the
-   installer reports incomplete recovery and retains the recovery program. If
-   atomic link replacement fails, it attempts a portable unlink/link while stopped.
+   Filesystem recovery errors are reported and the recovery program is retained.
+   Incomplete recovery does not restart the old service. If atomic link
+   replacement fails, it attempts a portable unlink/link while stopped.
 
 `migrate` applies every missing version, including a lower number arriving later.
 It rejects newer/unknown, dirty or changed checksums before writable access.
@@ -206,10 +206,13 @@ and use `--start-fresh` with an absent or empty target. This never adopts an
 unmanaged installation and never deletes retained evidence. Keep backups and
 failed copies until recovery is verified; `status` reports their paths/sizes.
 
-If the installer process tree stops, the service wrapper attempts pending
-rollback before opening history; rerunning the installer also attempts recovery.
-Process interruption has been tested, but recovery after a real power loss has
-not. Keep independent backups before upgrading.
+If the installer process tree stops, rerun the installer. The service wrapper
+will refuse automatic rollback because it cannot prove the old server has stopped.
+The installer attempts recovery only after stopping the managed service. If a
+failed-state directory already exists, recovery refuses to guess whether it is
+the right history: keep all copies and inspect them before manually restoring.
+Recovery after a real power loss has not been tested. Keep independent backups
+before upgrading.
 Do not delete `pending-upgrade`, its private `.upgrade.*` directory or the
 `.hx-upgrade-lock-*` anchor beside state while recovery
 is pending. Retained binaries, backups and failed state are never pruned automatically.

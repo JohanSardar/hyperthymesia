@@ -54,6 +54,28 @@ enum Command {
         #[arg(long)]
         lifecycle: PathBuf,
     },
+    /// Check whether the state volume supports safe recovery renames.
+    #[command(hide = true)]
+    ProbeRecovery {
+        #[arg(long)]
+        state: PathBuf,
+    },
+    /// Move a failed generation aside without replacing an existing path.
+    #[command(hide = true)]
+    RetireState {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+    },
+    /// Return retained source keys to a restored state without overwriting files.
+    #[command(hide = true)]
+    RecoverSecrets {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// Atomically replace an installer symlink without platform-specific mv flags.
     #[command(hide = true)]
     InstallLink {
@@ -123,6 +145,18 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
+    if let Command::ProbeRecovery { state } = &cli.command {
+        probe_recovery(state)?;
+        return Ok(());
+    }
+    if let Command::RetireState { from, to } = &cli.command {
+        retire_state(from, to)?;
+        return Ok(());
+    }
+    if let Command::RecoverSecrets { from, to } = &cli.command {
+        recover_secrets(from, to)?;
+        return Ok(());
+    }
     if let Command::InstallLink { link, target } = &cli.command {
         if let Ok(metadata) = std::fs::symlink_metadata(link) {
             anyhow::ensure!(
@@ -314,6 +348,9 @@ async fn main() -> Result<()> {
         | Command::Status { .. }
         | Command::UpgradeGuard { .. }
         | Command::UpgradeRecover { .. }
+        | Command::ProbeRecovery { .. }
+        | Command::RetireState { .. }
+        | Command::RecoverSecrets { .. }
         | Command::InstallLink { .. } => {
             unreachable!("readiness commands run before opening the store")
         }
@@ -549,6 +586,205 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+/// Exercise no-overwrite renames on both the state and its parent volume.
+fn probe_recovery(state: &std::path::Path) -> Result<()> {
+    use rustix::fs::{Mode, OFlags, RenameFlags, open, renameat_with};
+    use rustix::io::Errno;
+    for root in [state, state.parent().context("state parent")?] {
+        anyhow::ensure!(
+            std::fs::symlink_metadata(root)?.file_type().is_dir(),
+            "recovery path is not a real directory"
+        );
+        let work = tempfile::Builder::new()
+            .prefix(".hx-recovery-probe-")
+            .tempdir_in(root)?;
+        std::fs::create_dir(work.path().join("source"))?;
+        std::fs::create_dir(work.path().join("destination"))?;
+        let fd = open(
+            work.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        match renameat_with(&fd, "source", &fd, "destination", RenameFlags::NOREPLACE) {
+            Err(Errno::EXIST) => {}
+            Ok(()) => bail!("recovery rename unexpectedly replaced an existing directory"),
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::remove_dir(work.path().join("destination"))?;
+        renameat_with(&fd, "source", &fd, "destination", RenameFlags::NOREPLACE)?;
+    }
+    Ok(())
+}
+
+/// Move a failed state only to an absent sibling. A retry after interruption
+/// refuses an existing destination rather than adopting an unverified history.
+fn retire_state(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    use rustix::fs::{
+        AtFlags, FileType, Mode, OFlags, RenameFlags, fsync, open, renameat_with, statat,
+    };
+    let state = from
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("invalid state path")?;
+    let failed = to
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("invalid failed-state path")?;
+    let prefix = format!("{state}.failed-");
+    anyhow::ensure!(
+        from.parent() == to.parent()
+            && failed
+                .strip_prefix(&prefix)
+                .is_some_and(|suffix| !suffix.is_empty()
+                    && suffix.bytes().all(|b| b.is_ascii_digit() || b == b'-')),
+        "failed state must be a sibling of the active state"
+    );
+    let parent = open(
+        from.parent().context("state parent")?,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("cannot open state parent")?;
+    let metadata = statat(&parent, state, AtFlags::SYMLINK_NOFOLLOW)?;
+    anyhow::ensure!(
+        FileType::from_raw_mode(metadata.st_mode) == FileType::Directory,
+        "active state is not a real directory"
+    );
+    renameat_with(&parent, state, &parent, failed, RenameFlags::NOREPLACE)
+        .context("could not move state safely; retained paths were not overwritten")?;
+    fsync(&parent).context("could not sync state parent")?;
+    Ok(())
+}
+
+/// Move, never copy or overwrite, the private source-key directory after a
+/// restored backup is published. Both state roots must be real sibling dirs.
+fn recover_secrets(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    use rustix::fs::{
+        AtFlags, FileType, Mode, OFlags, RenameFlags, fsync, open, openat, renameat_with, statat,
+        unlinkat,
+    };
+    use rustix::io::Errno;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let name = to
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("invalid state path")?;
+    let failed = from
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("invalid failed-state path")?;
+    let prefix = format!("{name}.failed-");
+    anyhow::ensure!(
+        from.parent() == to.parent()
+            && failed.strip_prefix(&prefix).is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+            }),
+        "failed state must be a sibling of the restored state"
+    );
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let source = open(from, flags, Mode::empty()).context("cannot open retained failed state")?;
+    let target = open(to, flags, Mode::empty()).context("cannot open restored state")?;
+    let directory_identity = |dir: &std::os::fd::OwnedFd| -> Result<Option<String>> {
+        match statat(dir, "secrets", AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                anyhow::ensure!(
+                    FileType::from_raw_mode(stat.st_mode) == FileType::Directory,
+                    "source-key path is not a real directory"
+                );
+                Ok(Some(format!("{}:{}\n", stat.st_dev, stat.st_ino)))
+            }
+            Err(Errno::NOENT) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let marker_name = ".source-keys-recovery";
+    let marker = match openat(
+        &source,
+        marker_name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let file: std::fs::File = fd.into();
+            let meta = file.metadata()?;
+            anyhow::ensure!(
+                meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o7777 == 0o600,
+                "invalid source-key recovery marker"
+            );
+            let mut value = String::new();
+            file.take(128).read_to_string(&mut value)?;
+            Some(value)
+        }
+        Err(Errno::NOENT) => None,
+        Err(error) => return Err(error.into()),
+    };
+    match (directory_identity(&source)?, directory_identity(&target)?) {
+        (Some(identity), None) => {
+            if let Some(marker) = &marker {
+                anyhow::ensure!(
+                    marker == &identity,
+                    "source-key recovery marker does not match"
+                );
+            } else {
+                // Never publish a partial marker. An interrupted temporary
+                // file is not trusted or deleted by a later retry.
+                let staged = format!(".source-keys-recovery.{}", ulid::Ulid::generate());
+                let publish = (|| -> Result<()> {
+                    let fd = openat(
+                        &source,
+                        staged.as_str(),
+                        OFlags::WRONLY
+                            | OFlags::CREATE
+                            | OFlags::EXCL
+                            | OFlags::NOFOLLOW
+                            | OFlags::CLOEXEC,
+                        Mode::RUSR | Mode::WUSR,
+                    )?;
+                    let mut file: std::fs::File = fd.into();
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                    file.write_all(identity.as_bytes())?;
+                    file.sync_all()?;
+                    renameat_with(
+                        &source,
+                        staged.as_str(),
+                        &source,
+                        marker_name,
+                        RenameFlags::NOREPLACE,
+                    )?;
+                    fsync(&source)?;
+                    Ok(())
+                })();
+                if publish.is_err() {
+                    let _ = unlinkat(&source, staged.as_str(), AtFlags::empty());
+                }
+                publish?;
+            }
+            renameat_with(
+                &source,
+                "secrets",
+                &target,
+                "secrets",
+                RenameFlags::NOREPLACE,
+            )
+            .context("could not safely restore source keys; retained copies were kept")?;
+        }
+        (Some(_), Some(_)) => bail!("source keys exist in both states; neither was changed"),
+        (None, Some(identity)) => anyhow::ensure!(
+            marker.as_deref() == Some(identity.as_str()),
+            "cannot verify previously moved source keys; neither state was changed"
+        ),
+        (None, None) => anyhow::ensure!(
+            marker.is_none(),
+            "source keys are missing; retained state was not changed"
+        ),
+    }
+    fsync(&source).context("could not sync retained state directory")?;
+    fsync(&target).context("could not sync restored state directory")?;
+    Ok(())
+}
+
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     // Register SIGTERM before starting workers; service managers don't send Ctrl-C.
     #[cfg(unix)]
@@ -591,14 +827,41 @@ fn worker_lock(dir: &std::path::Path) -> Result<std::fs::File> {
 /// until the installer removes it, even if the complete installer tree dies.
 /// Treat unreadable/malformed managed metadata as blocked at every caller.
 fn upgrade_pending(dir: &std::path::Path) -> Result<bool> {
-    let prefix = match std::fs::read_to_string(dir.join(".install-prefix")) {
-        Ok(prefix) => PathBuf::from(prefix.trim_end_matches('\n')),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+    let managed = std::env::var_os("HX_MANAGED_PREFIX").map(PathBuf::from);
+    upgrade_pending_with_prefix(dir, managed.as_deref())
+}
+fn upgrade_pending_with_prefix(
+    dir: &std::path::Path,
+    managed: Option<&std::path::Path>,
+) -> Result<bool> {
+    let marker = dir.join(".install-prefix");
+    let recorded = match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "invalid installer state marker"
+            );
+            Some(PathBuf::from(
+                std::fs::read_to_string(marker)?.trim_end_matches('\n'),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
+    };
+    if let (Some(recorded), Some(managed)) = (&recorded, managed) {
+        anyhow::ensure!(
+            recorded == managed,
+            "installer state marker does not match managed service"
+        );
+    }
+    let Some(prefix) = managed.map(PathBuf::from).or(recorded) else {
+        return Ok(false);
     };
     anyhow::ensure!(prefix.is_absolute(), "invalid installer prefix");
     anyhow::ensure!(
-        prefix.join(".installed").metadata()?.is_file(),
+        std::fs::symlink_metadata(prefix.join(".installed"))?
+            .file_type()
+            .is_file(),
         "installer marker missing"
     );
     match std::fs::symlink_metadata(prefix.join("pending-upgrade")) {
@@ -709,4 +972,23 @@ fn retained_copies(state: &std::path::Path) -> Vec<serde_json::Value> {
             Err(error) => serde_json::json!({"path":path,"error":error.to_string()}),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn managed_prefix_fences_restored_state_without_its_marker() {
+        let scratch = tempfile::tempdir().unwrap();
+        let state = scratch.path().join("state");
+        let prefix = scratch.path().join("program");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&prefix).unwrap();
+        std::fs::write(prefix.join(".installed"), b"synthetic").unwrap();
+        std::os::unix::fs::symlink("synthetic", prefix.join("pending-upgrade")).unwrap();
+        assert!(upgrade_pending_with_prefix(&state, Some(&prefix)).unwrap());
+        assert!(!upgrade_pending_with_prefix(&state, None).unwrap());
+        std::fs::write(state.join(".install-prefix"), b"/different-prefix\n").unwrap();
+        assert!(upgrade_pending_with_prefix(&state, Some(&prefix)).is_err());
+    }
 }
