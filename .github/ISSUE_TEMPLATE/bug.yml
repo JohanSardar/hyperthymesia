@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible problem using synthetic data.
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For vulnerabilities use Security → Advisories → Report a vulnerability.
+        Never attach credentials, server.env, databases, screenshots or raw captures.
+  - type: input
+    id: version
+    attributes:
+      label: Version and OS/architecture
+      placeholder: "0.x.y, Linux x86_64 or Apple Silicon macOS"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal synthetic reproduction
+      description: Commands, expected result, actual result, and redacted diagnostics.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact and workaround
+      description: Mention data-loss risk without posting private data.

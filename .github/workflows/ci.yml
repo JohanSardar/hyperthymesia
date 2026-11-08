@@ -35,12 +35,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: python3 scripts/check-store-transactions.py
+      - run: python3 scripts/check-tooling.py
+      - name: Privacy patterns in current files and published history
+        run: python3 scripts/scan-personal-data.py
       - run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app -- -D warnings
