@@ -23,7 +23,7 @@ Options: `--provider codex|grok|gateway`, `--model M`, `--effort E`,
 `--state-dir /absolute/local/path`, `--server-only`, `--app-only`, `--dry-run`,
 `--uninstall`, `--start-fresh`. Defaults explicitly select **fx / codex / gpt-6.1-sol / xhigh**.
 Grok/gateway users should select their supported model. Real logins beyond
-Codex still need owner validation; see [unknowns](specs/unknowns.md).
+Codex still need owner validation; see [provider limitations](provider-limitations.md).
 
 Dry runs verify downloads and list files/service contents without executing
 downloaded binaries, initializing state or contacting service managers. Release
