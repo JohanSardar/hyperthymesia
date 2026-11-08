@@ -127,7 +127,7 @@ doctor)
 install-link)
     [ "$1" = --link ] && [ "$3" = --target ] || exit 97
     if [ "${TEST_ROLLBACK_FAIL:-}" = switch ] && [ "${4##*/}" = 0.1.0 ]; then exit 1; fi
-    exec python3 -c 'import os,sys,tempfile; link,target=sys.argv[1:]; d=tempfile.mkdtemp(dir=os.path.dirname(link)); p=d+"/current"; os.symlink(target,p); os.rename(p,link); os.rmdir(d)' "$2" "$4" ;;
+    exec python3 -c 'import os,sys,tempfile,signal; link,target=sys.argv[1:]; d=tempfile.mkdtemp(dir=os.path.dirname(link)); p=d+"/current"; os.symlink(target,p); os.rename(p,link); os.rmdir(d); interruption=os.environ.get("TEST_INTERRUPT_SWAP"); interruption and target.endswith("/0.1.1") and os.kill(os.getppid(),getattr(signal,"SIG"+interruption))' "$2" "$4" ;;
 
 serve) printf "%s\\n" --state-dir "$state" serve "$@" > "$TEST_SERVER_ARGS"; printf "%s\\n" "$TEST_ENV" > "$TEST_SERVER_ENV" ;;
 *) exit 97 ;;
@@ -152,9 +152,9 @@ esac
         path = root / f'''home {counter} & quote' % " $ test'''
         path.mkdir()
         return path
-    def run(h, *args, os_name='Linux', arch='x86_64', script=installer, tmpdir=None, cwd=None):
+    def run(h, *args, os_name='Linux', arch='x86_64', script=installer, tmpdir=None, cwd=None, shell='/bin/bash'):
         env = {k: v for k, v in os.environ.items() if not k.startswith(('HX_', 'FX_'))}
-        env.update(HOME=str(h), PATH=str(stubs) + os.pathsep + os.environ['PATH'],
+        env.update(HOME=str(h), SHELL=shell, PATH=str(stubs) + os.pathsep + os.environ['PATH'],
                    TMPDIR=tmpdir or str(root), HX_RELEASE_BASE=fixture.as_uri(),
                    HX_FX_RELEASE_BASE=fixture.as_uri(), TEST_OS=os_name, TEST_ARCH=arch,
                    TEST_COMMAND_LOG=str(root / 'commands'),
@@ -186,6 +186,27 @@ esac
     assert run(h).returncode == 0
     assert (state / 'server.env').read_bytes() == original_env
     print('ok: one command migrates, starts a user service, preserves private env')
+
+    h = home()
+    startup = h / '.bash_profile'
+    startup.write_text('# existing Bash-only configuration\n')
+    (h / '.bashrc').write_text('# keep this file unchanged\n')
+    assert run(h).returncode == 0
+    assert '# hyperthymesia PATH' in startup.read_text()
+    once = startup.read_bytes()
+    assert run(h).returncode == 0
+    assert startup.read_bytes() == once, 'update duplicated PATH setup'
+    assert not (h / '.zshrc').exists(), 'Bash-only user got a zsh startup file'
+    assert (h / '.bashrc').read_text() == '# keep this file unchanged\n'
+    path_result = subprocess.run(
+        ['/bin/bash', '--noprofile', '--norc', '-c', '. "$1"; . "$1"; printf "%s" "$PATH"', 'bash', str(startup)],
+        env={'HOME': str(h), 'PATH': '/usr/bin:/bin'}, capture_output=True, text=True, check=True)
+    assert path_result.stdout.split(':').count(str(h / '.local/bin')) == 1
+    h = home()
+    (h / '.zshrc').write_text('# existing zsh configuration\n')
+    assert run(h, shell='/bin/zsh').returncode == 0
+    assert '# hyperthymesia PATH' in (h / '.zshrc').read_text()
+    print('ok: Bash-only and zsh users get PATH exactly once without replacing startup files')
 
     # A remembered history must never turn into an empty replacement core,
     # including a custom state path whose volume disappeared.
@@ -436,6 +457,16 @@ esac
     assert (state / 'secrets/source.key').read_text() == 'synthetic-source-key'
     assert (state / 'secrets/source.key').stat().st_mode & 0o777 == 0o600
     assert (state / 'server.log').stat().st_mode & 0o777 == 0o600
+    for interruption in ('INT', 'TERM'):
+        os.environ['TEST_INTERRUPT_SWAP'] = interruption
+        interrupted = run(h, '--server-only')
+        os.environ.pop('TEST_INTERRUPT_SWAP')
+        assert interrupted.returncode != 0, interrupted.stdout
+        assert os.readlink(h / '.local/share/hyperthymesia/current') == old
+        assert (state / 'core.sqlite').read_text() == 'synthetic seeded evidence'
+        assert (state / 'server.env').read_bytes() == env_before
+        assert (state / 'secrets/source.key').read_text() == 'synthetic-source-key'
+    print('ok: INT and TERM immediately after atomic swap restore the old version and evidence')
     os.environ['TEST_FAIL_STEP'] = 'provider'
     provider_warning = run(h, '--server-only')
     os.environ.pop('TEST_FAIL_STEP')

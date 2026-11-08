@@ -79,6 +79,18 @@ support=$HOME/Library/Application\ Support/Hyperthymesia
 plist=$HOME/Library/LaunchAgents/com.hyperthymesia.server.plist
 unit=$HOME/.config/systemd/user/hyperthymesia.service
 app=$HOME/Applications/Hyperthymesia.app
+startup=$HOME/.profile
+login_shell=${SHELL:-}
+if exists "$HOME/.zshrc" || [ "${login_shell##*/}" = zsh ]; then
+    startup=$HOME/.zshrc
+else
+    for candidate in .bash_profile .bash_login .profile .bashrc; do
+        if exists "$HOME/$candidate"; then startup=$HOME/$candidate; break; fi
+    done
+fi
+if [ "$uninstall" = false ] && { [ -L "$startup" ] || { exists "$startup" && [ ! -f "$startup" ]; }; }; then
+    owner "$startup (shell startup must be a regular file)"
+fi
 for legacy in "$support/server-data" "$support/agent.json"; do
     if exists "$legacy"; then owner "$legacy"; fi
 done
@@ -269,6 +281,9 @@ untar() {
 release_base=${HX_RELEASE_BASE:-https://github.com/JohanSardar/hyperthymesia/releases/latest/download}
 fx_base=${HX_FX_RELEASE_BASE:-https://github.com/vercel-labs/fx/releases/download/v0.0.16}
 fetch "$release_base/SHA256SUMS" "$work/SHA256SUMS"
+if [ -n "${HX_RELEASE_SHA256:-}" ]; then
+    verify "$work/SHA256SUMS" "$HX_RELEASE_SHA256"
+fi
 asset=
 server_sha=
 while read -r checksum name extra; do
@@ -415,6 +430,7 @@ if [ "$dry_run" = true ]; then
         printf 'WRITE %s/%s\n' "$version_dir" "${file#./}"
     done
     printf 'WRITE %s\n' "$prefix/.installed" "$prefix/.last-version" "$prefix/tools/fx-0.0.16/fx"
+    printf 'PATH setup (once): %s\n' "$startup"
     printf 'LINK %s -> %s\n' "$prefix/current" "$version_dir"
     if [ "$app_only" = false ]; then
         printf 'LINK %s -> %s\n' "$bin" "$prefix/current/hx-server" "$service" "$prefix/current/$service_name"
@@ -492,6 +508,7 @@ setting() { printf '%s=%s\n' "$1" "$(shell_quote "$2")"; }
     setting model "$model"
     setting effort "$effort"
     setting configured "$configured"
+    setting startup "$startup"
 } > "$work/lifecycle"
 # $0 can be sh when piped. Render fixed functions without reading this script.
 cat >> "$work/lifecycle" <<'LIFECYCLE'
@@ -753,6 +770,16 @@ if [ "$install_app" = true ]; then
     mkdir -p "$HOME/Applications"
     [ -L "$app" ] || ln -s "$prefix/current/Hyperthymesia.app" "$app"
 fi
+if ! grep -Fq '# hyperthymesia PATH' "$startup" 2>/dev/null; then
+    cat >> "$startup" <<'PATH_SETUP'
+
+# hyperthymesia PATH
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+PATH_SETUP
+fi
 printf '%s\n' "$version_dir" > "$prefix/.last-version.next"
 mv "$prefix/.last-version.next" "$prefix/.last-version"
 committed=true
@@ -760,7 +787,8 @@ save_progress
 if [ -L "$prefix/pending-upgrade" ] && [ "$(readlink "$prefix/pending-upgrade")" = "$work" ]; then rm -f "$prefix/pending-upgrade"; fi
 stopped=false
 trap - 0 HUP INT TERM
-printf 'Installed. State: %s\n' "$state"
+printf 'Installed Hyperthymesia %s. State: %s\n' "${version_dir##*/}" "$state"
+printf 'PATH configured in %s. Open a new shell, or export PATH="$HOME/.local/bin:$PATH".\n' "$startup"
 if [ "$app_only" = false ]; then
     if [ "$new_env" = false ]; then
         printf 'Next: run doctor with the preserved server.env; use its configured provider and private fx for login.\n'
@@ -771,13 +799,11 @@ if [ "$app_only" = false ]; then
         quote "$prefix/tools/fx-0.0.16/fx"
         printf ' login %s\n' "$provider"
     fi
-    printf 'Then: hx-server --state-dir "%s" doctor (load server.env first).\n' "$state"
-    printf 'Pair a device: hx-server --state-dir "%s" pair --url http://127.0.0.1:7377 --name DEVICE.\n' "$state"
+    printf 'Then: set -a; . '; quote "$state/server.env"
+    printf '; set +a; '; quote "$bin"; printf ' --state-dir '; quote "$state"; printf ' doctor\n'
     printf 'Dashboard: '; quote "$bin"; printf ' --state-dir '; quote "$state"
     printf ' token create --name dashboard --prefix source: --prefix macos-agent: --prefix macos-media: --prefix companion: --scopes read_raw,read_l3\n'
     printf 'Keep the printed token private: it can read raw evidence and manage sources. Open http://127.0.0.1:7377/login. Add other connector prefixes when needed.\n'
-    printf 'Remote access: tailscale serve --bg 7377, or ssh -N -L 7377:127.0.0.1:7377 user@host.\n'
-    printf 'Automatic GC is off. A login delayed past 24 hours leaves old windows on the daily paid sweep cap.\n'
 fi
 LIFECYCLE
 if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then

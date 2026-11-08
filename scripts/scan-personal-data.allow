@@ -6,7 +6,11 @@ metadata:commit-author	identity-name	*	the owner's name as commit author
 scripts/build-release.sh	identity-name	1	the public repository URL required in release source notices
 README.md	identity-name	1	the public repository clone URL
 scripts/install.sh	identity-name	1	the public repository release URL
+docs/install	identity-name	1	the public repository release URL in the pinned Pages launcher
+scripts/live-install-smoke.py	identity-name	2	the public Pages install URL and repository clone URL for clean-VM acceptance
 docs/install.md	identity-name	1	the public repository release URL
 .audit/build.tsv	identity-name	5	public repository and merged pull request URLs in the build log
 crates/hx-interpret/src/snapshots/hx_interpret__digest__tests__mac_only_digest_main.snap	captured-prose	2	fixed renderer format and citation instructions; sample observations and screen text are synthetic
 docs/BUILD-BRIEF.md	identity-name	1	the public repository URL
+docs/setup.md	identity-name	1	the public repository clone URL in the source-build guide
+scripts/readme-commands.test.py	identity-name	1	the public Pages installation URL asserted by the README contract
