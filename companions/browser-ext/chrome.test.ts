@@ -2,12 +2,17 @@ import {test, expect} from "bun:test";
 import {chromium} from "playwright-core";
 import {existsSync} from "node:fs";
 import {join} from "node:path";
-test.skipIf(!existsSync("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))("installed Chrome exercises bundled viewport capture with mocked extension messaging", async () => {
+const chrome = [
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/usr/bin/google-chrome",
+  "/usr/bin/google-chrome-stable",
+].find(existsSync);
+test.skipIf(!chrome)("installed Chrome exercises bundled viewport capture with mocked extension messaging", async () => {
   const script=join(import.meta.dir,"dist/content.js");
   const built=Bun.spawnSync(["bun","run","build"],{cwd:import.meta.dir});
   expect(built.exitCode).toBe(0);
   const server=Bun.serve({hostname:"127.0.0.1",port:0,fetch:()=>new Response('<!doctype html><title>Synthetic fixture</title><p>Synthetic viewport evidence</p><input value="Never read input"><p style="display:none">Never read hidden</p><div style="opacity:0"><span>Never read transparent</span></div><p style="position:absolute;top:5000px">Never read offscreen</p><button onclick="history.pushState({},\'\',\'/route-two\')">Route</button>',{headers:{"content-type":"text/html"}})});
-  const browser=await chromium.launch({channel:"chrome",headless:true});
+  const browser=await chromium.launch({executablePath:chrome,headless:true});
   try {
     const page=await browser.newPage();
     await page.addInitScript(() => {
