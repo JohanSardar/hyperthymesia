@@ -25,7 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Offline installer contracts (scratch HOME, stubbed services)
-        run: sh scripts/install.test.sh
+        run: |
+          sh scripts/install.test.sh
+          python3 scripts/installer-launcher.test.py
 
   rust-linux:
     name: Rust (Linux, server side)
