@@ -25,6 +25,7 @@ fi
 
 sh scripts/install.test.sh
 python3 scripts/installer-launcher.test.py
+python3 scripts/readme-commands.test.py
 for directory in companions/*/; do
   if [[ -f "$directory/package.json" ]]; then
     (cd "$directory" && bun install --frozen-lockfile && bun run typecheck && bun run build && bun test)
