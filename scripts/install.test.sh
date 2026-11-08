@@ -208,6 +208,33 @@ esac
     assert '# hyperthymesia PATH' in (h / '.zshrc').read_text()
     print('ok: Bash-only and zsh users get PATH exactly once without replacing startup files')
 
+    h = home()
+    assert run(h).returncode == 0
+    startup = h / '.bash_profile'
+    startup.write_text('# irreplaceable shell configuration\n')
+    startup.chmod(0o640)
+    before_profile = startup.read_bytes()
+    prefix = h / '.local/share/hyperthymesia'
+    state = h / '.local/state/hyperthymesia'
+    old_target = os.readlink(prefix / 'current')
+    (state / 'core.sqlite').write_bytes(b'synthetic evidence before PATH failure')
+    before_core = (state / 'core.sqlite').read_bytes()
+    before_env = (state / 'server.env').read_bytes()
+    stub('cat', '''if [ "$#" -gt 0 ]; then exec /bin/cat "$@"; fi
+exec python3 -c 'import os,sys; d=sys.stdin.buffer.read(); fail=d.startswith(b"\\n# hyperthymesia PATH\\n"); sys.stdout.buffer.write(d[:40] if fail else d); sys.stdout.buffer.flush(); open(os.environ["TEST_COMMAND_LOG"],"a").write("path-write-fault\\n") if fail else None; sys.exit(75 if fail else 0)'
+''')
+    result = run(h)
+    (stubs / 'cat').unlink()
+    assert result.returncode != 0
+    assert 'path-write-fault' in (root / 'commands').read_text(), 'partial write was not reached'
+    assert startup.read_bytes() == before_profile, 'partial PATH write corrupted the existing shell startup file'
+    assert startup.stat().st_mode & 0o777 == 0o640
+    assert not list(h.glob('.bash_profile.hyperthymesia.*')), 'PATH staging file was not cleaned'
+    assert os.readlink(prefix / 'current') == old_target
+    assert (state / 'core.sqlite').read_bytes() == before_core
+    assert (state / 'server.env').read_bytes() == before_env
+    print('ok: partial PATH writes retain the original shell file, mode, old CLI and state')
+
     # A remembered history must never turn into an empty replacement core,
     # including a custom state path whose volume disappeared.
     for custom in (False, True):

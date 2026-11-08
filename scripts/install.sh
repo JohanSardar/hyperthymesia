@@ -571,6 +571,7 @@ backup=
 failed_state=$state.failed-$(date +%s)-$$
 migration_started=false
 committed=false
+path_stage=
 recovering=false
 backup_server=$work/payload/hx-server
 if [ -n "$old" ]; then backup_server=$old/hx-server; fi
@@ -594,6 +595,7 @@ rollback() {
     trap - 0 HUP INT TERM
     # Recovery must attempt every step, even when storage itself is failing.
     set +e
+    [ -z "$path_stage" ] || rm -f "$path_stage"
     # The durable commit is the boundary: a cleanup error after it must not
     # roll back a version that the recovery program already considers committed.
     if [ "$committed" = true ]; then exit "$result"; fi
@@ -771,7 +773,9 @@ if [ "$install_app" = true ]; then
     [ -L "$app" ] || ln -s "$prefix/current/Hyperthymesia.app" "$app"
 fi
 if ! grep -Fq '# hyperthymesia PATH' "$startup" 2>/dev/null; then
-    cat >> "$startup" <<'PATH_SETUP'
+    path_stage=$(mktemp "$startup.hyperthymesia.XXXXXXXX")
+    if [ -f "$startup" ]; then cp -p "$startup" "$path_stage"; fi
+    cat >> "$path_stage" <<'PATH_SETUP'
 
 # hyperthymesia PATH
 case ":$PATH:" in
@@ -779,6 +783,8 @@ case ":$PATH:" in
     *) export PATH="$HOME/.local/bin:$PATH" ;;
 esac
 PATH_SETUP
+    mv -f "$path_stage" "$startup"
+    path_stage=
 fi
 printf '%s\n' "$version_dir" > "$prefix/.last-version.next"
 mv "$prefix/.last-version.next" "$prefix/.last-version"
