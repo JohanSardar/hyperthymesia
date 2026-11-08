@@ -35,20 +35,13 @@ login files, screenshots, window titles, private URLs or logs.
 ./scripts/check.sh
 ```
 
-This checks Rust formatting, clippy, unit/integration tests, and on macOS the
-synthetic capture harness. CI additionally checks explicit builds/typechecks,
-installer contracts and companions. To run those locally:
-
-```sh
-cargo check --locked --workspace --all-targets
-sh scripts/install.test.sh
-python3 scripts/scan-personal-data.py
-```
-
-Apply the same macOS package exclusions to Cargo commands on Linux. For each
-companion with a package.json, run `bun install --frozen-lockfile`,
-`bun run typecheck`, `bun run build`, and `bun test` in its directory.
-Run `bun test companions/shell-hook` from the root.
+This runs locked Rust formatting, clippy, explicit typecheck/build,
+unit/integration tests, real synthetic CLI/API/backup/restore smoke, installer
+contracts, companion typechecks/builds/tests, shell syntax, privacy and generated
+documentation/rustdoc checks. On macOS it also runs the synthetic capture harness.
+Linux automatically excludes macOS-only crates. No paid account, captured history
+or persistent service is used. See [reference generation](docs/guides.md#change-a-documented-interface)
+when changing CLI, configuration, MCP or HTTP interfaces.
 The installed-Chrome test is optional when Chrome is unavailable; it is not
 proof of a browser's real extension permissions.
 
