@@ -33,10 +33,15 @@ fn anonymizer_is_deterministic_and_deny_by_default() {
         process::{Command, Stdio},
     };
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/extract-fixtures.sh");
+    let home = tempfile::tempdir().unwrap();
+    let key = home.path().join("fixture-key");
+    std::fs::write(&key, b"synthetic deterministic test key").unwrap();
     let input = r#"{"connector_instance":"private","source_key":"secret","revision":"1","observation_id":"random","kind":"agent.message","payload":{"text":"This private natural language must disappear forever.","new_unknown_field":"https://private.invalid","cwd":"/Users/private/repo"}}"#;
     let run = || {
         let mut child = Command::new(&script)
             .arg("--anonymize")
+            .env("HOME", home.path())
+            .env("HX_FIXTURE_KEY_FILE", &key)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -57,4 +62,5 @@ fn anonymizer_is_deterministic_and_deny_by_default() {
     assert!(!a.contains("/Users/"));
     assert!(!a.contains("https://"));
     assert!(a.contains("agent.message"));
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
 }
