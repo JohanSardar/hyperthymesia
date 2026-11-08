@@ -5,3 +5,37 @@ node_modules/
 *.log
 /data/
 /dist/
+
+# Local agent/editor state is not project source.
+/.claude/
+/.audit/
+/.fx/
+/.idea/
+/.vscode/
+*.swp
+*~
+__pycache__/
+*.py[cod]
+
+# Captures, local databases, credentials and signing material.
+/.state/
+/state/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+server.env
+agent.json
+*auth.json
+*.pem
+*.key
+*.p12
+*.pfx
+/secrets/
+/backups/
+/artifacts/
+coverage/
+*.vsix

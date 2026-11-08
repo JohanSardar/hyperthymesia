@@ -116,7 +116,7 @@ proxy or SSH tunnel as described in the installer guide.
 
 Grok uses `HX_FX_PROVIDER=grok` and `fx login grok`; select a supported model.
 Gateway uses `HX_FX_PROVIDER=gateway` and `AI_GATEWAY_API_KEY` instead of a login
-file. See [provider limitations](docs/specs/unknowns.md); real logins beyond Codex
+file. See [provider limitations](docs/provider-limitations.md); real logins beyond Codex
 still need validation.
 
 The state folder contains `core.sqlite`, `agent.sqlite`, `blobs/`, `locks/` and
@@ -171,6 +171,6 @@ scanner reports paths and patterns without printing matched content. Historical
 privacy findings need an owner decision before distributing that history.
 
 See [server details](crates/hx-server/README.md), [the schema](schema/), and
-[the design](docs/DESIGN.md). Original code, scripts, companions and documentation
+[the documentation](docs/README.md). Original code, scripts, companions and documentation
 in this repository are licensed **AGPL-3.0-only** under [LICENSE](LICENSE).
 Third-party dependencies retain their own licenses.
