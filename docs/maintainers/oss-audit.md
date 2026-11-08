@@ -49,3 +49,19 @@ Each area uses its own branch and PR; no merge before its actual CI succeeds.
 See [decisions](decisions.md) for choices and [validation](validation.md) for
 measured results and remaining limits. Rows describe the initial state; completion
 is recorded with evidence, never inferred from the presence of a file.
+
+## Implemented checkpoint
+
+| Area | Before | Verified change |
+| --- | --- | --- |
+| CI | Unprotected main and incomplete local checks | #86 requires green/current CI, including admins; #88 unifies platform-aware locked checks |
+| Tree/privacy | Obsolete build, agent planning and review notes tracked | #87 removes these from the current tree; history deliberately retained |
+| Contributors | License only | #89 adds contributor/security/conduct policies, issue/PR templates and comprehensive ignores |
+| Architecture | Mixed historical design notes | #90 adds the current crate/data/trust-boundary map |
+| Quality | Large combined helper/test modules; developer-dependent fixture setup | #91 adds enforcement, splits citation/MCP schema/test boundaries and isolates fixture keys/HOME; remaining module debt is explicit |
+| Docs/README/install/release | Source-first and no public release | Prepared locally with generated references, concise install-first README, atomic PATH setup and 0.1.3 integrity-checked release notes; final area merges/public activation are not yet claimed here |
+
+The combined candidate passes all local checks. Independent tracked-source and
+all-history secret scans have no unclassified findings, but removed historical
+notes remain public. See [validation](validation.md) for exact counts, scope,
+failures corrected and the separate clean-host acceptance gate.
