@@ -1,0 +1,17 @@
+name: Feature request
+description: Propose a focused improvement.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and real task
+      description: What are you trying to do? Do not include personal activity.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change and alternatives
+      description: Include privacy, compatibility and evidence-retention implications.
+    validations:
+      required: true
