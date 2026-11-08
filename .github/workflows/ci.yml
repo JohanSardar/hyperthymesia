@@ -4,6 +4,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -14,6 +21,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Offline installer contracts (scratch HOME, stubbed services)
@@ -22,6 +30,7 @@ jobs:
   rust-linux:
     name: Rust (Linux, server side)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -32,13 +41,18 @@ jobs:
       - run: python3 scripts/check-store-transactions.py
       - run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app -- -D warnings
+      - name: typecheck
+        run: cargo check --locked --workspace --all-targets --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+      - name: build
+        run: cargo build --locked --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
       - name: test
-        run: cargo test --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+        run: cargo test --locked --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
 
   mover-postgres:
     name: Mover (synthetic Postgres cutover)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17
@@ -66,6 +80,7 @@ jobs:
   rust-macos:
     name: Rust (macOS, capture agent)
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -87,13 +102,33 @@ jobs:
   companions:
     name: Companions (bun)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.12
+      - name: Install shell-hook test prerequisite
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
       - name: test each companion that has a package.json
         run: |
           for d in companions/*/; do
             if [ -f "$d/package.json" ]; then
-              (cd "$d" && bun install --frozen-lockfile 2>/dev/null || bun install) && (cd "$d" && bun test)
+              (cd "$d" && bun install --frozen-lockfile && bun run typecheck && bun run build && bun test)
             fi
           done
+          bun test companions/shell-hook
+
+  required:
+    name: Required checks
+    if: always()
+    needs: [installer, rust-linux, mover-postgres, rust-macos, companions]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI job to pass
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          printf '%s\n' "$RESULTS"
+          jq -e 'length == 5 and all(.[]; . == "success")' <<<"$RESULTS"
