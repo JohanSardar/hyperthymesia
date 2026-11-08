@@ -30,3 +30,6 @@
    service/live-download tests. Missing Docker locally is not a passing test.
 10. Record each later implementation choice here, along with limits. Do not
     manufacture clean-machine, real-provider or macOS-permission evidence.
+11. Enforcing the omitted shell-hook tests exposed missing zsh on Ubuntu.
+    Install it on the disposable runner, not the developer host; pin Bun to
+    the locally validated 1.3.12 instead of silently following latest.

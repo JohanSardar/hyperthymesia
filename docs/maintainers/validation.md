@@ -21,3 +21,12 @@ real service behavior. A temporary HOME does not establish a clean OS image.
 Commands needing credentials, permissions, destructive legacy data operations
 or a paid model request are documented separately and are not silently run
 against the owner's machine.
+
+## CI hardening
+
+- Local `scripts/check.sh` completed successfully, including macOS synthetic
+  capture/pairing harness checks. Installer contracts and actionlint passed.
+- First PR CI exposed two shell-hook failures because Ubuntu lacked zsh. The
+  checks were not skipped or weakened; the runner prerequisite was added.
+- Private vulnerability reporting and strict/admin-enforced branch protection
+  with `Required checks` were enabled through the GitHub API.
