@@ -198,6 +198,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Release note integrity and refusal tests
+        run: python3 scripts/release-notes.test.py
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
@@ -227,6 +230,7 @@ jobs:
                       sums.write(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n')
           PY
           (cd release && sha256sum --check SHA256SUMS)
+          python3 scripts/release-notes.py "v$(python3 -c 'import re; print(re.search(r"(?m)^version = \"([^\"]+)\"$", open("crates/hx-server/Cargo.toml").read())[1])')" release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hyperthymesia-release
@@ -242,6 +246,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: hyperthymesia-release
@@ -251,4 +256,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" release/* --verify-tag --title "Hyperthymesia $TAG" --generate-notes
+        run: |
+          python3 scripts/release-notes.py "$TAG" release > release-notes.md
+          gh release create "$TAG" release/* --verify-tag --title "Hyperthymesia $TAG" --notes-file release-notes.md

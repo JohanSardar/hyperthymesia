@@ -16,8 +16,10 @@
    competing pipeline. Require one stable aggregate check with strict branch
    freshness and admin enforcement; do not require a second human reviewer
    on this single-maintainer repository.
-6. Use patch version 0.1.1 for the first binary release: no incompatible public
-   behavior is intended. Keep the app and server versions equal.
+6. Use patch version 0.1.3 for the first binary release: the actual server/app
+   packages are already 0.1.2, despite the library workspace default of 0.1.0.
+   Correct the initial 0.1.1 assumption rather than downgrade. No incompatible
+   public behavior is intended. Keep the app and server versions equal.
 7. Keep full privacy/cost/host-execution warnings, even though they move below
    the concise README introduction. Quick start proves local storage/service,
    not model quality, capture permissions or a paid provider request.
