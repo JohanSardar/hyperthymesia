@@ -44,7 +44,7 @@ not proof of public hosting or a real service.
 The release workflow checks real user-service installation on disposable Linux
 and macOS runners using produced artifacts. `Live release acceptance` separately
 runs the exact public curl command against Pages and GitHub release assets on a
-new GitHub-hosted Ubuntu VM, verifies CLI/health/update, then clones the public
+new GitHub-hosted Ubuntu VM, verifies CLI/health/rerun, then clones the public
 repository and runs its default contributor checks without development caches.
 It cannot run on a developer/self-hosted machine. It never logs in or calls a
 model. Until that workflow completes against the final public pin, live curl

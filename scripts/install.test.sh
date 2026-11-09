@@ -561,12 +561,12 @@ exec python3 -c 'import os,sys; d=sys.stdin.buffer.read(); fail=d.startswith(b"\
         assert 'Recovery incomplete' in result.stderr or 'Could not restore current link' in result.stderr
     print('ok: incomplete recovery retains its record and does not restart the old service')
 
-    # Run the README fx snippet against a bad download and an existing
+    # Run the source guide fx snippet against a bad download and an existing
     # synthetic binary; checksum failure must stop before that binary runs.
-    text = Path('README.md').read_text()
+    text = Path('docs/setup.md').read_text()
     block = text.split('Install the pinned model runner, fx 0.0.16', 1)[1].split('```sh\n', 1)[1].split('\n```', 1)[0]
     h = home()
-    old_fx = h / '.local/share/hyperthymesia/tools/fx-0.0.16/fx'
+    old_fx = h / '.local/share/hyperthymesia-source/tools/fx-0.0.16/fx'
     old_fx.parent.mkdir(parents=True)
     old_fx.write_text('#!/bin/sh\ntouch "$HOME/existing-fx-ran"\n')
     old_fx.chmod(0o700)
@@ -579,5 +579,5 @@ exec python3 -c 'import os,sys; d=sys.stdin.buffer.read(); fail=d.startswith(b"\
     (stubs / 'curl').write_text(old_curl)
     assert result.returncode != 0 and 'verification failed' in result.stderr.lower(), result.stderr
     assert not (h / 'existing-fx-ran').exists()
-    print('ok: README checksum failure stops before any existing fx can run')
+    print('ok: source guide checksum failure stops before any existing fx can run')
 PY
