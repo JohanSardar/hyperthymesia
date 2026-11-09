@@ -15,6 +15,9 @@ cargo fmt --all -- --check
 cargo clippy "${packages[@]}" --all-targets -- -D warnings
 cargo check "${packages[@]}" --all-targets
 cargo build "${packages[@]}"
+python3 scripts/reference.test.py
+python3 scripts/reference.py --check
+cargo doc "${packages[@]}" --no-deps
 cargo test "${packages[@]}"
 python3 scripts/quickstart.test.py
 

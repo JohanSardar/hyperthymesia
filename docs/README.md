@@ -12,6 +12,16 @@ or correct model-generated claims.
 - [Provider limitations](provider-limitations.md)
 - [Garbage-collection safety](gc-safety.md)
 - [Legacy PostgreSQL migration](moving-to-sqlite.md)
+- [Troubleshooting](troubleshooting.md)
+- [Task guides](guides.md)
+
+## Reference
+
+- [Every server, mover and connector command/option](reference/cli.md)
+- [Mac commands and GUI](reference/macos.md)
+- [HTTP contracts](reference/api.md) and [complete routes](reference/routes.md)
+- [Configuration](reference/configuration.md) and [all environment names](reference/environment.md)
+- [Run-scoped MCP tool schemas](reference/mcp-tools.json)
 
 ## Extend it
 

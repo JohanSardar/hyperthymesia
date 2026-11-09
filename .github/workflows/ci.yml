@@ -53,6 +53,11 @@ jobs:
         run: cargo check --locked --workspace --all-targets --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
       - name: build
         run: cargo build --locked --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+      - name: Generated documentation and library API reference
+        run: |
+          python3 scripts/reference.test.py
+          python3 scripts/reference.py --check
+          cargo doc --locked --workspace --no-deps --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
       - name: test
         run: cargo test --locked --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
       - name: Real CLI, loopback API, backup and restore
