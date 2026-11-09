@@ -35,3 +35,13 @@
 11. Enforcing the omitted shell-hook tests exposed missing zsh on Ubuntu.
     Install it on the disposable runner, not the developer host; pin Bun to
     the locally validated 1.3.12 instead of silently following latest.
+12. Resume the existing prepared branches in place, preserving Factory Droid's
+    commits and authorship. Reconcile the already-squashed installer with main;
+    do not rebuild completed areas or merge stale branches without checks.
+13. Publish the GitHub binary release only from the approved annotated v0.1.3
+    tag at 545d2224c325c02da9de4400c30d77cacd4b9e30. Verify all six downloaded
+    public assets independently before changing the separate Pages pin.
+14. Enable branch-based Pages from main /docs through the GitHub API. Keep the
+    public launcher fail-closed until the VERSION/SHA256-only PR is green.
+15. Keep remaining large-module debt and untested real-provider/Mac permission
+    flows explicit; synthetic or login-free checks do not establish them.

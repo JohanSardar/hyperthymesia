@@ -14,3 +14,4 @@ crates/hx-interpret/src/snapshots/hx_interpret__digest__tests__mac_only_digest_m
 docs/BUILD-BRIEF.md	identity-name	1	the public repository URL
 docs/setup.md	identity-name	1	the public repository clone URL in the source-build guide
 scripts/readme-commands.test.py	identity-name	1	the public Pages installation URL asserted by the README contract
+docs/maintainers/validation.md	identity-name	5	public project workflow, Pages install and release URLs in the acceptance evidence

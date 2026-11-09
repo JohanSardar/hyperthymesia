@@ -49,3 +49,31 @@ Each area uses its own branch and PR; no merge before its actual CI succeeds.
 See [decisions](decisions.md) for choices and [validation](validation.md) for
 measured results and remaining limits. Rows describe the initial state; completion
 is recorded with evidence, never inferred from the presence of a file.
+
+## Implemented checkpoint
+
+| Area | Before | Verified change |
+| --- | --- | --- |
+| CI | Unprotected main and incomplete local checks | #86 requires green/current CI, including admins; #88 unifies platform-aware locked checks |
+| Tree/privacy | Obsolete build, agent planning and review notes tracked | #87 removes these from the current tree; history deliberately retained |
+| Contributors | License only | #89 adds contributor/security/conduct policies, issue/PR templates and comprehensive ignores |
+| Architecture | Mixed historical design notes | #90 adds the current crate/data/trust-boundary map |
+| Quality | Large combined helper/test modules; developer-dependent fixture setup | #91 adds enforcement, splits citation/MCP schema/test boundaries and isolates fixture keys/HOME; remaining module debt is explicit |
+| Docs | Partial references and scattered guides | #93 adds generated CLI/options, MCP, environment and route references, API contracts, task guides, troubleshooting and drift/link checks |
+| README | Source-first long introduction | #94 leads with public curl and a login-free service check, features, docs and license; source instructions move to a task guide |
+| Installer | No public independently pinned entry point | #92 adds checksum-pinned Pages launcher, owned lifecycle and atomic/idempotent PATH; #96 pins only VERSION/SHA256 to verified 0.1.3 assets |
+| Release | No published binary release | #95 prepares matching versions/changelog and verified checksum notes; v0.1.3 published for Linux x86_64/arm64 and Apple Silicon with six verified assets |
+
+The combined candidate passes all local checks. Independent tracked-source and
+all-history secret scans have no unclassified findings, but removed historical
+notes remain public. See [validation](validation.md) for exact counts, scope,
+failures corrected and the separate clean-host acceptance gate.
+
+
+Public acceptance is complete: the exact curl command installed a healthy
+0.1.3 user service on a new hosted VM in 3.47 seconds, the exact README check
+passed, and all contributor checks passed from a fresh clone. See the linked
+run, measured timings and remaining platform/account limits in
+[validation](validation.md#completed-public-curl-and-stranger-acceptance).
+No release/share step remains for the owner; personal provider login and Mac
+permissions are separate opt-in operations.
