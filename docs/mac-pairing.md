@@ -1,5 +1,11 @@
 # Mac first run and pairing
 
+The unreleased app saves foreground-window JPEG screenshots only, never video
+or audio. Published 0.1.3 and earlier builds also capture video. The macOS
+permission is still named **Screen Recording**. Screenshots default to at most one per 60 seconds in a focused session; unchanged images are
+skipped, and idle/locked/secure/excluded windows remain suppressed. Existing
+video evidence from older builds is retained; this change does not delete it.
+
 An unconfigured app shows **Not paired** and keeps observations in its local
 outbox. Choose **Grant permissions** to request macOS capture permissions when
 ready. Permission requests happen only through that action or `hx-agent onboard`.

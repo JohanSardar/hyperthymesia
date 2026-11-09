@@ -36,6 +36,50 @@ fn span(p: &mut Producer, presence: bool) -> Envelope {
     )
 }
 #[test]
+fn capture_accepts_screenshots_but_never_video() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut out = Outbox::open(&dir.path().join("db"), 100_000, 100_000).unwrap();
+    let policy = Policy::new(&Config::default()).unwrap();
+    let focus = Focus {
+        bundle_id: "synthetic.app".into(),
+        name: "Synthetic".into(),
+        pid: 1,
+        title: Some("Synthetic window".into()),
+        electron: false,
+    };
+    let mut p = producer();
+    for (kind, mime) in [
+        ("media.chunk", "video/mp4"),
+        ("media.still", "video/mp4"),
+        ("media.still", "image/jpeg"),
+    ] {
+        let bytes = b"synthetic media".to_vec();
+        let blob = BlobRef {
+            sha256: sha256_hex(&bytes),
+            media_type: mime.into(),
+            bytes: bytes.len() as u64,
+        };
+        let mut event = p.calibration();
+        event.kind = Kind::new(kind);
+        event.blobs.push(blob.clone());
+        let accepted = persist(
+            &mut out,
+            &policy,
+            Some(&focus),
+            false,
+            &event,
+            &[(blob, bytes)],
+        )
+        .unwrap();
+        assert_eq!(accepted, mime == "image/jpeg", "{kind} {mime}");
+    }
+    let batch = out.batch().unwrap().unwrap();
+    assert_eq!(batch.envelopes.len(), 1);
+    assert_eq!(batch.envelopes[0].kind.as_str(), "media.still");
+    assert_eq!(batch.envelopes[0].blobs[0].media_type, "image/jpeg");
+}
+
+#[test]
 fn browser_and_electron_content_is_allowed_but_privacy_gates_remain() {
     for (bundle_id, electron) in [
         ("com.apple.Safari", false),
@@ -62,7 +106,7 @@ fn browser_and_electron_content_is_allowed_but_privacy_gates_remain() {
                 .observe(false, p.time(), &mut p)
                 .is_none()
         );
-        for kind in ["text.snapshot", "ui.click", "media.still", "media.chunk"] {
+        for kind in ["text.snapshot", "ui.click", "media.still"] {
             let dir = tempfile::tempdir().unwrap();
             let mut out = Outbox::open(&dir.path().join("db"), 100_000, 100).unwrap();
             let mut event = p.calibration();
@@ -676,7 +720,7 @@ fn told_when_screen_fails_and_clears_on_recovery_or_pause() {
         "status":"failed", "detail":"writer start: Cannot create file"
     }});
     let warning = screen_warning(Some(&health), false).unwrap();
-    assert!(warning.contains("Cannot save screen recordings"));
+    assert!(warning.contains("Cannot save screenshots"));
     assert!(warning.contains("permissions"));
     assert!(screen_warning(Some(&health), true).is_none());
     // Starting a stream is not recovery; only a successfully written frame is.
@@ -698,42 +742,6 @@ fn told_when_screen_fails_and_clears_on_recovery_or_pause() {
         screen_warning(Some(&health), false)
             .unwrap()
             .contains("Screen Recording permission")
-    );
-}
-
-#[test]
-fn recording_comes_back_after_failed_writer_or_missing_staging_folder() {
-    let dir = tempfile::tempdir().unwrap();
-    let staging = dir.path().join("media-staging");
-    let failure = crate::media::staged_writer(&staging, |path| -> anyhow::Result<()> {
-        std::fs::write(path, [])?;
-        anyhow::bail!("writer start: Cannot create file");
-    });
-    assert!(
-        failure
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot create file")
-    );
-    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
-    std::fs::remove_dir(&staging).unwrap();
-    let (path, ()) = crate::media::staged_writer(&staging, |path| {
-        std::fs::write(path, b"synthetic video")?;
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(std::fs::read(path).unwrap(), b"synthetic video");
-    // An existing unwritable directory fails visibly, then recovers after repair.
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o500)).unwrap();
-    assert!(
-        crate::media::staged_writer(&staging, |path| Ok(std::fs::write(path, b"synthetic")?))
-            .is_err()
-    );
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(
-        crate::media::staged_writer(&staging, |path| Ok(std::fs::write(path, b"synthetic")?))
-            .is_ok()
     );
 }
 

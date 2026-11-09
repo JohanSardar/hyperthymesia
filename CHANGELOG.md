@@ -7,6 +7,13 @@ Versions before this first public binary release were source-only checkpoints.
 
 ## [Unreleased]
 
+### Changed
+
+- Mac visual capture now saves JPEG screenshots only. Video encoding, MP4
+  staging and new video persistence are removed; existing evidence is retained.
+- Capture health/menu text now describes screenshots. Temporary native objects
+  are drained after JPEG conversion on the background capture thread.
+
 ## [0.1.3] - 2026-11-08
 
 ### Added

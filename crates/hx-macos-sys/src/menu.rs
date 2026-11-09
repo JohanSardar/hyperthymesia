@@ -106,7 +106,7 @@ impl MenuBar {
         let health = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
-                &NSString::from_str("Screen recording is starting"),
+                &NSString::from_str("Screenshots are starting"),
                 None,
                 &NSString::from_str(""),
             )
@@ -173,9 +173,9 @@ impl MenuBar {
             }));
         }
         self.health.setTitle(&NSString::from_str(if paused {
-            "Screen recording is paused"
+            "Screenshots are paused"
         } else {
-            warning.unwrap_or("Screen recording is ready")
+            warning.unwrap_or("Screenshots are ready")
         }));
         self.toggle.setTitle(&NSString::from_str(if paused {
             "Resume capture"

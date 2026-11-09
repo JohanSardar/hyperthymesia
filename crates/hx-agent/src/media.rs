@@ -1,10 +1,10 @@
 use crate::{
-    config::{Config, Profile, support_dir},
+    config::{Config, Profile},
     envelope::Producer,
     policy::Policy,
     runtime::Submission,
 };
-use hx_macos_sys::{Focus, Frame, ScreenStream, VideoWriter};
+use hx_macos_sys::{Focus, Frame, ScreenStream};
 use hx_schema::{kinds::*, *};
 use std::{
     sync::{
@@ -14,16 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 pub(crate) type LiveHealth = Arc<Mutex<Option<serde_json::Value>>>;
-struct Chunk {
-    writer: VideoWriter,
-    path: std::path::PathBuf,
-    start: ObservationTime,
-    last_frame: ObservationTime,
-    started: Instant,
-    width: u32,
-    height: u32,
-    focus: Focus,
-}
 struct Session {
     stream: ScreenStream,
     focus: Focus,
@@ -71,25 +61,7 @@ fn run_inner(
         secure: false,
         blobs: vec![],
     })?;
-    let staging = support_dir().join("media-staging");
-    if staging.exists() {
-        for entry in std::fs::read_dir(&staging)? {
-            let entry = entry?;
-            if entry.path().extension().is_some_and(|ext| ext == "mp4")
-                && entry.metadata()?.len() == 0
-            {
-                std::fs::remove_file(entry.path())?;
-            }
-        }
-    }
-    if staging.exists()
-        && std::fs::read_dir(&staging)?
-            .any(|entry| entry.is_ok_and(|e| e.path().extension().is_some_and(|ext| ext == "mp4")))
-    {
-        send_health(&mut producer,&tx, &live, CollectorStatus::Failed,"incomplete staging files from an interrupted capture are retained; recovery requires validation before upload".into(),0)?;
-    }
     let mut session: Option<Session> = None;
-    let mut chunk: Option<Chunk> = None;
     let mut hour = Instant::now();
     let mut spent = 0u64;
     let mut last_hash = String::new();
@@ -156,11 +128,11 @@ fn run_inner(
             let detail = if !granted {
                 "Screen Recording permission is off. Enable it in System Settings > Privacy & Security > Screen Recording.".into()
             } else if !allowed {
-                "Screen recording is paused.".into()
+                "Screenshots are paused.".into()
             } else {
                 failure
                     .clone()
-                    .unwrap_or_else(|| "Recording the foreground window.".into())
+                    .unwrap_or_else(|| "Taking screenshots of the foreground window.".into())
             };
             send_health(
                 &mut producer,
@@ -176,9 +148,6 @@ fn run_inner(
             .is_some_and(|s| focus.as_ref() != Some(&s.focus));
         if !allowed || changed {
             session = None;
-            if let Some(c) = chunk.take() {
-                finish(c, &mut producer, &tx)?;
-            }
         }
         if allowed && session.is_none() && retry.elapsed() >= Duration::from_secs(10) {
             retry = Instant::now();
@@ -226,60 +195,6 @@ fn run_inner(
                     || !hx_macos_sys::permissions().screen
                 {
                     continue;
-                }
-                if chunk
-                    .as_ref()
-                    .is_some_and(|c| c.started.elapsed() >= Duration::from_secs(60))
-                    && let Some(c) = chunk.take()
-                {
-                    finish(c, &mut producer, &tx)?;
-                }
-                if chunk.is_none() {
-                    let dir = support_dir().join("media-staging");
-                    let (path, writer) = staged_writer(&dir, |path| {
-                        VideoWriter::new(path, s.stream.width, s.stream.height)
-                            .map_err(anyhow::Error::msg)
-                    })?;
-                    chunk = Some(Chunk {
-                        writer,
-                        path,
-                        start: frame_time(producer.time(), frame.nanos),
-                        last_frame: frame_time(producer.time(), frame.nanos),
-                        started: Instant::now(),
-                        width: s.stream.width,
-                        height: s.stream.height,
-                        focus: s.focus.clone(),
-                    });
-                }
-                if let Some(c) = chunk.as_mut() {
-                    if c.writer.append(&frame).map_err(anyhow::Error::msg)? {
-                        c.last_frame = frame_time(producer.time(), frame.nanos);
-                        if failure.take().is_some() {
-                            send_health(
-                                &mut producer,
-                                &tx,
-                                &live,
-                                CollectorStatus::Running,
-                                "Screen recording recovered.".into(),
-                                0,
-                            )?;
-                        }
-                    } else {
-                        send_health(
-                            &mut producer,
-                            &tx,
-                            &live,
-                            if failure.is_none() {
-                                CollectorStatus::Running
-                            } else {
-                                CollectorStatus::Failed
-                            },
-                            failure.clone().unwrap_or_else(|| {
-                                "The video encoder is not accepting frames.".into()
-                            }),
-                            1,
-                        )?;
-                    }
                 }
                 s.stills.latest = Some(frame);
             }
@@ -361,6 +276,16 @@ fn run_inner(
                             secure: false,
                             blobs: vec![(blob, bytes)],
                         })?;
+                        if failure.take().is_some() {
+                            send_health(
+                                &mut producer,
+                                &tx,
+                                &live,
+                                CollectorStatus::Running,
+                                "Screenshots recovered.".into(),
+                                0,
+                            )?;
+                        }
                     }
                     Err(error) => {
                         failure = Some(error.clone());
@@ -372,73 +297,6 @@ fn run_inner(
         std::thread::sleep(Duration::from_millis(100));
     }
     drop(session);
-    if let Some(c) = chunk {
-        finish(c, &mut producer, &tx)?;
-    }
-    Ok(())
-}
-/// Recreate a removed staging directory on every attempt and remove partial
-/// output even when AVAssetWriter fails during construction (Cannot create file).
-pub(crate) fn staged_writer<T>(
-    dir: &std::path::Path,
-    create: impl FnOnce(&std::path::Path) -> anyhow::Result<T>,
-) -> anyhow::Result<(std::path::PathBuf, T)> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| anyhow::anyhow!("Cannot create the screen recording folder: {e}"))?;
-    let path = dir.join(format!("{}.mp4", ulid::Ulid::generate()));
-    match create(&path) {
-        Ok(writer) => Ok((path, writer)),
-        Err(error) => {
-            let _ = std::fs::remove_file(&path);
-            Err(anyhow::anyhow!("Cannot save screen recording: {error}"))
-        }
-    }
-}
-
-fn finish(
-    c: Chunk,
-    p: &mut Producer,
-    tx: &tokio::sync::mpsc::Sender<Submission>,
-) -> anyhow::Result<()> {
-    let frames = c.writer.frames;
-    let result = c.writer.finish();
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&c.path);
-        return Err(anyhow::anyhow!("Could not finish screen recording: {e}"));
-    }
-    let bytes = std::fs::read(&c.path)?;
-    let mut e = p.core(
-        format!("chunk:{}", ulid::Ulid::generate()),
-        "0",
-        Operation::Observe,
-        CorePayload::MediaChunk(MediaChunk {
-            display: "main:foreground_window_only".into(),
-            codec: "hevc".into(),
-            width: c.width,
-            height: c.height,
-            frames,
-        }),
-    );
-    e.time = chunk_interval(c.start, c.last_frame, e.time);
-    let blob = BlobRef {
-        sha256: sha256_hex(&bytes),
-        media_type: "video/mp4".into(),
-        bytes: bytes.len() as u64,
-    };
-    e.blobs.push(blob.clone());
-    let (reply, ack) = std::sync::mpsc::sync_channel(1);
-    tx.blocking_send(Submission {
-        envelope: e,
-        reply: Some(reply),
-        focus: Some(c.focus),
-        secure: false,
-        blobs: vec![(blob, bytes)],
-    })?;
-    anyhow::ensure!(
-        ack.recv_timeout(Duration::from_secs(45))?,
-        "media declined by persistence policy"
-    );
-    std::fs::remove_file(&c.path)?;
     Ok(())
 }
 fn send_health(
@@ -487,7 +345,7 @@ pub(crate) fn run(
     stop: Arc<AtomicBool>,
     live: LiveHealth,
 ) -> anyhow::Result<()> {
-    // One failed write (a full disk, a codec error) must not end screen capture for
+    // One failed capture or JPEG conversion must not end screenshots for
     // the rest of the session: report it, back off, and start a fresh capture.
     let mut backoff = RESTART_MIN;
     let mut failure = None;
@@ -537,7 +395,7 @@ pub(crate) fn run(
                         CollectorStatus::Failed
                     },
                     if is_paused {
-                        "Screen recording is paused.".into()
+                        "Screenshots are paused.".into()
                     } else {
                         format!("{error}; restarting capture")
                     },
@@ -578,25 +436,6 @@ fn still_trigger(previous_hash: &str, hash: &str) -> Option<StillTrigger> {
 fn health_due(elapsed: Duration, last_screen: Option<bool>, screen: bool) -> bool {
     elapsed >= Duration::from_secs(45) || last_screen != Some(screen)
 }
-fn chunk_interval(
-    start: ObservationTime,
-    last_frame: ObservationTime,
-    finish: ObservationTime,
-) -> ObservationTime {
-    let mut time = start;
-    // Wall times derive from separate clock reads, so a one-frame chunk can
-    // land nanoseconds before its start. Never emit a negative interval.
-    time.source_end = last_frame.source_start.max(time.source_start);
-    time.mono_end = match (&time.mono_start, last_frame.mono_start) {
-        (Some(s), Some(mut e)) if e.boot_id == s.boot_id && e.domain == s.domain => {
-            e.nanos = e.nanos.max(s.nanos);
-            Some(e)
-        }
-        (_, e) => e,
-    };
-    time.observed_at = finish.observed_at;
-    time
-}
 fn frame_time(mut now: ObservationTime, nanos: u64) -> ObservationTime {
     let stamp = now.mono_start.as_mut().expect("native stamp");
     now.source_start = Some(
@@ -620,24 +459,6 @@ mod statechart_regressions {
         }
         assert_eq!(delay, RESTART_MAX);
         assert_eq!(next_backoff(RESTART_MIN), RESTART_MIN * 2);
-    }
-    #[test]
-    fn chunk_interval_never_ends_before_it_starts() {
-        let at = chrono::Utc::now();
-        let stamp = |nanos| hx_schema::MonoStamp {
-            domain: hx_schema::ClockDomain::MachContinuous,
-            boot_id: hx_schema::BootId::new("synthetic-boot"),
-            nanos,
-        };
-        let mut start = ObservationTime::point(at);
-        start.mono_start = Some(stamp(1_000));
-        // The same single frame, read again a few nanoseconds of wall-clock jitter earlier.
-        let mut last = ObservationTime::point(at - chrono::Duration::nanoseconds(3));
-        last.mono_start = Some(stamp(999));
-        let time = chunk_interval(start, last, ObservationTime::point(at));
-        assert_eq!(time.validate(), Ok(()));
-        assert_eq!(time.source_end, Some(at));
-        assert_eq!(time.mono_end.map(|s| s.nanos), Some(1_000));
     }
     #[test]
     fn periodic_still_uses_retained_change_and_skips_static_window() {
@@ -693,21 +514,5 @@ mod statechart_regressions {
         assert!(health_due(Duration::from_secs(1), Some(true), false));
         assert!(!health_due(Duration::from_secs(1), Some(false), false));
         assert!(health_due(Duration::from_secs(46), Some(false), false));
-    }
-    #[test]
-    fn video_finish_timestamp_stops_at_last_accepted_frame() {
-        let p = Producer::new("synthetic".into()).unwrap();
-        let start = p.time();
-        let mut last = start.clone();
-        last.source_start = last.source_start.map(|t| t + chrono::Duration::seconds(4));
-        last.mono_start.as_mut().unwrap().nanos += 4_000_000_000;
-        let boundary = last.source_start.unwrap() + chrono::Duration::seconds(1);
-        let mut finish = last.clone();
-        finish.source_start = Some(boundary + chrono::Duration::seconds(5));
-        finish.mono_start.as_mut().unwrap().nanos += 6_000_000_000;
-        let interval = chunk_interval(start, last.clone(), finish);
-        assert_eq!(interval.source_end, last.source_start);
-        assert_eq!(interval.mono_end, last.mono_start);
-        assert!(interval.source_end.unwrap() < boundary);
     }
 }

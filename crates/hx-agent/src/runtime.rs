@@ -59,15 +59,15 @@ pub(crate) fn screen_warning(health: Option<&serde_json::Value>, paused: bool) -
             let detail = media["detail"].as_str().unwrap_or("The capture service stopped.");
             let lower = detail.to_lowercase();
             Some(if lower.contains("file") || lower.contains("folder") || lower.contains("writer") || lower.contains("permission denied") || lower.contains("disk") {
-                "Cannot save screen recordings. Check free disk space and recording folder permissions. Retrying automatically.".into()
+                "Cannot save screenshots. Check free disk space and app permissions. Retrying automatically.".into()
             } else {
-                format!("Screen recording stopped: {}. Retrying automatically.", detail.chars().take(180).collect::<String>())
+                format!("Screenshot capture stopped: {}. Retrying automatically.", detail.chars().take(180).collect::<String>())
             })
         }
         "running" => {
             let observed = media["observed_at"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
             if observed.is_none_or(|at| (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds() >= 55) {
-                Some("Screen recording is not responding. Waiting for it to recover.".into())
+                Some("Screenshot capture is not responding. Waiting for it to recover.".into())
             } else { None }
         }
         _ => None,
