@@ -1,6 +1,6 @@
 #!/bin/sh
-VERSION=0.0.0
-SHA256=0000000000000000000000000000000000000000000000000000000000000000
+VERSION=0.1.3
+SHA256=0943a5d8c6f96e51c435f95738ec52cd93046234805aec93c88de11faa3de599
 # Pin the release manifest, which binds the lifecycle installer and every asset.
 set -eu
 umask 077
