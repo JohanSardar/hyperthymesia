@@ -18,7 +18,6 @@ objc2-core-foundation = "=0.3.2"
 objc2-core-graphics = "=0.3.2"
 objc2-application-services = "=0.3.2"
 objc2-screen-capture-kit = "=0.3.2"
-objc2-av-foundation = { version = "=0.3.2", features = ["objc2-core-media"] }
 objc2-image-io = "=0.3.2"
 block2 = "0.6"
 libc = "0.2"

@@ -1,11 +1,10 @@
 use super::*;
 use dispatch2::DispatchQueue;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-use objc2_av_foundation::*;
 use objc2_core_foundation::{CFDictionary, CFMutableData};
 use objc2_core_image::{CIContext, CIImage};
 use objc2_core_media::{CMSampleBuffer, CMTime};
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSURL};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject};
 use objc2_image_io::CGImageDestination;
 use objc2_screen_capture_kit::*;
 
@@ -209,7 +208,9 @@ impl Drop for ScreenStream {
 }
 impl Frame {
     pub fn jpeg(&self) -> Result<Vec<u8>, String> {
-        unsafe {
+        // This runs on a long-lived Rust capture thread without AppKit's pool.
+        // Release temporary Core Image/Foundation objects after each screenshot.
+        objc2::rc::autoreleasepool(|_| unsafe {
             let pixel = self.sample.image_buffer().ok_or("no pixel buffer")?;
             let image = CIImage::imageWithCVPixelBuffer(&pixel);
             let context = CIContext::contextWithOptions(None);
@@ -232,116 +233,6 @@ impl Frame {
                 return Err("JPEG encoding failed".into());
             }
             Ok(data.to_vec())
-        }
-    }
-}
-pub struct VideoWriter {
-    path: std::path::PathBuf,
-    writer: Retained<AVAssetWriter>,
-    input: Retained<AVAssetWriterInput>,
-    started: bool,
-    pub frames: u32,
-}
-impl VideoWriter {
-    pub fn new(path: &std::path::Path, width: u32, height: u32) -> Result<Self, String> {
-        unsafe {
-            let url = NSURL::fileURLWithPath(&NSString::from_str(
-                path.to_str().ok_or("invalid video path")?,
-            ));
-            let writer = AVAssetWriter::initWithURL_fileType_error(
-                AVAssetWriter::alloc(),
-                &url,
-                AVFileTypeMPEG4.ok_or("missing AVFoundation constant")?,
-            )
-            .map_err(|e| e.to_string())?;
-            let bitrate = NSNumber::new_i32(160_000);
-            let compression = NSDictionary::from_slices(
-                &[AVVideoAverageBitRateKey.ok_or("missing AVFoundation constant")?],
-                &[&*bitrate],
-            );
-            let w = NSNumber::new_u32(width);
-            let h = NSNumber::new_u32(height);
-            let settings = NSDictionary::<NSString, objc2::runtime::AnyObject>::from_slices(
-                &[
-                    AVVideoCodecKey.ok_or("missing AVFoundation constant")?,
-                    AVVideoWidthKey.ok_or("missing AVFoundation constant")?,
-                    AVVideoHeightKey.ok_or("missing AVFoundation constant")?,
-                    AVVideoCompressionPropertiesKey.ok_or("missing AVFoundation constant")?,
-                ],
-                &[
-                    AVVideoCodecTypeHEVC.ok_or("HEVC unavailable")?.as_ref(),
-                    w.as_ref(),
-                    h.as_ref(),
-                    compression.as_ref(),
-                ],
-            );
-            let input = AVAssetWriterInput::initWithMediaType_outputSettings(
-                AVAssetWriterInput::alloc(),
-                AVMediaTypeVideo.ok_or("missing AVFoundation constant")?,
-                Some(&settings),
-            );
-            input.setExpectsMediaDataInRealTime(true);
-            if !writer.canAddInput(&input) {
-                return Err("HEVC input unsupported".into());
-            }
-            writer.addInput(&input);
-            if !writer.startWriting() {
-                return Err(format!("writer start: {:?}", writer.error()));
-            }
-            Ok(Self {
-                path: path.into(),
-                writer,
-                input,
-                started: false,
-                frames: 0,
-            })
-        }
-    }
-    pub fn append(&mut self, frame: &Frame) -> Result<bool, String> {
-        unsafe {
-            if self.writer.status() != AVAssetWriterStatus::Writing {
-                return Err(format!("writer stopped: {:?}", self.writer.error()));
-            }
-            if !self.started {
-                self.writer
-                    .startSessionAtSourceTime(frame.sample.presentation_time_stamp());
-                self.started = true;
-            }
-            if !self.input.isReadyForMoreMediaData() {
-                return Ok(false);
-            }
-            if !self.input.appendSampleBuffer(&frame.sample) {
-                return Err(format!("writer append: {:?}", self.writer.error()));
-            }
-            self.frames += 1;
-            Ok(true)
-        }
-    }
-    pub fn finish(self) -> Result<(), String> {
-        unsafe {
-            self.input.markAsFinished();
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let cb = RcBlock::new(move || {
-                let _ = tx.try_send(());
-            });
-            self.writer.finishWritingWithCompletionHandler(&cb);
-            rx.recv_timeout(Duration::from_secs(10))
-                .map_err(|e| e.to_string())?;
-            if self.writer.status() != AVAssetWriterStatus::Completed {
-                return Err(format!("writer finish: {:?}", self.writer.error()));
-            }
-            Ok(())
-        }
-    }
-}
-
-impl Drop for VideoWriter {
-    fn drop(&mut self) {
-        unsafe {
-            if self.writer.status() != AVAssetWriterStatus::Completed {
-                self.writer.cancelWriting();
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
+        })
     }
 }

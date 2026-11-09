@@ -59,6 +59,17 @@ pub fn persist(
     envelope: &hx_schema::Envelope,
     blobs: &[(hx_schema::BlobRef, Vec<u8>)],
 ) -> anyhow::Result<bool> {
+    // Capture is screenshots-only, including companion submissions. Keep legacy
+    // video readable on the server, but never persist new video on this Mac.
+    if envelope.kind.as_str() == "media.chunk"
+        || envelope
+            .blobs
+            .iter()
+            .chain(blobs.iter().map(|(blob, _)| blob))
+            .any(|blob| blob.media_type.to_ascii_lowercase().starts_with("video/"))
+    {
+        return Ok(false);
+    }
     // Only the closed, content-free gap schema bypasses companion content checks.
     // A companion cannot smuggle arbitrary fields or blobs under this kind.
     let metadata_gap = envelope.kind.as_str() == "policy.gap"

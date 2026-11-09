@@ -54,8 +54,10 @@ Third-party dependencies retain their own licenses.
 
 ## Before you collect data
 
-The Mac app can record focused windows, accessibility text, input activity,
-screen video and stills. It buffers uploads locally. The server stores evidence,
+The Mac app can record focused-window context, accessibility text, input activity
+and screenshots. The unreleased screenshot-only build removes video capture;
+published 0.1.3 and earlier builds also record video. It buffers uploads locally.
+The server stores evidence,
 saved source answers and day pages on your disk. Your configured **cloud model**
 can receive captured window titles, URLs, accessibility text, screenshot OCR,
 fuller saved evidence from broker lookups, and source responses during setup and

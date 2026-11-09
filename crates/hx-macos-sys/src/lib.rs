@@ -698,7 +698,7 @@ impl Drop for AxObserver {
 mod media;
 mod text_walk;
 mod window_match;
-pub use media::{Frame, ScreenStream, VideoWriter};
+pub use media::{Frame, ScreenStream};
 
 pub fn session_locked() -> Option<bool> {
     let dictionary = CGSessionCopyCurrentDictionary()?;

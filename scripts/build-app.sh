@@ -29,7 +29,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>LSUIElement</key><true/>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSAccessibilityUsageDescription</key><string>Record focused window context for your private activity timeline.</string>
-<key>NSScreenCaptureUsageDescription</key><string>Record screen evidence for your private activity timeline.</string>
+<key>NSScreenCaptureUsageDescription</key><string>Capture screenshots, never video, for your private activity timeline.</string>
 <key>NSInputMonitoringUsageDescription</key><string>Measure input activity without recording key identities.</string>
 </dict></plist>
 PLIST
