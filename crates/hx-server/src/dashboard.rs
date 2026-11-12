@@ -17,7 +17,7 @@ pub(crate) fn shell(title: &str, body: Markup) -> Html<String> {
         meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'";
         title {(title)}
         style {"body{font:16px system-ui;background:#10151e;color:#e8edf5;margin:2rem}a{color:#8fd3ff}.lane{margin:1rem 0}.entry{display:flex;gap:1rem;margin:.6rem 0}.when{font-variant-numeric:tabular-nums;color:#9fb0c8;min-width:7.5rem}.desc{margin:.2rem 0;color:#b9c6d8;font-size:14px}.summary{color:#cfd8e6}summary{cursor:pointer;margin:1rem 0}.track{height:2.5rem;background:#253143;position:relative;overflow:hidden}.bar{position:absolute;background:#255b87;height:100%;white-space:nowrap;overflow:hidden;font-size:12px;color:white}.axis{display:flex;justify-content:space-between}pre{white-space:pre-wrap;overflow-wrap:anywhere}.zoom:target .track{height:5rem}table{border-spacing:1rem .4rem}input{font:inherit}img{max-width:480px}"}
-    } body {nav {a href="/" {"Today"} " · " a href="#episodes" {"What you did"} " · " a href="#tasks" {"Tasks"} " · " a href="#lanes" {"Lanes"} " · " a href="/connect" {"Connect sources"} " · " a href="/agent-setup" {"What your agent set up"}}
+    } body {nav {a href="/" {"Today"} " · " a href="#sessions" {"Work sessions"} " · " a href="#episodes" {"What you did"} " · " a href="#tasks" {"Tasks"} " · " a href="#lanes" {"Lanes"} " · " a href="/connect" {"Connect sources"} " · " a href="/agent-setup" {"What your agent set up"}}
         (body)
     }}}.into_string())
 }
@@ -62,6 +62,53 @@ fn entries<'a>(
     out
 }
 
+/// One work session (hx-replica/v10 revisions) in the owner's local time.
+struct SessionEntry<'a> {
+    start: chrono::DateTime<chrono::FixedOffset>,
+    end: chrono::DateTime<chrono::FixedOffset>,
+    minutes: f64,
+    item: &'a serde_json::Value,
+}
+
+fn sessions<'a>(
+    revisions: &'a [serde_json::Value],
+    day: Interval,
+    zone: chrono::FixedOffset,
+) -> Vec<SessionEntry<'a>> {
+    let mut out: Vec<SessionEntry> = revisions
+        .iter()
+        .flat_map(|r| {
+            let window =
+                serde_json::from_value::<Interval>(r["interpretation"]["window"].clone()).ok();
+            r["interpretation"]["sessions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |item| (window, item))
+        })
+        .filter_map(|(window, item)| {
+            let ranges: Vec<Interval> = serde_json::from_value(item["ranges"].clone()).ok()?;
+            // Source-only sessions have no active time; place them in their window.
+            let (start, end) = match ranges
+                .iter()
+                .map(|i| (i.start, i.end))
+                .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+            {
+                Some(bounds) => bounds,
+                None => (window?.start, window?.end),
+            };
+            (start < day.end && end > day.start).then(|| SessionEntry {
+                start: start.with_timezone(&zone),
+                end: end.with_timezone(&zone),
+                minutes: item["active_s"].as_f64().unwrap_or(0.0) / 60.0,
+                item,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.minutes.total_cmp(&a.minutes));
+    out
+}
+
 fn zone_label(zone: chrono::FixedOffset) -> String {
     let minutes = zone.local_minus_utc() / 60;
     let sign = if minutes < 0 { '−' } else { '+' };
@@ -80,6 +127,7 @@ pub fn render_day(
 ) -> Html<String> {
     let width = timeline.window.len().num_milliseconds().max(1) as f64;
     let local_start = timeline.window.start.with_timezone(&zone);
+    let sessions = sessions(revisions, timeline.window, zone);
     let episodes = entries(revisions, "episodes", timeline.window, zone);
     let tasks = entries(revisions, "tasks", timeline.window, zone);
     shell(
@@ -98,8 +146,30 @@ pub fn render_day(
                     }
                 }
             }
+            section id="sessions" {h2 {"Work sessions"}
+                @for s in &sessions {
+                    div class="entry" {
+                        span class="when" {(s.start.format("%H:%M")) "–" (s.end.format("%H:%M")) br; (format!("{:.1} min", s.minutes))}
+                        div {
+                            b {(s.item["project"].as_str().unwrap_or(""))} " " small {"(" (s.item["kind"].as_str().unwrap_or("")) ")"}
+                            p class="desc" {(s.item["summary"].as_str().unwrap_or(""))}
+                            @for step in s.item["done"].as_array().into_iter().flatten() {
+                                p class="desc" {(step["at"].as_str().and_then(|t| t.parse::<chrono::DateTime<Utc>>().ok()).map(|t| t.with_timezone(&zone).format("%H:%M").to_string()).unwrap_or_default()) " " (step["what"].as_str().unwrap_or(""))}
+                            }
+                            @for o in s.item["outcomes"].as_array().into_iter().flatten() {
+                                p class="desc" {"Outcome: " (o["what"].as_str().unwrap_or("")) @if o["status"] == "not_established" {" (not established)"}}
+                            }
+                            @for b in s.item["blockers"].as_array().into_iter().flatten() {
+                                p class="desc" {"Blocked by: " (b["what"].as_str().unwrap_or(""))}
+                            }
+                            @if let Some(note) = s.item["borderline"].as_str() {p class="desc" {"Borderline: " (note)}}
+                            p class="desc" {"Sources: " @for id in s.item["evidence"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_i64) {a href=(format!("/evidence/{id}")) {"Evidence " (id)} " "}}
+                        }
+                    }
+                }
+            }
             section id="episodes" {h2 {"What you did"}
-                @if episodes.is_empty() {p {"No replica for this day yet."}}
+                @if episodes.is_empty() && sessions.is_empty() {p {"No replica for this day yet."}}
                 @for e in &episodes {
                     div class="entry" {
                         span class="when" {(e.start.format("%H:%M")) "–" (e.end.format("%H:%M"))}

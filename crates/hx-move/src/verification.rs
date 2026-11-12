@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, io::Read, path::Path};
 
-// Only the published interpretation's episode/claim fields are citations.
+// Only the published interpretation's session (or older episode/claim) fields are citations.
 // agent_run, input_manifest, prior-context responses and rejected check_failures
 // are immutable audit records, and may contain failed or hallucinated lookups.
 fn citations(value: &Value, ids: &mut BTreeSet<i64>) -> Result<()> {
@@ -23,6 +23,24 @@ fn citations(value: &Value, ids: &mut BTreeSet<i64>) -> Result<()> {
             }
         }
         Ok(())
+    }
+    for session in value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        add(session.get("evidence"), ids)?;
+        for key in ["done", "outcomes", "blockers"] {
+            for item in session
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                add(item.get("evidence"), ids)?;
+            }
+        }
     }
     for episode in value
         .get("episodes")

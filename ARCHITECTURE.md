@@ -40,7 +40,7 @@ the same as human attention.
 | `crates/hx-store` | SQLite schema/migrations, state privacy, evidence persistence/search, tokens, backups and restore |
 | `crates/hx-jobs` | Durable scheduling, lease ownership, heartbeat and completion fencing through store transactions |
 | `crates/hx-compile` | Deterministic interval/coverage/exposure projection, independent of model calls |
-| `crates/hx-interpret` | Evidence digest, provider contract, structured claims and citation validation |
+| `crates/hx-interpret` | Fact sheet, work sessions and their add-up check, provider contract, legacy claims and citation validation |
 | `crates/hx-visual` | Image sampling/cache and OCR helper; native Vision on a Mac |
 | `crates/hx-sources` | API, CLI and MCP source transport, bounded output and command/process lifecycle |
 | `crates/hx-server` | CLI, REST/dashboard/auth, disclosure, processing coordinator, source setup/pulls and fx broker |

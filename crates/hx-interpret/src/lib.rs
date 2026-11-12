@@ -1,5 +1,10 @@
 //! L2 → L3: structured, evidence-checked claims about what happened.
 //!
+//! The server's interpreter (hx-replica/v10) writes [`sessions`] from a
+//! [`facts`] sheet. Episodes and tasks below are the replaced interpret/v2 and
+//! hx-replica/v9 output: still read from older revisions and still produced by
+//! the legacy single-call providers (stub, Claude CLI), but no longer by fx.
+//!
 //! INTERFACE (frozen for parallel work; the implementation fills the bodies):
 //! - [`build_packet`] turns a compiled window into a bounded evidence packet.
 //!   Restricted evidence never enters a packet unredacted.
@@ -142,12 +147,14 @@ pub trait Provider: Send + Sync {
 
 pub const PROMPT_VERSION: &str = "interpret/v2";
 
-pub mod digest;
+pub mod facts;
 pub mod packet;
 pub mod providers;
+pub mod sessions;
 mod validation;
-pub use digest::{Digest, DigestConfig, ScreenText, Segment, build_digest};
+pub use facts::{FactConfig, FactSheet, ScreenText, Stretch, build_fact_sheet};
 pub use packet::{PacketBudget, build_packet, build_packet_with_budget, entity_assertions};
+pub use sessions::{Session, SessionKind, SessionReplica};
 pub use validation::{check, check_and_repair};
 
 /// The model supplies content only; provenance and audit records are server-owned.

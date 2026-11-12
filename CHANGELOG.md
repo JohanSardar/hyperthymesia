@@ -9,6 +9,15 @@ Versions before this first public binary release were source-only checkpoints.
 
 ### Changed
 
+- The interpreter (hx-replica/v10) now writes work sessions grouped by project
+  from a deterministic fact sheet, and its sessions must account for every
+  active second (input within 180 s, Mac unlocked and awake). A hard add-up
+  check retries the model, then assigns any remaining seconds in code and
+  records it. Fact sheets include screenshot text. Older episode revisions
+  still display.
+- `HX_FX_PROVIDER=proxy` runs fx against a loopback OpenAI-compatible proxy
+  (for example CLIProxyAPI) with `HX_FX_PROXY_KEY` and `HX_FX_PROXY_URL`.
+
 - Mac visual capture now saves JPEG screenshots only. Video encoding, MP4
   staging and new video persistence are removed; existing evidence is retained.
 - Capture health/menu text now describes screenshots. Temporary native objects

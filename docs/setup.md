@@ -96,7 +96,10 @@ proxy or SSH tunnel as described in the installer guide.
 
 Grok uses `HX_FX_PROVIDER=grok` and `fx login grok`; select a supported model.
 Gateway uses `HX_FX_PROVIDER=gateway` and `AI_GATEWAY_API_KEY` instead of a login
-file. See [provider limitations](provider-limitations.md); real logins beyond Codex
+file. A local OpenAI-compatible proxy such as CLIProxyAPI uses
+`HX_FX_PROVIDER=proxy`, `HX_FX_PROXY_KEY` (the proxy's client key), `HX_FX_MODEL`
+and optionally `HX_FX_PROXY_URL` (loopback only; default
+`http://127.0.0.1:8317/v1`). See [provider limitations](provider-limitations.md); real logins beyond Codex
 still need validation.
 
 The state folder contains `core.sqlite`, `agent.sqlite`, `blobs/`, `locks/` and
