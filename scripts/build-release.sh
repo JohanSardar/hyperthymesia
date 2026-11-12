@@ -34,7 +34,7 @@ cargo build --locked --release -p hx-server
 mkdir "$work/server"
 cp "$CARGO_TARGET_DIR/release/hx-server" "$work/server/"
 cp LICENSE "$work/server/"
-printf 'https://github.com/JohanSardar/hyperthymesia\ncommit %s\n' "$(git rev-parse HEAD)" > "$work/server/SOURCE"
+printf 'https://gitlab.com/johansardar/hyperthymesia\ncommit %s\n' "$(git rev-parse HEAD)" > "$work/server/SOURCE"
 cargo about generate --locked --workspace --target "$target" --fail \
     scripts/release-licenses.hbs -o "$work/server/THIRD-PARTY.txt"
 [[ -s "$work/server/THIRD-PARTY.txt" ]]

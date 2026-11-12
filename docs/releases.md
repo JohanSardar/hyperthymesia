@@ -1,5 +1,17 @@
 # Releases
 
+> **Hosting since 2026-11-12.** The project lives at
+> https://gitlab.com/johansardar/hyperthymesia. Release assets are uploaded to
+> the project's generic package registry (`hyperthymesia/<version>/<file>`) and
+> linked from the GitLab release for the tag. The `pages` job in `.gitlab-ci.yml`
+> runs `scripts/pages-site.sh`, which publishes `docs/` plus the pinned assets
+> at https://hyperthymesia.eilmer.si (`/install`,
+> `/releases/download/v<version>/`, `/releases/latest/download/`). It refuses
+> assets that do not match the `docs/install` pin. The GitHub Actions release
+> and live-acceptance workflows below are kept for reference only: GitLab's free
+> hosted runners have no macOS, so the next release needs a macOS build path
+> before it can be cut. Steps below that say GitHub now mean GitLab.
+
 Only a maintainer-approved `v<server version>` tag publishes a public release.
 Server version `0.1.3` requires tag `v0.1.3`; the app version must match.
 The workflow rejects mismatched tags. Never publish a registry package or

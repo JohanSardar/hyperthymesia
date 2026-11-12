@@ -19,7 +19,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/hx-launcher.XXXXXXXX")
 trap 'rm -rf "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-base=https://github.com/JohanSardar/hyperthymesia/releases/download/v$VERSION
+base=https://hyperthymesia.eilmer.si/releases/download/v$VERSION
 curl -fsSL "$base/SHA256SUMS" -o "$work/SHA256SUMS" || die 'release manifest download failed'
 [ "$(sha256 "$work/SHA256SUMS")" = "$SHA256" ] || die 'SHA-256 mismatch: release manifest; nothing installed'
 expected=$(awk '

@@ -19,7 +19,7 @@ class ReadmeCommandsTest(unittest.TestCase):
     def test_actual_readme_has_public_install_and_login_free_check(self):
         root = Path(__file__).resolve().parent.parent
         readme = (root / "README.md").read_text()
-        public_url = "https://johansardar.github.io/hyperthymesia/install"
+        public_url = "https://hyperthymesia.eilmer.si/install"
         self.assertEqual(command_block(readme, "Install"), f"curl -fsSL {public_url} | sh")
         quickstart = command_block(readme, "30-second check")
         self.assertIn("doctor --state-only", quickstart)

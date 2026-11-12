@@ -1,13 +1,14 @@
 # Security policy
 
 Hyperthymesia is experimental software that can collect sensitive personal data.
-The latest GitHub release receives fixes; older 0.x versions are not maintained.
+The latest release receives fixes; older 0.x versions are not maintained.
 No version is claimed to be audited, sandboxed or production-safe.
 
 ## Report a vulnerability privately
 
-Use this repository's **Security → Advisories → Report a vulnerability** button.
-Private vulnerability reporting is enabled. Do not open a public issue with
+Open a **confidential issue** in this project on GitLab
+(https://gitlab.com/johansardar/hyperthymesia/-/issues/new, tick "This issue is
+confidential"). Only the reporter and maintainers can read it. Do not open a public issue with
 exploit details, credentials or captured personal data. Include the affected
 version, impact, minimal synthetic reproduction and suggested mitigation.
 Do not send raw evidence, databases, provider login files or server.env.

@@ -22,15 +22,15 @@ with tempfile.TemporaryDirectory(prefix="hx-launcher-test-") as tmp:
 set -eu
 [ "$#" = 4 ] && [ "$1" = -fsSL ] && [ "$3" = -o ] || exit 97
 case "$2" in
-  https://github.com/*/releases/download/v9.8.7/SHA256SUMS) cp "$TEST_RELEASE/SHA256SUMS" "$4" ;;
-  https://github.com/*/releases/download/v9.8.7/install.sh) cp "$TEST_RELEASE/install.sh" "$4" ;;
+  https://hyperthymesia.eilmer.si/releases/download/v9.8.7/SHA256SUMS) cp "$TEST_RELEASE/SHA256SUMS" "$4" ;;
+  https://hyperthymesia.eilmer.si/releases/download/v9.8.7/install.sh) cp "$TEST_RELEASE/install.sh" "$4" ;;
   *) exit 97 ;;
 esac
 """)
     curl.chmod(0o700)
     payload = b"""#!/bin/sh
 set -eu
-case "$HX_RELEASE_BASE" in https://github.com/*/releases/download/v9.8.7) ;; *) exit 98;; esac
+case "$HX_RELEASE_BASE" in https://hyperthymesia.eilmer.si/releases/download/v9.8.7) ;; *) exit 98;; esac
 [ "${#HX_RELEASE_SHA256}" = 64 ] || exit 98
 printf '%s' "$*" > "$HOME/installed"
 """

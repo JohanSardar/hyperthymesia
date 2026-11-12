@@ -16,7 +16,7 @@ assert os.uname().sysname == "Linux", "this acceptance run targets a fresh Linux
 root = Path(__file__).resolve().parent.parent
 home = Path.home()
 prefix = home / ".local/share/hyperthymesia"
-command = "curl -fsSL https://johansardar.github.io/hyperthymesia/install | sh"
+command = "curl -fsSL https://hyperthymesia.eilmer.si/install | sh"
 readme = (root / "README.md").read_text()
 assert command_block(readme, "Install") == command, "README public command drift"
 quickstart = command_block(readme, "30-second check")
@@ -77,7 +77,7 @@ try:
         clone_env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
                          GIT_TERMINAL_PROMPT="0", CARGO_TARGET_DIR=str(Path(tmp) / "build"))
         assert not Path(clone_env["CARGO_TARGET_DIR"]).exists()
-        run(["git", "clone", "https://github.com/JohanSardar/hyperthymesia.git", str(clone)],
+        run(["git", "clone", "https://gitlab.com/johansardar/hyperthymesia.git", str(clone)],
             cwd=tmp, env=clone_env)
         assert (clone / "CONTRIBUTING.md").is_file()
         # A fresh clone and its default verification entry point, no source

@@ -18,8 +18,8 @@ rules consistently, and avoid disclosing private reports or reporter identities.
 Conflicts of interest should be disclosed and moderation handed to another
 maintainer where one is available.
 
-For harassment, threats or private information, use GitHub's **Report abuse**
-action on the relevant content/profile. That reports privately to GitHub and is
+For harassment, threats or private information, use GitLab's **Report abuse**
+action on the relevant content/profile. That reports privately to GitLab and is
 not a private maintainer inbox. For non-sensitive moderation requests, open an
 issue without repeating abusive or private material. Do not publish sensitive
 details just to request moderation. Security vulnerabilities belong in the

@@ -15,3 +15,8 @@ docs/BUILD-BRIEF.md	identity-name	1	the public repository URL
 docs/setup.md	identity-name	1	the public repository clone URL in the source-build guide
 scripts/readme-commands.test.py	identity-name	1	the public Pages installation URL asserted by the README contract
 docs/maintainers/validation.md	identity-name	5	public project workflow, Pages install and release URLs in the acceptance evidence
+CHANGELOG.md	identity-name	1	the public GitLab project URL in the hosting move entry
+SECURITY.md	identity-name	1	the public GitLab issue URL for confidential reports
+docs/maintainers/decisions.md	identity-name	1	the public GitLab project URL in the hosting decision
+docs/releases.md	identity-name	1	the public GitLab project URL in the hosting note
+scripts/pages-site.sh	identity-name	3	the public GitLab project URL on the Pages landing page
