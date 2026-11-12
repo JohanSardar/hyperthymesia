@@ -2032,7 +2032,7 @@ async fn laptop_policy_turns_restricted_stills_into_ocr_text_only() {
 }
 
 #[tokio::test]
-async fn digest_only_cites_current_non_deleted_store_revisions() {
+async fn facts_only_cite_current_non_deleted_store_revisions() {
     use hx_server::{mcp::Broker, processing::SensitiveEgress};
     let f = Fixture::new().await;
     let mut rows = vec![];
@@ -2073,7 +2073,8 @@ async fn digest_only_cites_current_non_deleted_store_revisions() {
     )
     .unwrap();
     let broker = Broker::new(f.store.clone(), policy, SensitiveEgress::Full, w);
-    let digest = broker.digest().await.unwrap();
+    let sheet = broker.facts().await.unwrap();
+    let digest = &sheet.text;
     let audit = broker.audit.lock().await;
     let evidence: Vec<_> = audit.digest_evidence.values().collect();
     assert!(!digest.contains("STALE_"), "{digest}");
@@ -2086,11 +2087,11 @@ async fn digest_only_cites_current_non_deleted_store_revisions() {
             .iter()
             .all(|e| !e.text.contains("STALE_") && !e.text.contains("CURRENT_deleted"))
     );
-    assert_eq!(audit.digest_support.len(), 2);
+    assert_eq!(sheet.evidence.len(), 2);
     assert!(
-        audit
-            .digest_support
-            .keys()
+        sheet
+            .evidence
+            .iter()
             .all(|id| audit.digest_evidence.contains_key(id))
     );
     drop(audit);
@@ -2201,33 +2202,42 @@ async fn mcp_tools_are_bounded_and_current_policy_controls_all_context() {
     f.close().await;
 }
 
-#[tokio::test]
-#[cfg(unix)]
-async fn fx_reads_the_digest_cites_its_printed_times_and_stops_at_the_lookup_cap() {
-    let f = Fixture::new().await;
-    // Sub-second times: the digest prints whole seconds, and those must validate.
-    let base = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap() + Duration::milliseconds(250);
-    let focus = |key: &str, from: i64, to: i64, app: &str, title: &str| {
-        let mut e = event(key, 1);
+/// Front apps with one keystroke as each starts, so the fact sheet has active time.
+fn activity(prefix: &str, base: chrono::DateTime<Utc>, apps: &[(&str, i64, i64)]) -> Vec<Envelope> {
+    let mut out = vec![];
+    for (i, (app, from, to)) in apps.iter().enumerate() {
+        let mut e = event(&format!("{prefix}-focus-{i}"), 1);
         e.device = Some(hx_schema::DeviceId::new("synthetic-device"));
         e.kind = Kind::new("focus.span");
-        e.time = ObservationTime::point(base + Duration::seconds(from));
-        e.time.source_end = Some(base + Duration::seconds(to));
-        e.payload = json!({"app_bundle_id":"synthetic.app","app_name":app,"window_title":title,"pid":1,"display":null});
-        e
-    };
+        e.time = ObservationTime::point(base + Duration::seconds(*from));
+        e.time.source_end = Some(base + Duration::seconds(*to));
+        e.payload = json!({"app_bundle_id":"synthetic.app","app_name":app,"window_title":format!("Synthetic {app} work"),"pid":1,"display":null});
+        let mut k = event(&format!("{prefix}-input-{i}"), 1);
+        k.device = e.device.clone();
+        k.kind = Kind::new("input.bucket");
+        k.time = ObservationTime::point(base + Duration::seconds(*from));
+        k.payload = json!({"bucket_ms":1000,"keys":1,"clicks":0,"mouse_px":0,"scroll_events":0});
+        out.extend([e, k]);
+    }
+    out
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn fx_sessions_retry_until_they_add_up_and_stop_at_the_lookup_cap() {
+    let f = Fixture::new().await;
+    // Sub-second times: the fact sheet prints whole seconds, and those must add up.
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap() + Duration::milliseconds(250);
     ingest(
         &f.store,
-        vec![
-            focus("digest-a", 0, 300, "Synthetic Browser", "Synthetic search"),
-            focus(
-                "digest-b",
-                300,
-                1500,
-                "Synthetic Editor",
-                "Draft the launch note",
-            ),
-        ],
+        activity(
+            "facts",
+            base,
+            &[
+                ("Synthetic Browser", 0, 300),
+                ("Synthetic Editor", 300, 1500),
+            ],
+        ),
     )
     .await;
     let w = hx_store::window_at(base);
@@ -2240,17 +2250,22 @@ async fn fx_reads_the_digest_cites_its_printed_times_and_stops_at_the_lookup_cap
             .unwrap()
     );
     let value: Value = f.store.fx_digest_interpretation().await.unwrap();
-    // The printed whole-second times validate; only the non-Mac source wording is downgraded.
-    assert_eq!(
-        value["episodes"][0]["intervals"],
-        json!([{"start":"2026-01-01T01:05:00Z","end":"2026-01-01T01:25:00Z"}]),
-        "{}",
-        value["check_failures"]
+    // The first answer left the editor stretch out; the retry covered it.
+    assert_eq!(value["format"], "sessions/v1");
+    assert_eq!(value["active_total_s"], 181 + 181, "{value}");
+    assert_eq!(value["sessions"][0]["ranges"], value["active"], "{value}");
+    assert_eq!(value["sessions"][0]["active_s"], value["active_total_s"]);
+    let failures = value["check_failures"].to_string();
+    assert!(
+        failures.contains("add-up attempt 1") && failures.contains("removed uncited step"),
+        "{failures}"
     );
+    assert_eq!(value["sessions"][0]["done"].as_array().unwrap().len(), 1);
     let run: Value = f.store.fx_digest_agent_run().await.unwrap();
-    assert!(run["digest"].as_str().unwrap().contains("Synthetic Editor"));
+    assert!(run["facts"].as_str().unwrap().contains("Synthetic Editor"));
+    assert_eq!(run["responses"].as_array().unwrap().len(), 2);
     let calls = run["calls"].as_array().unwrap();
-    // Repair attempts share the cap: later attempts get no fresh lookups.
+    // Retries share the cap: later lookups get no fresh budget.
     assert!(calls.len() > hx_server::fx::DIGEST_LOOKUPS);
     let capped = hx_server::fx::DIGEST_LOOKUPS;
     assert!(
@@ -2271,7 +2286,7 @@ fn fake_fx(dir: &std::path::Path, mode: &str) -> hx_server::fx::Config {
     use std::os::unix::fs::PermissionsExt;
     let binary = dir.join(format!("fake-fx-{mode}"));
     let script = r#"#!/usr/bin/python3
-import sys,os,json,pathlib,time,urllib.request
+import sys,os,json,pathlib,re,time,urllib.request
 if '--version' in sys.argv:
  print('0.0.16');sys.exit(0)
 mode = 'MODE'
@@ -2286,15 +2301,19 @@ assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude
 assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
-assert 'hx-replica/v9' in sys.argv[sys.argv.index('--system')+1]
+assert 'hx-replica/v10' in sys.argv[sys.argv.index('--system')+1]
 instr=sys.stdin.read()
-assert instr.strip() and ('<digest>' in instr or 'Repair only' in instr)
+assert instr.strip() and '<facts>' in instr
+counter=pathlib.Path('COUNTER')
+attempt=int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(attempt+1))
 if mode=='timeout': time.sleep(3)
 if mode=='failure': print(json.dumps({'error':'synthetic failure','exit_code':1}));sys.exit(1)
 if mode=='generate': print(json.dumps({'error':'could not generate output','exit_code':1}));sys.exit(1)
 if mode=='rate': print(json.dumps({'error':'429 rate limited','exit_code':1}));sys.exit(1)
 if mode=='rate-retrying':
  sys.stderr.write('[notice] Rate limited · HTTP 429 · usage_limit_reached: The usage limit has been reached · retrying request in 30s\n'); sys.stderr.flush(); time.sleep(30)
+if mode=='repair-failure' and attempt>0: print(json.dumps({'error':'synthetic repair failure','exit_code':1}));sys.exit(1)
 server=json.loads((home/'.fx/mcp.json').read_text())['mcpServers']['hyperthymesia']
 def rpc(method,params):
  req=urllib.request.Request(server['url'],data=json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['HX_MCP_TOKEN']})
@@ -2302,22 +2321,33 @@ def rpc(method,params):
 rpc('initialize',{})
 assert len(rpc('tools/list',{})['tools'])==10
 assert server['operation_timeout_ms']==200000
+facts=instr.split('<facts>')[1].split('</facts>')[0]
+total=int(re.search(r'ACTIVE TOTAL = (\d+) s',facts).group(1))
+lines=[re.match(r'\[(\d+)[^\]]*\] (\d\d:\d\d:\d\d)-(\d\d:\d\d:\d\d) ',l) for l in facts.splitlines() if ' | k=' in l]
+lines=[m for m in lines if m]
+assert (total==0)==(not lines)
+def answer_for(ms):
+ if not ms: return {'sessions':[],'summary':'Nothing active'}
+ i=int(ms[0].group(1))
+ return {'sessions':[{'project':'Synthetic launch note','kind':'work','ranges':[[m.group(2),m.group(3)] for m in ms],'summary':'Drafted a synthetic note',
+  'done':[{'at':ms[0].group(2),'what':'Started the note','evidence':[i]},{'at':ms[0].group(2),'what':'Uncited step','evidence':[999999999]}],
+  'outcomes':[{'what':'Not visible','status':'not_established','evidence':[i]}],'blockers':[],'sources':['Synthetic editor'],'evidence':[i],'borderline':None}],'summary':'Synthetic launch note'}
+answer=answer_for(lines)
+short=answer_for(lines[:-1]) if len(lines)>1 else {'sessions':[dict(answer['sessions'][0],ranges=[])] if lines else [],'summary':'Short'}
 if mode=='digest':
- import re
- line=next(l for l in instr.splitlines() if l.startswith('[') and 'Synthetic Editor' in l)
- assert 'Draft the launch note' in line, line
- m=re.match(r'\[(\d+)[^\]]*\] (\d\d:\d\d:\d\d)-(\d\d:\d\d:\d\d) ',line)
- i=int(m.group(1)); iv={'start':'2026-01-01T'+m.group(2)+'Z','end':'2026-01-01T'+m.group(3)+'Z'}
- answer={'episodes':[{'id':'synthetic-digest','intervals':[iv],'title':'Drafted the launch note','description':'Wrote in the synthetic editor','claims':[{'actor':'owner','action':'edited','object':'launch note','outcome':'unknown','basis':'observed','evidence':[i],'outcome_evidence':[]}],'evidence':[i],'confidence':0.8}],'tasks':[],'summary':'Drafted the launch note'}
- for _ in range(12): rpc('tools/call',{'name':'list_sources','arguments':{}})
+ assert 'Synthetic Editor' in facts
+ if attempt==0:
+  for _ in range(12): rpc('tools/call',{'name':'list_sources','arguments':{}})
+  answer=short
+ else:
+  assert 'failed the add-up check' in instr and 'active time in no session' in instr
+  for _ in range(2): rpc('tools/call',{'name':'list_sources','arguments':{}})
  print(json.dumps({'exit_code':0,'model':'gpt-6.1-sol','steps':2,'final_output':json.dumps(answer),'tool_calls':[{'name':'mcp_hyperthymesia_list_sources','status':'success'}]*12}))
  sys.exit(0)
-start='2026-01-01T03:58:00Z' if mode=='late' else '2026-01-01T00:00:00Z'
+start=re.search(r'FACTS (\S+) to (\S+) \(UTC\)',facts).group(1)
 result=rpc('tools/call',{'name':'window_overview','arguments':{'from':start,'to':'2026-01-01T04:00:00Z'}})
 data=json.loads(result['content'][0]['text'])
 assert 'SYNTHETIC_RESTRICTED_CANARY' not in json.dumps(data)
-e=data['evidence'][0]; point={'start':e['at'],'end':e['at']}
-answer={'episodes':[{'id':'synthetic-episode','intervals':[point],'title':'Synthetic visit','description':'Synthetic visit','claims':[{'actor':'owner','action':'visited','object':'synthetic page','outcome':'unknown','basis':'observed','evidence':[e['id']],'outcome_evidence':[]}],'evidence':[e['id']],'confidence':0.8}], 'tasks':[], 'summary':'Synthetic visit'}
 if mode=='attention':
  lanes=data['attention']
  span=next(s for lane in lanes for s in lane['intervals'] if s['label']=='probably_away')
@@ -2329,43 +2359,18 @@ if mode=='attention':
  assert all('payload' not in e['text'] for e in data['attention_evidence'])
  second=rpc('tools/call',{'name':'timeline','arguments':{'from':start,'to':'2026-01-01T04:00:00Z'}})
  assert json.loads(second['content'][0]['text'])['attention']==lanes
- episode=answer['episodes'][0]
- episode.update(intervals=[span['interval']],title='Probably away',description='Inferred absence from healthy capture',evidence=ids)
- episode['claims'][0].update(action='was probably away',object='Mac',basis='inferred',evidence=ids)
- answer['summary']='Probably away'
+ for step in answer['sessions'][0]['done']: step['evidence']=[int(lines[0].group(1))]
 if mode=='invalid': answer='this is not JSON'
-if mode=='empty-repair':
- counter=pathlib.Path('COUNTER')
- if counter.exists(): answer={'episodes':[],'tasks':[],'summary':''}
- else:
-  counter.write_text('1')
-  bad=json.loads(json.dumps(answer['episodes'][0])); bad['id']='synthetic-unknown'; bad['evidence']=[999999999]
-  bad['claims'][0]['evidence']=[999999999]; answer['episodes'].append(bad)
-if mode=='merge-repair':
- counter=pathlib.Path('COUNTER')
- good=answer['episodes'][0]
- fixed=json.loads(json.dumps(good)); fixed['id']='synthetic-second'; fixed['title']='Second visit'
- if counter.exists():
-  assert 'Repair only these episodes' in instr and '<digest>' in instr and 'synthetic-second' in instr
-  assert 'synthetic-episode' not in instr.split('Rejected episodes:')[1]
-  intruder=json.loads(json.dumps(good)); intruder['id']='intruder'
-  answer={'episodes':[fixed,intruder],'tasks':[],'summary':''}
- else:
-  counter.write_text('1')
-  bad=json.loads(json.dumps(fixed)); bad['evidence']=[999999999]; bad['claims'][0]['evidence']=[999999999]
-  answer['episodes'].append(bad)
-  answer['tasks']=[{'id':'synthetic-task','title':'Visits','description':'Two visits','intervals':good['intervals'],'episode_ids':['synthetic-episode','synthetic-second'],'goal':None,'aliases':[],'confidence':0.7,'open':False}]
-if mode=='repair-failure':
- counter=pathlib.Path('COUNTER')
- if counter.exists(): print(json.dumps({'error':'synthetic repair failure','exit_code':1}));sys.exit(1)
- counter.write_text('1'); answer['episodes'][0]['claims'][0]['outcome']='completed'
+if mode=='repair-failure': answer=short
+if mode=='empty-repair': answer=short if attempt==0 else {'sessions':[],'summary':''}
 print(json.dumps({'exit_code':0,'model':'gpt-6.1-sol','steps':2,'final_output':answer if isinstance(answer,str) else json.dumps(answer),'tool_calls':[{'name':'mcp_hyperthymesia_window_overview','status':'success'}]}))
 "#;
     std::fs::write(
         &binary,
-        script
-            .replace("MODE", mode)
-            .replace("COUNTER", dir.join("counter").to_str().unwrap()),
+        script.replace("MODE", mode).replace(
+            "COUNTER",
+            dir.join(format!("counter-{mode}")).to_str().unwrap(),
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2445,15 +2450,16 @@ async fn fx_attention_intervals_are_citable_time_support() {
     let row = f.store.attention_revision().await.unwrap();
     let value: Value = row.get("interpretation");
     let run: Value = row.get("agent_run");
-    assert_eq!(value["episodes"].as_array().unwrap().len(), 1, "{value}");
-    assert_eq!(value["episodes"][0]["claims"][0]["basis"], "inferred");
+    // The attention tool still answers lookups; sessions cover the input grace.
+    assert_eq!(value["sessions"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["active_total_s"], 181 + 181);
     assert_eq!(value["check_failures"], json!([]));
     assert_eq!(
         run["calls"].as_array().unwrap().len(),
         2,
-        "validation should need no repair turn"
+        "an answer that adds up needs no retry"
     );
-    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v9");
+    assert_eq!(value["input_manifest"]["prompt_version"], "hx-replica/v10");
 
     // Gap payloads stay private, but the interrupted time must be unknown.
     let mut gap = capture(
@@ -2505,44 +2511,6 @@ async fn fx_attention_intervals_are_citable_time_support() {
 
 #[tokio::test]
 #[cfg(unix)]
-async fn fx_validation_supports_citations_beyond_the_exploration_row_cap() {
-    let f = Fixture::new().await;
-    // More than the 2,000-row exploration cap, all before the cited record.
-    let mut envelopes: Vec<Envelope> = (0..2100)
-        .map(|i| {
-            let mut e = event(&format!("fx-dense-{i}"), 1);
-            e.time = ObservationTime::point(
-                Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap()
-                    + chrono::Duration::milliseconds(i),
-            );
-            e
-        })
-        .collect();
-    let mut late = event("fx-late", 3);
-    late.time = ObservationTime::point(Utc.with_ymd_and_hms(2026, 1, 1, 3, 59, 0).unwrap());
-    envelopes.push(late);
-    ingest(&f.store, envelopes).await;
-    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
-    f.store.normalize_window(w).await.unwrap();
-    let scratch = tempfile::tempdir().unwrap();
-    let config = fake_fx(scratch.path(), "late");
-    assert!(
-        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-late", &config)
-            .await
-            .unwrap()
-    );
-    let value: Value = f.store.fx_late_interpretation().await.unwrap();
-    assert_eq!(
-        value["episodes"].as_array().unwrap().len(),
-        1,
-        "{}",
-        value["check_failures"]
-    );
-    f.close().await;
-}
-
-#[tokio::test]
-#[cfg(unix)]
 async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     let f = Fixture::new().await;
     ingest(&f.store, vec![event("fx-visible", 1)]).await;
@@ -2563,7 +2531,9 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     let row = f.store.revision_contents(previous).await.unwrap();
     let value: Value = row.get("interpretation");
     let run: Value = row.get("agent_run");
-    assert_eq!(value["episodes"].as_array().unwrap().len(), 1);
+    // Nothing was active, so no sessions; the lookup is still audited.
+    assert_eq!(value["sessions"], json!([]));
+    assert_eq!(value["active_total_s"], 0);
     assert_eq!(
         value["input_manifest"]["input_namespaces"],
         json!(["test:device"])
@@ -2571,7 +2541,9 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     assert_eq!(run["fx_version"], "0.0.16");
     assert_eq!(run["effort"], "xhigh");
     assert_eq!(run["fast"], true);
-    let id = value["episodes"][0]["evidence"][0].as_i64().unwrap();
+    let id = run["calls"][0]["result"]["evidence"][0]["id"]
+        .as_i64()
+        .unwrap();
     assert_eq!(run["evidence"][id.to_string()]["id"], id);
     assert_eq!(
         run["calls"][0]["result"]["evidence"][0],
@@ -2669,6 +2641,22 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     );
     let stale: i64 = f.store.stale_agent_revision_count().await.unwrap();
     assert_eq!(stale, 0);
+    // The first answer misses a stretch and the paid retry fails: the add-up
+    // repair gives the missing seconds to the adjacent session.
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap();
+    ingest(
+        &f.store,
+        activity(
+            "repair",
+            base,
+            &[
+                ("Synthetic Browser", 0, 300),
+                ("Synthetic Editor", 300, 900),
+            ],
+        ),
+    )
+    .await;
+    f.store.normalize_window(w).await.unwrap();
     let config = fake_fx(scratch.path(), "repair-failure");
     assert!(
         hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-repaired", &config)
@@ -2676,17 +2664,36 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
             .unwrap()
     );
     let value: Value = f.store.fx_repaired_interpretation().await.unwrap();
-    assert_eq!(value["episodes"][0]["claims"][0]["outcome"], "attempted");
-    assert!(!value["check_failures"].as_array().unwrap().is_empty());
+    assert_eq!(value["sessions"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["sessions"][0]["ranges"], value["active"]);
+    assert_eq!(value["sessions"][0]["active_s"], value["active_total_s"]);
+    let failures = value["check_failures"].to_string();
+    assert!(
+        failures.contains("add-up attempt 1")
+            && failures.contains("repaired: assigned uncovered active time"),
+        "{failures}"
+    );
     f.close().await;
 }
 
 #[tokio::test]
 #[cfg(unix)]
-async fn fx_keeps_the_fuller_answer_when_a_repair_comes_back_empty() {
+async fn fx_keeps_the_closest_answer_when_a_retry_comes_back_empty() {
     let f = Fixture::new().await;
-    ingest(&f.store, vec![event("fx-empty-repair", 1)]).await;
-    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap();
+    ingest(
+        &f.store,
+        activity(
+            "empty",
+            base,
+            &[
+                ("Synthetic Browser", 0, 300),
+                ("Synthetic Editor", 300, 900),
+            ],
+        ),
+    )
+    .await;
+    let w = hx_store::window_at(base);
     f.store.normalize_window(w).await.unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let config = fake_fx(scratch.path(), "empty-repair");
@@ -2696,35 +2703,13 @@ async fn fx_keeps_the_fuller_answer_when_a_repair_comes_back_empty() {
             .unwrap()
     );
     let value: Value = f.store.fx_empty_repair_interpretation().await.unwrap();
-    // The rejected episode triggered one repair; the empty repair must not replace the first answer.
-    assert_eq!(value["episodes"].as_array().unwrap().len(), 1, "{value}");
-    assert!(std::fs::metadata(scratch.path().join("counter")).is_ok());
-    f.close().await;
-}
-
-#[tokio::test]
-#[cfg(unix)]
-async fn fx_repair_replaces_only_rejected_episodes_and_keeps_the_rest() {
-    let f = Fixture::new().await;
-    ingest(&f.store, vec![event("fx-merge-repair", 1)]).await;
-    let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
-    f.store.normalize_window(w).await.unwrap();
-    let scratch = tempfile::tempdir().unwrap();
-    let config = fake_fx(scratch.path(), "merge-repair");
-    assert!(
-        hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-merge-repair", &config)
-            .await
-            .unwrap()
-    );
-    let value: Value = f.store.fx_merge_repair_interpretation().await.unwrap();
-    let ids: Vec<&str> = value["episodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids, ["synthetic-episode", "synthetic-second"], "{value}");
-    assert_eq!(value["tasks"][0]["id"], "synthetic-task", "{value}");
+    // Both retries came back empty; the first answer (one stretch short) was
+    // kept and repaired rather than replaced by an empty one.
+    assert_eq!(value["sessions"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["sessions"][0]["project"], "Synthetic launch note");
+    assert_eq!(value["sessions"][0]["active_s"], value["active_total_s"]);
+    let attempts = std::fs::read_to_string(scratch.path().join("counter-empty-repair")).unwrap();
+    assert_eq!(attempts, (hx_server::fx::REPAIR_ATTEMPTS + 1).to_string());
     f.close().await;
 }
 

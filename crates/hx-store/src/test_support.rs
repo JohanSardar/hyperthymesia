@@ -599,13 +599,6 @@ impl Store {
             ),
         ]))
     }
-    pub async fn fx_late_interpretation(&self) -> Result<Value> {
-        Ok(sqlx::query_scalar(
-            "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-late'",
-        )
-        .fetch_one(&self.pool)
-        .await?)
-    }
     pub async fn revision_contents(&self, id: i64) -> Result<Snapshot> {
         let row = sqlx::query("SELECT interpretation,agent_run FROM revisions WHERE id=$1")
             .bind(id)
@@ -654,13 +647,6 @@ impl Store {
     pub async fn fx_empty_repair_interpretation(&self) -> Result<Value> {
         Ok(sqlx::query_scalar(
             "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-empty-repair'",
-        )
-        .fetch_one(&self.pool)
-        .await?)
-    }
-    pub async fn fx_merge_repair_interpretation(&self) -> Result<Value> {
-        Ok(sqlx::query_scalar(
-            "SELECT interpretation FROM revisions WHERE output_key='synthetic-fx-merge-repair'",
         )
         .fetch_one(&self.pool)
         .await?)

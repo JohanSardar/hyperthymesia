@@ -119,12 +119,10 @@ pub struct Audit {
     pub live_calls: usize,
     pub source_failures: BTreeMap<String, usize>,
     pub disabled_sources: std::collections::BTreeSet<String>,
-    /// Every visible record in the window, citable because the digest names it.
+    /// Every visible record in the window, citable because the fact sheet names it.
     /// Kept out of the stored run log; only cited records matter there.
     #[serde(skip)]
     pub digest_evidence: BTreeMap<i64, EvidenceItem>,
-    #[serde(skip)]
-    pub digest_support: BTreeMap<i64, Vec<Interval>>,
 }
 pub fn bounded(text: &str, cap: usize) -> String {
     let mut end = text.len().min(cap);
@@ -197,27 +195,23 @@ impl Broker {
         let mut receiver = self.input_changed.subscribe();
         let _ = receiver.wait_for(|changed| *changed).await;
     }
-    /// Compile the whole window without the exploration row cap and render the
-    /// digest the model reads first. Every visible record in the window becomes
-    /// citable, and digest segments support their full interval.
-    pub async fn digest(&self) -> Result<String> {
+    /// Compile the whole window without the exploration row cap and build the
+    /// fact sheet the model reads first. Every visible record in the window
+    /// becomes citable. The returned sheet's text is secret-scrubbed.
+    pub async fn facts(&self) -> Result<hx_interpret::FactSheet> {
         self.check_generation().await?;
-        let config = hx_compile::AttentionConfig::default();
-        let lookback = config
-            .reading_max_s
-            .max(config.input_gap_s)
-            .max(config.health_max_s)
-            .max(config.visual_change_s);
+        let facts = hx_interpret::FactConfig::default();
+        // Input just before the window keeps its first seconds active.
+        let lookback = facts.grace_s;
         // Fetch all revisions of candidate identities as well: an edit or
         // tombstone outside this window can supersede a record inside it.
         let rows = self
             .store
             .digest_records(
-                self.window.start - Duration::seconds(i64::from(lookback)),
+                self.window.start - Duration::seconds(lookback),
                 self.window.end,
             )
             .await?;
-        let mut capture = vec![];
         let mut visible = vec![];
         let mut screens = vec![];
         let mut evidence = BTreeMap::new();
@@ -246,30 +240,15 @@ impl Broker {
                 .source_start
                 .unwrap_or(o.envelope.time.observed_at);
             let end = o.envelope.time.source_end.unwrap_or(at);
-            if at >= self.window.end
-                || end < self.window.start - Duration::seconds(i64::from(lookback))
-            {
+            if at >= self.window.end || end < self.window.start - Duration::seconds(lookback) {
                 continue;
             }
             // Preserve core capture rendering; only current non-core source
-            // records enter the digest or its citable evidence sidecar.
+            // records enter the fact sheet or its citable evidence sidecar.
             if !hx_schema::kinds::is_core(o.envelope.kind.as_str()) && !current.contains(&o.id) {
                 continue;
             }
             let e = &o.envelope;
-            if matches!(
-                e.kind.as_str(),
-                "collector.health"
-                    | "policy.gap"
-                    | "focus.span"
-                    | "presence.span"
-                    | "input.bucket"
-                    | "media.still"
-                    | "media.chunk"
-                    | "text.snapshot"
-            ) {
-                capture.push(o.clone());
-            }
             let at = e.time.source_start.unwrap_or(e.time.observed_at);
             if !self.visible(e) || at >= self.window.end {
                 continue;
@@ -292,40 +271,22 @@ impl Broker {
                 visible.push(o);
             }
         }
-        // Attention sees every capture signal, but a span resting on a record the
-        // model may not see is unknown, exactly as the attention tool reports it.
-        let mut attention: Vec<_> =
-            hx_compile::compile_with_attention_config(&capture, self.window, config)
-                .lanes
-                .into_iter()
-                .filter(|l| l.id.kind == "attention")
-                .collect();
-        for span in attention.iter_mut().flat_map(|l| &mut l.intervals) {
-            if span.evidence.iter().any(|id| !evidence.contains_key(id)) {
-                span.label = "unknown".into();
-            }
-            span.evidence.retain(|id| evidence.contains_key(id));
-        }
-        let mut timeline = hx_compile::compile(&visible, self.window);
-        timeline.lanes.retain(|l| l.id.kind != "attention");
-        timeline.lanes.extend(attention.clone());
-        let digest = hx_interpret::build_digest(
-            &timeline,
-            &visible,
-            &screens,
-            hx_interpret::DigestConfig::default(),
-        );
+        // The 180 s input rule replaces the attention lane here: its "unknown"
+        // labels hid real activity from the interpreter.
+        let timeline = hx_compile::compile(&visible, self.window);
+        let mut sheet = hx_interpret::build_fact_sheet(&timeline, &visible, &screens, facts);
         let filter = self.secret_filter().await?;
         for item in evidence.values_mut() {
             item.text = filter.scrub(&item.text.replace('\0', ""));
         }
+        // Citable means named in the sheet and visible under this policy.
+        sheet.evidence.retain(|id| evidence.contains_key(id));
         let mut audit = self.audit.lock().await;
-        audit.digest_support = digest.support();
         audit.digest_evidence = evidence;
-        audit.attention.extend(attention);
         audit.input_namespaces.extend(namespaces);
         self.check_generation().await?;
-        Ok(filter.scrub(&digest.text.replace('\0', "")))
+        sheet.text = filter.scrub(&sheet.text.replace('\0', ""));
+        Ok(sheet)
     }
     pub fn visible(&self, e: &Envelope) -> bool {
         visible(&self.policy, self.sensitive, e)
@@ -541,7 +502,8 @@ impl Broker {
             .await?
             {
                 let ids = revision_evidence(&value);
-                revisions.push(json!({"revision_id":row.id,"episodes":value["episodes"],"tasks":value["tasks"],"summary":value["summary"],"evidence":ids,"input_namespaces":value["input_manifest"]["input_namespaces"],"self_generated":true}));
+                // Sessions revisions (hx-replica/v10) carry no episodes or tasks.
+                revisions.push(json!({"revision_id":row.id,"sessions":value["sessions"],"episodes":value["episodes"],"tasks":value["tasks"],"summary":value["summary"],"evidence":ids,"input_namespaces":value["input_manifest"]["input_namespaces"],"self_generated":true}));
             }
         }
         Ok(json!({"entities":entities,"revisions":revisions}))
@@ -957,8 +919,25 @@ impl Broker {
         }
     }
 }
+/// Every id a published revision cites: sessions and their steps, outcomes and
+/// blockers, or (older revisions) episodes and their claims.
 pub fn revision_evidence(value: &Value) -> Vec<i64> {
     let mut ids = std::collections::BTreeSet::new();
+    let list = |v: &Value| -> Vec<i64> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_i64)
+            .collect()
+    };
+    for session in value["sessions"].as_array().into_iter().flatten() {
+        ids.extend(list(&session["evidence"]));
+        for key in ["done", "outcomes", "blockers"] {
+            for item in session[key].as_array().into_iter().flatten() {
+                ids.extend(list(&item["evidence"]));
+            }
+        }
+    }
     if let Some(episodes) = value["episodes"].as_array() {
         for episode in episodes {
             for key in ["evidence", "outcome_evidence"] {

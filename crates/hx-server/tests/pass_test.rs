@@ -109,9 +109,9 @@ async fn wait_for_cited_entry(server: &str, owner: &str, day: &str) -> i64 {
 }
 
 fn cited_entry(page: &str) -> Option<i64> {
-    let (_, episodes) = page.split_once(r#"id="episodes""#)?;
-    let (episodes, _) = episodes.split_once(r#"id="tasks""#)?;
-    let (_, link) = episodes.split_once(r#"href="/evidence/"#)?;
+    let (_, sessions) = page.split_once(r#"id="sessions""#)?;
+    let (sessions, _) = sessions.split_once(r#"id="episodes""#)?;
+    let (_, link) = sessions.split_once(r#"href="/evidence/"#)?;
     link.split_once('"')?.0.parse().ok()
 }
 
@@ -184,12 +184,12 @@ if instruction.startswith('Set up connected source '):
  call('addon_save',{'source':source,'name':'Message timing','text':'sent_at is the time the message was sent, not the retrieval time. Actor labels are in '+table+'.'})
  answer={'summary':'Set up recent messages, actor labels and a timing hint.','no_pull':None}
 else:
- start,end=re.search(r'window (\S+) to (\S+) \(UTC\)',instruction).groups()
+ start,end=re.search(r'FACTS (\S+) to (\S+) \(UTC\)',instruction).groups()
  overview=json.loads(rpc('tools/call',{'name':'window_overview','arguments':{'from':start,'to':end}})['content'][0]['text'])
- answer={'episodes':[],'tasks':[],'summary':''}
+ answer={'sessions':[],'summary':''}
  for e in overview['evidence']:
   if 'SUBJECT' in e['text']:
-   answer['episodes'].append({'id':'synthetic-email','intervals':[{'start':e['at'],'end':e['at']}],'title':'Received the synthetic invoice email','description':'','claims':[{'actor':'owner','action':'received','object':'synthetic invoice email','outcome':'unknown','basis':'observed','evidence':[e['id']],'outcome_evidence':[]}],'evidence':[e['id']],'confidence':0.8})
+   answer['sessions'].append({'project':'Synthetic greenhouse invoice','kind':'admin','ranges':[],'summary':'An invoice email arrived while the Mac was not in use.','outcomes':[{'what':'Invoice email received','status':'seen','evidence':[e['id']]}],'sources':['Synthetic Mail'],'evidence':[e['id']],'borderline':None})
 print(json.dumps({'exit_code':0,'model':'FX_MODEL','steps':2,'final_output':json.dumps(answer),'tool_calls':[{'name':'mcp_hyperthymesia_window_overview','status':'success'}]}))
 "#;
     let binary = dir.join("scripted-fx");
