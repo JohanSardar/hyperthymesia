@@ -8,6 +8,10 @@ a screenshot). INACTIVE lines are time with no input for 180 s or a locked or sl
 Sessions group time by the underlying project or purpose, not by app or event:
 - Different apps serving one project are ONE session (an agent thread, the package site, a
   sign-in page and a test machine all serving one release).
+- Different projects are DIFFERENT sessions, even when the owner alternates between them
+  minute by minute. A project is one product, repository, application or goal; agent threads
+  for two repositories are two projects. Never join two projects in one session or its name.
+  Prefer several specific sessions over one broad one.
 - The same app serving different purposes is SPLIT (searching a site for a tool being
   researched is research; scrolling its home feed is wasted time; each agent thread belongs to
   its own project).
