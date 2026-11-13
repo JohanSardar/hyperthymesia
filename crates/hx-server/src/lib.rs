@@ -4,6 +4,7 @@ mod connections;
 pub mod dashboard;
 pub mod disclosure;
 pub mod fx;
+pub mod guided_setup;
 mod live;
 pub mod mcp;
 mod oauth;
@@ -87,6 +88,7 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/v1/pair", post(pair).layer(DefaultBodyLimit::max(4096)))
         .route("/login", get(dashboard::login).post(dashboard::sign_in))
+        .route("/login/link", get(dashboard::sign_in_link))
         .route(
             "/connect",
             get(connections::page)

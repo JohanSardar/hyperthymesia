@@ -12,6 +12,8 @@ pub(crate) struct Onboarding {
     paired: bool,
     pending: Option<mpsc::Receiver<anyhow::Result<()>>>,
     message: Option<String>,
+    guide: Option<std::process::Child>,
+    guide_checked: Instant,
 }
 impl Onboarding {
     pub fn new(dir: PathBuf) -> Self {
@@ -21,9 +23,47 @@ impl Onboarding {
             paired: false,
             pending: None,
             message: None,
+            guide: None,
+            guide_checked: Instant::now() - Duration::from_secs(5),
+        }
+    }
+    /// Starts the setup guide as this app's child, so macOS attributes its privacy
+    /// requests to Hyperthymesia. Also resumes a run that was quit halfway.
+    fn setup_guide(&mut self) {
+        if cfg!(feature = "e2e-harness") || self.guide_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.guide_checked = Instant::now();
+        if let Some(child) = &mut self.guide {
+            match child.try_wait() {
+                Ok(None) => return,
+                _ => self.guide = None,
+            }
+        }
+        if !crate::setup::guide_wanted(&self.dir.join("setup")) {
+            return;
+        }
+        let Some(guide) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("hx-setup-guide")))
+            .filter(|path| path.is_file())
+        else {
+            return;
+        };
+        use std::os::unix::process::CommandExt as _;
+        // Its own process group, so it outlives the app restart it asks for.
+        match std::process::Command::new(guide)
+            .process_group(0)
+            .env("HX_SETUP_DIR", self.dir.join("setup"))
+            .stdin(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => self.guide = Some(child),
+            Err(error) => self.message = Some(format!("Setup guide could not start: {error}")),
         }
     }
     pub fn update(&mut self, menu: &mut MenuBar, warning: Option<&str>) {
+        self.setup_guide();
         if self.checked.elapsed() >= Duration::from_secs(1) {
             // A malformed edit must not claim that a configured device is unpaired.
             if let Ok(cfg) = Config::load_at(&self.dir) {

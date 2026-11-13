@@ -180,8 +180,9 @@ esac
     assert state.stat().st_mode & 0o777 == 0o700
     assert (state / 'server.env').stat().st_mode & 0o777 == 0o600
     assert 'synthetic-key-never-print' not in result.stdout + result.stderr
-    assert '--prefix source:' in result.stdout and '--scopes read_raw,read_l3' in result.stdout
-    assert 'http://127.0.0.1:7377/login' in result.stdout
+    # Non-interactive installs point at guided setup instead of printing tokens.
+    assert f'Next: {h}/.local/bin/hx-server setup' in result.stdout, result.stdout
+    assert 'token create' not in result.stdout
     original_env = (state / 'server.env').read_bytes()
     assert run(h).returncode == 0
     assert (state / 'server.env').read_bytes() == original_env

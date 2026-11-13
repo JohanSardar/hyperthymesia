@@ -336,6 +336,44 @@ pub async fn sign_in(
         .into_response())
 }
 
+#[derive(Deserialize)]
+pub struct LinkCode {
+    code: String,
+}
+/// One-use sign-in link minted by `hx-server setup`, so nobody pastes a token.
+pub async fn sign_in_link(
+    State(store): State<Store>,
+    axum::extract::Query(link): axum::extract::Query<LinkCode>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let token = crate::guided_setup::claim_login_link(&store.data_dir, &link.code);
+    let Some(token) = token else {
+        return Ok((
+            axum::http::StatusCode::GONE,
+            shell(
+                "Sign in",
+                html! {h1 {"This sign-in link was already used or has expired"} p {"Run " code {"hx-server setup"} " again for a new one."}},
+            ),
+        )
+            .into_response());
+    };
+    if store.authenticate(&token).await?.is_none() {
+        return Err(crate::ApiError(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid token".into(),
+        ));
+    }
+    let cookie = format!("hx_token={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200");
+    Ok((
+        [
+            (axum::http::header::SET_COOKIE, cookie),
+            (axum::http::header::CACHE_CONTROL, "no-store".into()),
+        ],
+        axum::response::Redirect::to("/"),
+    )
+        .into_response())
+}
+
 /// Audit prose is indivisible: hide it when any input namespace or policy changed.
 async fn authorized_run(
     store: &Store,

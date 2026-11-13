@@ -102,6 +102,20 @@ enum Command {
         #[arg(long, required = true)]
         name: Option<String>,
     },
+    /// Set up this computer: pair the Mac app, guide the few steps only you can
+    /// do (macOS permissions, model sign-in), then open the dashboard signed in.
+    /// Safe to run again; it only shows what is left.
+    Setup {
+        /// One JSON line per change for an agent; `say` is what to tell the person.
+        #[arg(long)]
+        json: bool,
+        /// Do not open the dashboard at the end.
+        #[arg(long)]
+        no_open: bool,
+        /// Stop waiting after this many minutes; the next run continues.
+        #[arg(long, default_value_t = 20)]
+        timeout_minutes: u64,
+    },
     Compile {
         #[arg(long)]
         from: DateTime<Utc>,
@@ -204,9 +218,23 @@ async fn main() -> Result<()> {
             "gc is disabled: old media can still be referenced by evidence. No files were deleted; see docs/gc-safety.md."
         );
     }
-    let dir = cli
-        .state_dir
-        .context("--state-dir or HX_STATE_DIR is required")?;
+    // Setup is often the first command in a new shell, before HX_STATE_DIR is set.
+    let state_dir = cli.state_dir.clone().or_else(|| {
+        matches!(cli.command, Command::Setup { .. })
+            .then(installed_state_dir)
+            .flatten()
+    });
+    let dir = state_dir.context("--state-dir or HX_STATE_DIR is required")?;
+    if matches!(cli.command, Command::Setup { .. }) && std::env::var_os("HX_SETUP_ENV").is_none() {
+        // Run once more with the service's provider settings in the environment.
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(std::env::args_os().skip(1))
+            .envs(hx_server::guided_setup::server_env(&dir))
+            .env("HX_STATE_DIR", &dir)
+            .env("HX_SETUP_ENV", "1")
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
     if matches!(cli.command, Command::Migrate) {
         let store = Store::migrate(&dir).await?;
         store.pool.close().await;
@@ -435,6 +463,23 @@ async fn main() -> Result<()> {
             println!("{link}");
         }
         Command::Gc => unreachable!("gc is refused before opening the store"),
+        Command::Setup {
+            json,
+            no_open,
+            timeout_minutes,
+        } => {
+            let code = hx_server::guided_setup::run(
+                &store,
+                hx_server::guided_setup::Options {
+                    json,
+                    open: !no_open,
+                    timeout: std::time::Duration::from_secs(timeout_minutes.max(1) * 60),
+                },
+            )
+            .await?;
+            store.pool.close().await;
+            std::process::exit(code);
+        }
         Command::Compile { from, to, .. } => {
             for w in windows(from, to)? {
                 processing::compile_window(&store, w).await?;
@@ -972,6 +1017,14 @@ fn retained_copies(state: &std::path::Path) -> Vec<serde_json::Value> {
             Err(error) => serde_json::json!({"path":path,"error":error.to_string()}),
         })
         .collect()
+}
+
+/// The state folder the installer recorded, if any.
+fn installed_state_dir() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let text = std::fs::read_to_string(home.join(".local/share/hyperthymesia/.state-dir")).ok()?;
+    let path = PathBuf::from(text.trim());
+    path.is_absolute().then_some(path)
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ exists() { [ -e "$1" ] || [ -L "$1" ]; }
 managed_link() { [ -L "$1" ] && [ "$(readlink "$1")" = "$2" ] && [ -f "$prefix/.installed" ]; }
 
 dry_run=false
+setup=true
 uninstall=false
 start_fresh=false
 server_only=false
@@ -24,6 +25,7 @@ configured=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) dry_run=true ;;
+        --no-setup) setup=false ;;
         --uninstall) uninstall=true ;;
         --start-fresh) start_fresh=true ;;
         --server-only) server_only=true ;;
@@ -39,7 +41,7 @@ while [ "$#" -gt 0 ]; do
                 --state-dir) requested_state=$1 ;;
             esac ;;
         --help)
-            printf '%s\n' 'Usage: install.sh [--provider codex|grok|gateway --model M --effort E --state-dir D] [--dry-run] [--start-fresh] [--uninstall] [--server-only|--app-only]' \
+            printf '%s\n' 'Usage: install.sh [--provider codex|grok|gateway --model M --effort E --state-dir D] [--dry-run] [--no-setup] [--start-fresh] [--uninstall] [--server-only|--app-only]' \
                 'Installs a loopback user service; upgrades are backed up and refused during interpret leases.' \
                 'HX_RELEASE_BASE: release download directory (default: GitHub latest/download).' \
                 'HX_FX_RELEASE_BASE: fx download directory; pinned SHA-256 checks always apply.'
@@ -488,6 +490,11 @@ if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
 fi
 # The guard holds its lock across stop, backup, migration and rollback.
 setting() { printf '%s=%s\n' "$1" "$(shell_quote "$2")"; }
+setup_follows=false
+if [ "$setup" = true ] && [ "$app_only" = false ] && [ -z "${CI:-}" ] && [ -t 2 ] \
+    && { : </dev/tty; } 2>/dev/null; then
+    setup_follows=true
+fi
 {
     printf '#!/bin/sh\nset -eu\numask 077\n'
     setting prefix "$prefix"
@@ -509,6 +516,7 @@ setting() { printf '%s=%s\n' "$1" "$(shell_quote "$2")"; }
     setting effort "$effort"
     setting configured "$configured"
     setting startup "$startup"
+    setting setup_follows "$setup_follows"
 } > "$work/lifecycle"
 # $0 can be sh when piped. Render fixed functions without reading this script.
 cat >> "$work/lifecycle" <<'LIFECYCLE'
@@ -764,7 +772,9 @@ if [ "$app_only" = false ]; then
     service_start
     healthy || { printf 'User service did not become healthy.\n' >&2; exit 1; }
     server doctor --state-only
-    if ! server doctor; then
+    # Guided setup checks the provider sign-in itself and opens it for the person.
+    if [ "$setup_follows" = true ]; then :
+    elif ! server doctor; then
         printf 'Service is running; provider setup is incomplete. Doctor above names what is missing. No login or model call was made.\n' >&2
     fi
 fi
@@ -795,25 +805,19 @@ stopped=false
 trap - 0 HUP INT TERM
 printf 'Installed Hyperthymesia %s. State: %s\n' "${version_dir##*/}" "$state"
 printf 'PATH configured in %s. Open a new shell, or export PATH="$HOME/.local/bin:$PATH".\n' "$startup"
-if [ "$app_only" = false ]; then
-    if [ "$new_env" = false ]; then
-        printf 'Next: run doctor with the preserved server.env; use its configured provider and private fx for login.\n'
-    elif [ "$provider" = gateway ]; then
-        printf 'Next: set AI_GATEWAY_API_KEY privately in server.env (mode 600).\n'
-    else
-        printf 'Next: FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 '
-        quote "$prefix/tools/fx-0.0.16/fx"
-        printf ' login %s\n' "$provider"
-    fi
-    printf 'Then: set -a; . '; quote "$state/server.env"
-    printf '; set +a; '; quote "$bin"; printf ' --state-dir '; quote "$state"; printf ' doctor\n'
-    printf 'Dashboard: '; quote "$bin"; printf ' --state-dir '; quote "$state"
-    printf ' token create --name dashboard --prefix source: --prefix macos-agent: --prefix macos-media: --prefix companion: --scopes read_raw,read_l3\n'
-    printf 'Keep the printed token private: it can read raw evidence and manage sources. Open http://127.0.0.1:7377/login. Add other connector prefixes when needed.\n'
+if [ "$app_only" = false ] && [ "$new_env" = true ] && [ "$provider" = gateway ]; then
+    printf 'Next: set AI_GATEWAY_API_KEY privately in server.env (mode 600).\n'
 fi
 LIFECYCLE
 if [ "$app_only" = false ] && [ -f "$state/core.sqlite" ]; then
     HX_INSTALL_RECOVERY="$work/lifecycle" "$work/payload/hx-server" --state-dir "$state" upgrade-guard /bin/sh "$work/lifecycle"
 else
     /bin/sh "$work/lifecycle"
+fi
+# One command: an interactive install goes straight into guided setup, which
+# does the rest itself and shows only the steps a person has to do.
+if [ "$setup_follows" = true ]; then
+    "$bin" --state-dir "$state" setup </dev/tty || true
+elif [ "$app_only" = false ]; then
+    printf 'Next: %s setup\n' "$bin"
 fi
