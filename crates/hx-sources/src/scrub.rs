@@ -40,6 +40,7 @@ impl Scrubber {
             if let Ok(value) = serde_json::from_str::<Value>(secret) {
                 if value.get("hx_oauth_v1") == Some(&Value::Bool(true))
                     || value.get("hx_oauth_pending_v1") == Some(&Value::Bool(true))
+                    || value.get("hx_connection_v1") == Some(&Value::Bool(true))
                 {
                     // These wrappers include public endpoint/scope metadata.
                     // Keep whole-bundle encodings protected, but only the private

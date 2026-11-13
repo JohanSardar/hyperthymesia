@@ -296,6 +296,24 @@ pub fn redaction_values(value: &str) -> Vec<String> {
         }
     }
     let mut values = vec![value.to_owned()];
+    if let Ok(Some(c)) = crate::connection::Credentials::parse(Some(value)) {
+        values.extend(c.key);
+        values.extend(c.redactions.into_iter().filter(|v| v.len() >= 4));
+        for (name, value) in &c.headers {
+            if name.eq_ignore_ascii_case("authorization")
+                && let Some((_, secret)) = value.split_once(' ')
+                && secret.len() >= 4
+            {
+                values.push(secret.to_owned());
+            }
+        }
+        values.extend(
+            c.headers
+                .into_values()
+                .chain(c.env.into_values())
+                .filter(|v| v.len() >= 4),
+        );
+    }
     if let Ok(json) = serde_json::from_str::<Value>(value) {
         visit(&json, &mut values);
     }

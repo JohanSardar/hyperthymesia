@@ -1,6 +1,7 @@
 //! Authenticated ingest, evidence API, and a local, escaped day view.
 mod agent_sql;
 mod app;
+mod connection_api;
 mod connections;
 pub mod dashboard;
 pub mod disclosure;
@@ -106,6 +107,7 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
             post(connections::switch).layer(DefaultBodyLimit::max(32 * 1024)),
         )
         .merge(sources::router())
+        .merge(connection_api::router())
         .route(
             "/connect/oauth",
             get(oauth::page)

@@ -163,6 +163,10 @@ pub async fn start(
     sources::owner(&store, &headers).await?;
     same_origin(&headers)?;
     let Form(request) = request.map_err(|_| bad("Invalid OAuth form"))?;
+    let state = begin(&store, request).await?;
+    Ok(Redirect::to(&format!("/connect/oauth?pending={state}")).into_response())
+}
+async fn begin(store: &Store, request: Start) -> ApiResult<String> {
     let (config, name, description, history_days) = if let Some(id) = &request.source {
         let source = store
             .source(id)
@@ -171,7 +175,7 @@ pub async fn start(
         if !source.enabled {
             return Err(bad("Turn this source on before reconnecting"));
         }
-        let saved = keys(&store)?
+        let saved = keys(store)?
             .read(id)
             .map_err(|_| bad("OAuth key unavailable"))?
             .ok_or_else(|| bad("OAuth key missing"))?;
@@ -224,7 +228,11 @@ pub async fn start(
     {
         return Err(bad("Invalid source name, description or history limit"));
     }
-    let filter = sources::scrubber(&store, Some(&config.client_secret)).await?;
+    let filter = sources::scrubber(
+        store,
+        (!config.client_secret.is_empty()).then_some(config.client_secret.as_str()),
+    )
+    .await?;
     if filter.contains_secret(&name) || filter.contains_secret(&description) {
         return Err(bad("Source description must not contain credentials"));
     }
@@ -245,13 +253,13 @@ pub async fn start(
         description,
         history_days,
     };
-    keys(&store)?
+    keys(store)?
         .write(
             &format!("oauth-{state}"),
             &serde_json::to_string(&pending).map_err(anyhow::Error::from)?,
         )
         .map_err(|_| bad("OAuth key storage unavailable"))?;
-    Ok(Redirect::to(&format!("/connect/oauth?pending={state}")).into_response())
+    Ok(state)
 }
 #[derive(Deserialize)]
 pub struct Finish {
@@ -266,7 +274,11 @@ pub async fn finish(
     sources::owner(&store, &headers).await?;
     same_origin(&headers)?;
     let Form(request) = request.map_err(|_| bad("Invalid OAuth return"))?;
-    let pending = load(&store, &request.state)?;
+    finish_connection(&store, request).await?;
+    Ok(Redirect::to("/connect?connected=1").into_response())
+}
+async fn finish_connection(store: &Store, request: Finish) -> ApiResult<String> {
+    let pending = load(store, &request.state)?;
     let returned = url::Url::parse(&request.redirected_url)
         .map_err(|_| bad("Paste the entire redirected URL, including code and state"))?;
     let redirect =
@@ -279,7 +291,7 @@ pub async fn finish(
     }
     let params: std::collections::BTreeMap<_, _> = returned.query_pairs().into_owned().collect();
     complete(
-        &store,
+        store,
         params
             .get("state")
             .filter(|s| **s == request.state)
@@ -322,7 +334,7 @@ pub async fn callback(
     }}))
 }
 static COMPLETE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-async fn complete(store: &Store, state: &str, code: &str) -> ApiResult<Response> {
+async fn complete(store: &Store, state: &str, code: &str) -> ApiResult<String> {
     let _lock = COMPLETE.lock().await;
     let pending = load(store, state)?;
     if let Some(id) = &pending.source
@@ -361,9 +373,10 @@ async fn complete(store: &Store, state: &str, code: &str) -> ApiResult<Response>
             .map_err(|_| bad("Invalid OAuth token expiry"))?,
     };
     let key = serde_json::to_string(&credential).map_err(anyhow::Error::from)?;
-    if let Some(id) = pending.source {
+    let id = if let Some(id) = pending.source {
         store.patch_source(&id, None, Some(&key)).await?;
         store.resume_source(&id).await?;
+        id
     } else {
         store
             .connect_source_with_key(
@@ -372,7 +385,84 @@ async fn complete(store: &Store, state: &str, code: &str) -> ApiResult<Response>
                 pending.history_days,
                 Some(&key),
             )
-            .await?;
+            .await?
+            .id
+    };
+    Ok(id)
+}
+
+/// Generic OAuth client: sign-in never needs a provider-specific UI or a server browser.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiStart {
+    source: Option<String>,
+    config: Option<Config>,
+    name: Option<String>,
+    description: Option<String>,
+    history_days: Option<u8>,
+}
+pub async fn api_start(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    request: Result<axum::Json<ApiStart>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    sources::owner(&store, &headers).await?;
+    let axum::Json(request) = request.map_err(|_| bad("Invalid OAuth JSON"))?;
+    if request.source.is_some() == request.config.is_some() {
+        return Err(bad("Supply either source to reconnect or an OAuth config"));
     }
-    Ok(Redirect::to("/connect?connected=1").into_response())
+    let config = request.config;
+    let state = begin(
+        &store,
+        Start {
+            source: request.source,
+            client_json: config.as_ref().map(|c| {
+                serde_json::json!({"installed":{
+            "client_id":c.client_id,"client_secret":c.client_secret,
+            "auth_uri":c.authorization_url,"token_uri":c.token_url}})
+                .to_string()
+            }),
+            redirect_uri: config.as_ref().map(|c| c.redirect_uri.clone()),
+            origins: config.as_ref().map(|c| c.origins.join(" ")),
+            scopes: config.map(|c| c.scopes),
+            name: request.name,
+            description: request.description,
+            history_days: request.history_days,
+        },
+    )
+    .await?;
+    let pending = load(&store, &state)?;
+    let mut url =
+        url::Url::parse(&pending.config.authorization_url).map_err(|_| bad("Invalid OAuth URL"))?;
+    url.query_pairs_mut().extend_pairs([
+        ("client_id", pending.config.client_id.as_str()),
+        ("redirect_uri", pending.config.redirect_uri.as_str()),
+        ("response_type", "code"),
+        ("scope", pending.config.scopes.as_str()),
+        ("state", state.as_str()),
+        (
+            "code_challenge",
+            URL_SAFE_NO_PAD
+                .encode(Sha256::digest(pending.verifier.as_bytes()))
+                .as_str(),
+        ),
+        ("code_challenge_method", "S256"),
+        ("access_type", "offline"),
+        ("prompt", "consent"),
+    ]);
+    Ok(axum::Json(
+        serde_json::json!({"state":state,"authorization_url":url.as_str(),"expires_at":pending.expires}),
+    ))
+}
+pub async fn api_finish(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    request: Result<axum::Json<Finish>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<axum::Json<serde_json::Value>> {
+    sources::owner(&store, &headers).await?;
+    let axum::Json(request) = request.map_err(|_| bad("Invalid OAuth return JSON"))?;
+    let id = finish_connection(&store, request).await?;
+    Ok(axum::Json(
+        serde_json::json!({"id":id,"status":"setting_up"}),
+    ))
 }
