@@ -16,4 +16,4 @@ Built with React 19 and the UI SDK (`@ui-sdk/react`). Before using it, read `nod
 - `src/shell/`: the sidebar, the main panel and `PageHeader`.
 - `src/pages/`: one file per sidebar page.
 
-`bun run dev` also serves `/app/#/kit`, a page showing every component in both themes. It isn't in the build.
+`bun run dev` also serves `/app/kit`, a page showing every component in both themes. It isn't in the build.

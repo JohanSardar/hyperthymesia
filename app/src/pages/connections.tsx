@@ -6,7 +6,7 @@ function ConnectionsPage() {
     <>
       <PageHeader title="Connections" />
       <Page width="explore">
-        <Empty title="No connections yet" description="Your Mac is the first source. Other sources you connect show up here" />
+        <Empty title="No connections yet" description="Sources you connect beyond this Mac show up here" />
       </Page>
     </>
   )

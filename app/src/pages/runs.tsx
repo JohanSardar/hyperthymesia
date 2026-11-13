@@ -6,7 +6,7 @@ function RunsPage() {
     <>
       <PageHeader title="Runs" />
       <Page width="dashboard">
-        <Empty title="No runs yet" description="Passes run every 4 hours. Each pass and pull shows up here" />
+        <Empty title="No runs yet" description="Each 4-hour pass and every pull shows up here" />
       </Page>
     </>
   )

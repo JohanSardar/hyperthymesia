@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react"
-import { createHashRouter, Navigate, RouterProvider, type RouteObject } from "react-router"
+import { createBrowserRouter, Navigate, RouterProvider, type RouteObject } from "react-router"
 import { AgentPage } from "./pages/agent"
 import { ConnectionsPage } from "./pages/connections"
 import { RunsPage } from "./pages/runs"
@@ -23,7 +23,7 @@ if (KitPage) {
   children.push({ path: "kit", element: <Suspense><KitPage /></Suspense> })
 }
 
-const router = createHashRouter([{ path: "/", element: <Layout />, children }])
+const router = createBrowserRouter([{ path: "/", element: <Layout />, children }], { basename: "/app" })
 
 function App() {
   return <RouterProvider router={router} />
