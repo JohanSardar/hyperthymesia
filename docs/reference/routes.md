@@ -62,4 +62,16 @@ All public route registrations, including dashboard forms. See [API contracts](a
 | DELETE | `/v1/settings/tokens/{id}` | [settings_api.rs:24](../../crates/hx-server/src/settings_api.rs#L24) |
 | GET | `/v1/runs` | [settings_api.rs:28](../../crates/hx-server/src/settings_api.rs#L28) |
 | GET | `/v1/recording` | [settings_api.rs:29](../../crates/hx-server/src/settings_api.rs#L29) |
+| GET | `/v1/connections/catalog` | [connection_api.rs:583](../../crates/hx-server/src/connection_api.rs#L583) |
+| GET | `/v1/connections` | [connection_api.rs:584](../../crates/hx-server/src/connection_api.rs#L584) |
+| POST | `/v1/connections` | [connection_api.rs:584](../../crates/hx-server/src/connection_api.rs#L584) |
+| GET | `/v1/connections/{id}` | [connection_api.rs:585](../../crates/hx-server/src/connection_api.rs#L585) |
+| PATCH | `/v1/connections/{id}` | [connection_api.rs:585](../../crates/hx-server/src/connection_api.rs#L585) |
+| POST | `/v1/connections/{id}/setup` | [connection_api.rs:589](../../crates/hx-server/src/connection_api.rs#L589) |
+| POST | `/v1/connections/{id}/reconnect` | [connection_api.rs:590](../../crates/hx-server/src/connection_api.rs#L590) |
+| GET | `/v1/connections/{id}/entries` | [connection_api.rs:591](../../crates/hx-server/src/connection_api.rs#L591) |
+| GET | `/v1/agent` | [connection_api.rs:592](../../crates/hx-server/src/connection_api.rs#L592) |
+| POST | `/v1/recipes/{id}/retry` | [connection_api.rs:593](../../crates/hx-server/src/connection_api.rs#L593) |
+| POST | `/v1/connections/oauth` | [connection_api.rs:594](../../crates/hx-server/src/connection_api.rs#L594) |
+| POST | `/v1/connections/oauth/finish` | [connection_api.rs:595](../../crates/hx-server/src/connection_api.rs#L595) |
 | POST | `/mcp` | [mcp.rs:1037](../../crates/hx-server/src/mcp.rs#L1037) |

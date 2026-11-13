@@ -230,11 +230,57 @@ async fn check_connection(
             &host,
         )
         .await
-        .map(|_| ())
+        .and_then(|value| {
+            if value["ok"] == false
+                || value["valid"] == false
+                || value["errors"]
+                    .as_array()
+                    .is_some_and(|errors| !errors.is_empty())
+            {
+                Err(hx_sources::request::RequestError::Login)
+            } else {
+                Ok(())
+            }
+        })
+}
+
+async fn replacement_key(store: &Store, id: &str, key: &str) -> ApiResult<String> {
+    let saved = keys(store)?
+        .read(id)
+        .map_err(|_| bad("Source key unavailable"))?;
+    if let Some(mut credentials) = hx_sources::connection::Credentials::parse(saved.as_deref())
+        .map_err(|_| bad("Invalid saved credentials"))?
+    {
+        let old = credentials.key.as_deref().ok_or_else(|| {
+            bad("Update imported header/env credentials by adding an updated connection")
+        })?;
+        for value in credentials
+            .headers
+            .values_mut()
+            .chain(credentials.env.values_mut())
+        {
+            *value = value.replace(old, key);
+        }
+        for value in &mut credentials.redactions {
+            *value = value.replace(old, key);
+        }
+        credentials.key = Some(key.to_owned());
+        credentials
+            .validate()
+            .map_err(|_| bad("Invalid replacement key"))?;
+        return serde_json::to_string(&credentials)
+            .map_err(|e| crate::ApiError::from(anyhow::Error::from(e)));
+    }
+    Ok(key.to_owned())
 }
 
 pub(crate) async fn reconnect_source(store: &Store, id: &str, key: Option<&str>) -> ApiResult<()> {
     let source = source(store, id).await?;
+    let replacement = match key {
+        Some(key) => Some(replacement_key(store, id, key).await?),
+        None => None,
+    };
+    let key = replacement.as_deref();
     if !source.enabled {
         return Err(bad("Turn this source on before reconnecting"));
     }
@@ -281,7 +327,12 @@ pub async fn list(State(store): State<Store>, headers: HeaderMap) -> ApiResult<J
                     "source key storage unavailable".into(),
                 )
             })?
-            .is_some();
+            .is_some_and(|value| {
+                hx_sources::connection::Credentials::parse(Some(&value))
+                    .ok()
+                    .flatten()
+                    .is_none_or(|c| c.key.is_some() || !c.headers.is_empty() || !c.env.is_empty())
+            });
         let mut value = serde_json::to_value(&source).map_err(anyhow::Error::from)?;
         value["has_key"] = json!(has_key);
         value["oauth"] = json!(
@@ -324,8 +375,12 @@ pub async fn patch_source(
             return Err(bad("saved configuration must not contain source keys"));
         }
     }
+    let replacement = match request.key.as_deref() {
+        Some(key) => Some(replacement_key(&store, &value, key).await?),
+        None => None,
+    };
     store
-        .patch_source(&value, request.enabled, request.key.as_deref())
+        .patch_source(&value, request.enabled, replacement.as_deref())
         .await?;
     Ok(Json(
         json!({"id":value,"enabled":request.enabled.unwrap_or(source.enabled)}),

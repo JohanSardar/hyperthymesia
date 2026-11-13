@@ -155,8 +155,14 @@ impl Broker {
         if name == "source_info" {
             let recipes = self.store.recipes(Some(source_id)).await?;
             let tables = crate::agent_sql::tables(&self.store, Some(source_id)).await?;
+            let credentials_managed = hx_sources::connection::Credentials::parse(
+                KeyStore::new(&self.store.data_dir)?
+                    .read(source_id)?
+                    .as_deref(),
+            )?
+            .is_some();
             return Ok(
-                json!({"source":source,"recipes":recipes.iter().map(|r| json!({"id":r.id,"recipe":r.recipe.0,"enabled":r.enabled,"owner_off":r.owner_off})).collect::<Vec<_>>(),"addons":self.store.addons(Some(source_id)).await?,"tables":tables,"table_prefix":format!("s_{source_id}_"),"connection_check":self.store.source_check(source_id).await?,"cli_identity":self.store.source_cli(source_id).await?,"cadence_hours":4}),
+                json!({"source":source,"recipes":recipes.iter().map(|r| json!({"id":r.id,"recipe":r.recipe.0,"enabled":r.enabled,"owner_off":r.owner_off})).collect::<Vec<_>>(),"addons":self.store.addons(Some(source_id)).await?,"tables":tables,"table_prefix":format!("s_{source_id}_"),"connection_check":self.store.source_check(source_id).await?,"cli_identity":self.store.source_cli(source_id).await?,"cadence_hours":4,"connection_credentials_managed":credentials_managed}),
             );
         }
         if name == "addon_save" {
