@@ -50,3 +50,18 @@ Checks (with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` to limit disk use):
 
 An earlier verification attempt stopped after pulling an entry because the disk
 filled. The successful run above used fresh state after disk space was restored.
+
+Sol review regression checks:
+
+- S1: Notion's catalog description repeated the injected version header, causing
+  credential redaction to reject connection creation (400). Removed the redundant
+  instruction while retaining the header. The reviewer's API regression test
+  failed before the fix and now returns 201.
+- S2: A custom CLI's generated description authorized only its probe arguments.
+  Also name the pinned executable so setup can discover other read subcommands.
+  The reviewer's API-to-setup-broker regression test failed with destination
+  authorization denied before the fix and now passes.
+
+`cargo test --locked -p hx-server --test review_s1 --test review_s2` passes
+both regression tests. These are the only new tests; Sol supplied both to
+reproduce findings.

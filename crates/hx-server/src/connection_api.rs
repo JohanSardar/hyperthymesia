@@ -366,7 +366,11 @@ pub async fn connect(
         }
         Connection::Cli { argv, env } => {
             credentials.env = env;
-            let destination = format!("CLI via {}", command_description(&argv)?);
+            let destination = format!(
+                "CLI via {}. Executable {}",
+                command_description(&argv)?,
+                command_description(&argv[..1])?
+            );
             let cli = argv.first().cloned();
             (
                 Request::Cli {
