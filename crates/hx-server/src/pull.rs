@@ -94,6 +94,36 @@ async fn enabled(store: &Store, id: &str) -> Result<Option<(StoredRecipe, Source
 /// out without advancing the cadence, so lease recovery replays as duplicates.
 /// Remote/recipe failures are recorded and wait until the next boundary.
 pub async fn run(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullReport> {
+    let source: Option<String> = sqlx::query_scalar("SELECT r.source_id FROM recipes r JOIN sources s ON s.id=r.source_id JOIN recipe_state rs ON rs.recipe_id=r.id WHERE r.id=$1 AND r.enabled AND NOT r.owner_off AND s.enabled AND s.status='ready' AND rs.next_run_at<=$2")
+        .bind(id)
+        .bind(hx_store::Ts::from(now))
+        .fetch_optional(&store.pool)
+        .await?;
+    let Some(source) = source else {
+        return Ok(PullReport::default());
+    };
+    let mut tx = store.begin_write().await?;
+    let history: i64 = sqlx::query_scalar("INSERT INTO pull_history(recipe_id,source_id,started_at,status) VALUES($1,$2,$3,'running') RETURNING id")
+        .bind(id).bind(source).bind(hx_store::Ts::from(now)).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    let result = run_inner(store, id, now).await;
+    let status = match &result {
+        Ok(r) if r.error.is_some() => "failed",
+        Ok(r) if r.stopped => "stopped",
+        Ok(_) => "succeeded",
+        Err(_) => "failed",
+    };
+    let mut tx = store.begin_write().await?;
+    sqlx::query("UPDATE pull_history SET finished_at=$2,status=$3,accepted=$4,duplicates=$5,rejected=$6 WHERE id=$1")
+        .bind(history).bind(hx_store::Ts::now()).bind(status)
+        .bind(result.as_ref().map(|r| r.accepted).unwrap_or(0))
+        .bind(result.as_ref().map(|r| r.duplicates).unwrap_or(0))
+        .bind(result.as_ref().map(|r| r.rejected as i64).unwrap_or(0))
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    result
+}
+async fn run_inner(store: &Store, id: &str, now: DateTime<Utc>) -> Result<PullReport> {
     let mut report = PullReport::default();
     let Some((stored, source)) = enabled(store, id).await? else {
         return Ok(report);

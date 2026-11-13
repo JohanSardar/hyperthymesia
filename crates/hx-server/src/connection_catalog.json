@@ -1,0 +1,505 @@
+[
+  {
+    "id": "slack",
+    "name": "Slack",
+    "category": "Chat",
+    "description": "Read your recent messages and joined conversations. Use conversations.history and bounded oldest timestamps; auth.test identifies the connected account.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://slack.com/api",
+      "probe_path": "/api/auth.test",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "discord",
+    "name": "Discord",
+    "category": "Chat",
+    "description": "Read channels and recent messages accessible to your bot. Respect channel permissions and message content intent; do not post messages.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://discord.com/api/v10",
+      "probe_path": "/api/v10/users/@me",
+      "headers": {
+        "Authorization": "Bot {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "linear",
+    "name": "Linear",
+    "category": "Tasks",
+    "description": "Read assigned issues and updates through GraphQL. Discover the current viewer and bound issue updatedAt queries.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.linear.app",
+      "probe_path": "/graphql",
+      "headers": {
+        "Authorization": "{{key}}"
+      },
+      "method": "POST",
+      "body": {
+        "query": "{ viewer { id name } }"
+      }
+    }
+  },
+  {
+    "id": "todoist",
+    "name": "Todoist",
+    "category": "Tasks",
+    "description": "Read your tasks and completed activity with documented v1 endpoints. A current list of old tasks is undated context, not activity now.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.todoist.com",
+      "probe_path": "/api/v1/tasks?limit=10",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "asana",
+    "name": "Asana",
+    "category": "Tasks",
+    "description": "Read your assigned tasks and recent task stories. Begin with the current user and accessible workspaces; use bounded modified-since reads.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://app.asana.com",
+      "probe_path": "/api/1.0/users/me",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "clickup",
+    "name": "ClickUp",
+    "category": "Tasks",
+    "description": "Read your spaces, tasks and recent changes. Discover teams from /api/v2/team and use documented date_updated filters.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.clickup.com",
+      "probe_path": "/api/v2/user",
+      "headers": {
+        "Authorization": "{{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "notion",
+    "name": "Notion",
+    "category": "Notes",
+    "description": "Read pages shared with your integration. Use search with last_edited_time sorting and bounded page/block reads. Only shared pages are accessible.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.notion.com",
+      "probe_path": "/v1/users/me",
+      "headers": {
+        "Authorization": "Bearer {{key}}",
+        "Notion-Version": "2025-09-03"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "airtable",
+    "name": "Airtable",
+    "category": "Notes",
+    "description": "Read records in bases explicitly granted to this personal access token. Discover base schemas and read bounded records; use actual source timestamps when present.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.airtable.com",
+      "probe_path": "/v0/meta/bases",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "raindrop",
+    "name": "Raindrop.io",
+    "category": "Notes",
+    "description": "Read saved bookmarks with stable IDs, created and lastUpdate timestamps. Bound recent reads using the documented search API.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.raindrop.io",
+      "probe_path": "/rest/v1/user",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "readwise",
+    "name": "Readwise",
+    "category": "Reading",
+    "description": "Read highlights updated since the connection history floor using updated__gt. Follow documented next links only on this origin.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://readwise.io",
+      "probe_path": "/api/v2/highlights/?page_size=1",
+      "headers": {
+        "Authorization": "Token {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "reader",
+    "name": "Readwise Reader",
+    "category": "Reading",
+    "description": "Read saved documents with updatedAfter and pageCursor. A document library is context; use actual saved/read timestamps when available.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://readwise.io",
+      "probe_path": "/api/v3/list/?page_size=10",
+      "headers": {
+        "Authorization": "Token {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "listenbrainz",
+    "name": "ListenBrainz",
+    "category": "Music",
+    "description": "Read your recent music listens via /1/user/{user_name}/listens with bounded min_ts and max_ts. Discover your username with validate-token.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.listenbrainz.org",
+      "probe_path": "/1/validate-token",
+      "headers": {
+        "Authorization": "Token {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "spotify",
+    "name": "Spotify",
+    "category": "Music",
+    "description": "Read recently played tracks via /v1/me/player/recently-played using after milliseconds. Requires user-read-recently-played. A manually supplied access token expires; use the OAuth API for unattended refresh.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.spotify.com",
+      "probe_path": "/v1/me",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "oura",
+    "name": "Oura",
+    "category": "Health",
+    "description": "Read recent sleep, activity and readiness summaries from /v2/usercollection with bounded start_date and end_date. Dates are daily context, not invented event instants. Supply an OAuth access token; legacy personal access tokens are no longer supported. Use the OAuth API for unattended refresh.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.ouraring.com",
+      "probe_path": "/v2/usercollection/personal_info",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "fitbit",
+    "name": "Fitbit",
+    "category": "Health",
+    "description": "Read activity summaries for your connected Fitbit account. Use documented daily date ranges; use the OAuth API for refreshable sign-in.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.fitbit.com",
+      "probe_path": "/1/user/-/profile.json",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "strava",
+    "name": "Strava",
+    "category": "Health",
+    "description": "Read your recent activities via /api/v3/athlete/activities with after and before unix seconds. Requires activity:read; use OAuth for refreshing access.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://www.strava.com",
+      "probe_path": "/api/v3/athlete",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "toggl",
+    "name": "Toggl Track",
+    "category": "Activity",
+    "description": "Read your recent time entries through /api/v9/me/time_entries using bounded start_date and end_date. Supply a Basic credential (base64 of api_token:api_token).",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.track.toggl.com",
+      "probe_path": "/api/v9/me",
+      "headers": {
+        "Authorization": "Basic {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "clockify",
+    "name": "Clockify",
+    "category": "Activity",
+    "description": "Read workspaces and your recent time entries through /api/v1, with bounded start/end filters. Discover the current user first.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.clockify.me",
+      "probe_path": "/api/v1/user",
+      "headers": {
+        "X-Api-Key": "{{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "gitlab",
+    "name": "GitLab",
+    "category": "Code",
+    "description": "Read your user events, projects and merge requests with bounded after/before dates. Use read_api scope.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://gitlab.com",
+      "probe_path": "/api/v4/user",
+      "headers": {
+        "PRIVATE-TOKEN": "{{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "sentry",
+    "name": "Sentry",
+    "category": "Code",
+    "description": "Read your accessible projects and recent issue events. Use bounded statsPeriod and environment filters; only source event time proves activity.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://sentry.io",
+      "probe_path": "/api/0/projects/",
+      "headers": {
+        "Authorization": "Bearer {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "jira",
+    "name": "Jira Cloud",
+    "category": "Code",
+    "description": "Read recent issues and worklogs through REST v3. Supply a Basic credential (base64 of email:API token); use bounded JQL updated filters.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [
+      "site"
+    ],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://{{site}}.atlassian.net",
+      "probe_path": "/rest/api/3/myself",
+      "headers": {
+        "Authorization": "Basic {{key}}"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "calcom",
+    "name": "Cal.com",
+    "category": "Calendar",
+    "description": "Read your recent bookings and meeting activity. Use bounded time filters and the documented API version.",
+    "auth": "key",
+    "requirements": "A read-only API token with access to the described personal data.",
+    "variables": [],
+    "connection": {
+      "kind": "api",
+      "base_url": "https://api.cal.com",
+      "probe_path": "/v2/me",
+      "headers": {
+        "Authorization": "Bearer {{key}}",
+        "cal-api-version": "2024-08-13"
+      },
+      "method": "GET",
+      "body": null
+    }
+  },
+  {
+    "id": "gmail-gws",
+    "name": "Gmail",
+    "category": "Mail",
+    "description": "Read Gmail through the installed, signed-in gws CLI. messages.list returns IDs only: use detail messages.get, internalDate unix_ms and Subject from payload.headers. Bound q with after:{{since_unix}}. Auth exit code 2. Do not change the login or use --page-all.",
+    "auth": "existing_login",
+    "requirements": "Install gws and sign in separately before connecting. This API never installs software or changes CLI login.",
+    "variables": [],
+    "connection": {
+      "kind": "cli",
+      "argv": [
+        "gws",
+        "gmail",
+        "users",
+        "messages",
+        "list",
+        "--params",
+        "{\"userId\":\"me\",\"maxResults\":1,\"q\":\"newer_than:1d\"}"
+      ],
+      "env": {}
+    }
+  },
+  {
+    "id": "calendar-gws",
+    "name": "Google Calendar",
+    "category": "Calendar",
+    "description": "Read Google Calendar through the installed, signed-in gws CLI. Bound events.list timeMin/timeMax, use nextPageToken and start.dateTime/end.dateTime. Skip date-only floating events in timed recipes. Auth exit code 2.",
+    "auth": "existing_login",
+    "requirements": "Install gws and sign in separately before connecting. This API never installs software or changes CLI login.",
+    "variables": [],
+    "connection": {
+      "kind": "cli",
+      "argv": [
+        "gws",
+        "calendar",
+        "calendarList",
+        "list",
+        "--params",
+        "{\"maxResults\":1}"
+      ],
+      "env": {}
+    }
+  },
+  {
+    "id": "drive-gws",
+    "name": "Google Drive",
+    "category": "Files",
+    "description": "Read recent file changes through installed, signed-in gws. Use drive files list with modifiedTime filters and bounded pageSize. Shared files require read permissions.",
+    "auth": "existing_login",
+    "requirements": "Install gws and sign in separately before connecting. This API never installs software or changes CLI login.",
+    "variables": [],
+    "connection": {
+      "kind": "cli",
+      "argv": [
+        "gws",
+        "drive",
+        "files",
+        "list",
+        "--params",
+        "{\"pageSize\":1,\"fields\":\"files(id,name,modifiedTime)\"}"
+      ],
+      "env": {}
+    }
+  },
+  {
+    "id": "apple-bridge",
+    "name": "Apple Bridge",
+    "category": "Apple",
+    "description": "Read personal Mac data via Apple Bridge MCP. Discover read tools such as calendar_agenda, reminders and health where available. Use bounded recent ranges. Never request Mac permissions or start services during setup.",
+    "auth": "none",
+    "requirements": "An Apple Bridge MCP server already running on this Mac with its required permissions.",
+    "variables": [],
+    "connection": {
+      "kind": "mcp",
+      "transport": "http",
+      "url": "http://127.0.0.1:7780/mcp",
+      "headers": {}
+    }
+  }
+]

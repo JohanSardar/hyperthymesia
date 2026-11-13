@@ -6,6 +6,10 @@ permission is still named **Screen Recording**. Screenshots default to at most o
 skipped, and idle/locked/secure/excluded windows remain suppressed. Existing
 video evidence from older builds is retained; this change does not delete it.
 
+`hx-server setup` does all of this for you: it pairs the app with the local
+server and guides each permission beside its System Settings pane. The rest of
+this page describes the manual paths.
+
 An unconfigured app shows **Not paired** and keeps observations in its local
 outbox. Choose **Grant permissions** to request macOS capture permissions when
 ready. Permission requests happen only through that action or `hx-agent onboard`.

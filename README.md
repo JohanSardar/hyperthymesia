@@ -15,6 +15,13 @@ working systemd user service (Linux) or desktop login (macOS). No Rust, Docker o
 database service is needed. The installer verifies pinned release checksums and
 refuses unrelated destinations. See [options and recovery](docs/install.md).
 
+Then setup runs by itself. It pairs the Mac app, opens the dashboard already
+signed in, and shows you only what a person has to do: switch on three macOS
+permissions and sign in to your model provider, each guided beside the screen
+where you do it. "Not now" always works. Run `hx-server setup` again any time; it
+only shows what is left. Asking an AI agent to set it up? Point it at
+[these instructions](docs/setup-for-agents.md).
+
 **Experimental:** capture can have gaps and model-written pages can be wrong.
 Cloud processing can cost money and the agent is not sandboxed.
 Read [the safety notes](#before-you-collect-data) before pairing or connecting.

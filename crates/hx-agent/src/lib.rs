@@ -23,6 +23,7 @@ pub mod startup;
 
 mod first_run;
 pub mod pair;
+pub mod setup;
 
 #[cfg(all(feature = "e2e-harness", not(debug_assertions)))]
 compile_error!("e2e-harness must never be enabled in release builds");

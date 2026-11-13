@@ -1,0 +1,79 @@
+# Connections API verification
+
+Verified on macOS with a separately built `hx-server`, temporary state, loopback
+source services and a scratch copy of the fx credential. The installed server
+and its state were not used. All source records and source credentials were
+synthetic. The setup worker used real fx; interpretation was disabled for this
+isolated verification.
+
+The API client connected a custom API with a private `X-API-Key` header. Without
+further client setup, fx discovered the records, tested and saved a recipe, and
+reported a successful setup. The recipe retry endpoint ingested a record and the
+connection entries endpoint returned it. Source and recipe off switches blocked
+retries. Restarting the server preserved the off switch and saved evidence.
+
+Selected client output:
+
+```text
+Catalog: 26 entries; 12 categories
+API connect: setting_up
+Agent setup: succeeded; one recipe; no_pull: null
+Pull cadence: 14400 seconds
+Pulled entries: 1
+Restart: off switch and evidence retained
+Imported HTTP MCP: setting_up
+CLI probe: setting_up
+Refused key: needs_reconnect; replacement key: setup resumed
+OAuth: PKCE URL, exchange, private credentials and replay rejection passed
+PASS: owner auth, API setup/pull, retry, switches, restart, MCP import,
+      CLI, validation, reconnect
+STDIO MCP: imported config, expanded variable, private env, real fx setup,
+           deterministic pull and redacted Agent response passed; entries: 1
+```
+
+OAuth used a local authorization-code issuer, not a personal third-party login.
+The client also checked missing owner auth, missing import selection, unresolved
+variables and a forbidden HTTP method. Source credential values were checked
+against JSON responses. Catalog services that require personal accounts were
+not individually signed in; their requirements are returned in catalog metadata.
+
+Checks (with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` to limit disk use):
+
+- `cargo check --locked -p hx-server`: passed.
+- `cargo clippy --locked -p hx-server -p hx-sources -p hx-store --all-targets -- -D warnings`: passed.
+- `cargo build --locked -p hx-server`: passed.
+- `cargo test --locked -p hx-sources`: 47 passed.
+- `cargo fmt --all -- --check`: passed.
+- `python3 scripts/check-store-transactions.py`: passed.
+- `python3 scripts/check-tooling.py`: passed.
+- `python3 scripts/reference.py`: regenerated references and validated local links.
+
+An earlier verification attempt stopped after pulling an entry because the disk
+filled. The successful run above used fresh state after disk space was restored.
+
+Sol review regression checks:
+
+- S1: Notion's catalog description repeated the injected version header, causing
+  credential redaction to reject connection creation (400). Removed the redundant
+  instruction while retaining the header. The reviewer's API regression test
+  failed before the fix and now returns 201.
+- S2: A custom CLI's generated description authorized only its probe arguments.
+  Also name the pinned executable so setup can discover other read subcommands.
+  The reviewer's API-to-setup-broker regression test failed with destination
+  authorization denied before the fix and now passes.
+
+`cargo test --locked -p hx-server --test review_s1 --test review_s2` passes
+both regression tests. These are the only new tests; Sol supplied both to
+reproduce findings.
+
+Rebase verification after MRs !5 and !7 (base `ed15d27`): kept both Settings
+and Connections router registrations and both route-generator inputs. Connection
+behavior is unchanged; no additional Sol round was needed. Re-ran all-target
+Clippy for hx-server/hx-sources/hx-store, both review regressions (2 passed),
+hx-sources tests (47 passed), formatting, transaction/tooling checks, server
+build and reference generation successfully.
+
+One fresh isolated API run selected its model through `PUT /v1/settings`,
+connected an API source, completed real fx setup, saved a four-hour pull and
+retrieved one ingested entry. `GET /v1/settings` and `GET /v1/runs` also succeeded
+alongside the Connections API. The scratch server was stopped afterward.

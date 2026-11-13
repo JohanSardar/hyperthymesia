@@ -688,7 +688,14 @@ impl Store {
         Ok(true)
     }
     pub async fn gc(&self) -> Result<usize> {
-        let hashes:Vec<String>=sqlx::query_scalar("SELECT sha256 FROM blobs WHERE retention_class='chunk' AND pins=0 AND published AND created_at < $1 ORDER BY sha256").bind(Ts::from(Utc::now()-Duration::days(30))).fetch_all(&self.pool).await?;
+        let days: Option<i64> = sqlx::query_scalar(
+            "SELECT json_extract(value,'$.chunk_retention_days') FROM app_settings WHERE id=1",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        let cutoff = Ts::from(Utc::now() - Duration::days(days.unwrap_or(30).clamp(1, 3650)));
+        let hashes:Vec<String>=sqlx::query_scalar("SELECT sha256 FROM blobs WHERE retention_class='chunk' AND pins=0 AND published AND created_at < $1 ORDER BY sha256").bind(cutoff).fetch_all(&self.pool).await?;
         let mut expired = 0;
         for sha in &hashes {
             let mut tx = self.begin_write().await?;
@@ -697,7 +704,7 @@ impl Store {
                 tx.observe_gc_commit(boundary.clone());
             }
             let eligible: Option<String> = sqlx::query_scalar("SELECT sha256 FROM blobs WHERE sha256=$1 AND retention_class='chunk' AND pins=0 AND published AND created_at < $2")
-                .bind(sha).bind(Ts::from(Utc::now()-Duration::days(30))).fetch_optional(&mut *tx).await?;
+                .bind(sha).bind(cutoff).fetch_optional(&mut *tx).await?;
             if eligible.is_none() {
                 tx.commit().await?;
                 continue;

@@ -19,7 +19,6 @@ pub const DIGEST_LOOKUPS: usize = 6;
 /// One repair pass: a second rarely changed anything but cost a full run.
 pub const REPAIR_ATTEMPTS: usize = 1;
 pub const FX_VERSION: &str = "0.0.16";
-pub const MODEL: &str = "gpt-6.1-sol";
 /// Defaults sized for a dense real four-hour window; override per deployment.
 pub const DEFAULT_MAX_STEPS: u64 = 120;
 pub const DEFAULT_TIMEOUT_S: u64 = 1200;
@@ -35,8 +34,8 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        let provider = std::env::var("HX_FX_PROVIDER").unwrap_or_else(|_| "codex".into());
-        let credential_name = login_file(&provider).unwrap_or("chatgpt-auth.json");
+        let provider = std::env::var("HX_FX_PROVIDER").unwrap_or_default();
+        let credential_name = login_file(&provider).unwrap_or("auth.json");
         Self {
             binary: std::env::var_os("HX_FX_BINARY")
                 .map(PathBuf::from)
@@ -49,6 +48,17 @@ impl Config {
         }
     }
 }
+fn credential_path(config: &Config, provider: &str) -> PathBuf {
+    if std::env::var_os("HX_FX_CREDENTIAL").is_some()
+        || config.credential != Config::from_env().credential
+    {
+        return config.credential.clone();
+    }
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join(".fx")
+        .join(login_file(provider).unwrap_or("auth.json"))
+}
+
 // Only these login mechanisms are proven under an isolated HOME (see unknowns.md).
 fn login_file(provider: &str) -> Option<&'static str> {
     match provider {
@@ -65,24 +75,56 @@ struct Selection {
 }
 impl Selection {
     fn from_env() -> Result<Self> {
-        let read = |name, default: &str| -> Result<String> {
-            let value = match std::env::var(name) {
-                Ok(value) => value,
-                Err(std::env::VarError::NotPresent) => default.into(),
-                Err(_) => anyhow::bail!("{name} must be valid UTF-8"),
-            };
-            ensure!(!value.trim().is_empty(), "{name} must not be empty");
-            Ok(value)
-        };
         let selection = Self {
-            provider: read("HX_FX_PROVIDER", "codex")?,
-            model: read("HX_FX_MODEL", MODEL)?,
-            effort: read("HX_FX_EFFORT", "xhigh")?,
+            provider: std::env::var("HX_FX_PROVIDER")
+                .map(|v| if v == "vercel" { "gateway".into() } else { v })
+                .unwrap_or_default(),
+            model: std::env::var("HX_FX_MODEL").unwrap_or_default(),
+            effort: std::env::var("HX_FX_EFFORT").unwrap_or_default(),
         };
+        selection.validate()?;
+        Ok(selection)
+    }
+    fn validate(&self) -> Result<()> {
         ensure!(
-            login_file(&selection.provider).is_some() || selection.provider == "gateway",
-            "unsupported fx provider; HX_FX_PROVIDER must be codex, grok or gateway"
+            matches!(
+                self.provider.as_str(),
+                "codex" | "grok" | "gateway" | "vercel"
+            ),
+            "unsupported fx provider; choose a provider first"
         );
+        ensure!(
+            !self.model.trim().is_empty(),
+            "HX_FX_MODEL must not be empty; choose a model first"
+        );
+        ensure!(
+            !self.model.chars().any(char::is_control)
+                && !self.effort.chars().any(char::is_control)
+                && (self.effort.is_empty() || !self.effort.trim().is_empty()),
+            "invalid model choice or HX_FX_EFFORT"
+        );
+        Ok(())
+    }
+    async fn for_store(store: &Store) -> Result<Self> {
+        let model = crate::preferences::load(store)
+            .await?
+            .model
+            .ok_or_else(|| {
+                anyhow::Error::new(hx_jobs::Deferred::Until(
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                ))
+                .context("choose a provider and model in Settings first")
+            })?;
+        let selection = Self {
+            provider: if model.provider == "vercel" {
+                "gateway".into()
+            } else {
+                model.provider
+            },
+            model: model.model,
+            effort: model.effort.unwrap_or_default(),
+        };
+        selection.validate()?;
         Ok(selection)
     }
     fn manifest_provider(&self) -> String {
@@ -102,7 +144,7 @@ impl Selection {
         sensitive: SensitiveEgress,
         namespaces: &[String],
     ) -> Value {
-        let mut manifest = json!({"window":window,"timeline_hash":timeline_hash,"input_generation":generation,"provider":self.manifest_provider(),"fx_version":FX_VERSION,"model":self.model,"effort":self.effort,"fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
+        let mut manifest = json!({"window":window,"timeline_hash":timeline_hash,"input_generation":generation,"provider":self.manifest_provider(),"fx_version":FX_VERSION,"model":self.model,"effort":self.effort,"fast":false,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
         if !policy.source_grants.is_empty() {
             manifest["source_grants"] = json!(policy.source_grants);
         }
@@ -119,9 +161,29 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 /// Local readiness only: never read login contents or invoke `ask`/`login`.
 pub async fn doctor(config: &Config) -> Result<()> {
-    let selection = Selection::from_env()?;
+    doctor_selection(
+        config,
+        &Selection::from_env()?,
+        std::env::var("AI_GATEWAY_API_KEY").ok(),
+    )
+    .await
+}
+pub async fn doctor_store(store: &Store) -> Result<()> {
+    doctor_selection(
+        &Config::from_env(),
+        &Selection::for_store(store).await?,
+        crate::preferences::gateway_key(store)?,
+    )
+    .await
+}
+async fn doctor_selection(
+    config: &Config,
+    selection: &Selection,
+    key: Option<String>,
+) -> Result<()> {
+    let credential = credential_path(config, &selection.provider);
     if login_file(&selection.provider).is_some() {
-        let metadata = std::fs::symlink_metadata(&config.credential)
+        let metadata = std::fs::symlink_metadata(&credential)
             .context("fx login missing; run fx login for HX_FX_PROVIDER")?;
         ensure!(
             metadata.is_file(),
@@ -131,8 +193,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
         // Reject redirection below that boundary, including .fx and explicit
         // credential parents; do not reject ordinary HOME ancestry.
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        for parent in config
-            .credential
+        for parent in credential
             .ancestors()
             .skip(1)
             .filter(|p| !p.as_os_str().is_empty())
@@ -158,7 +219,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
             ensure!(metadata.nlink() == 1, "fx login must not have hard links");
         }
     } else {
-        let key = std::env::var("AI_GATEWAY_API_KEY").unwrap_or_default();
+        let key = key.unwrap_or_default();
         ensure!(
             !key.trim().is_empty() && !key.chars().any(char::is_control),
             "fx gateway login requires a nonempty AI_GATEWAY_API_KEY"
@@ -183,6 +244,91 @@ pub async fn doctor(config: &Config) -> Result<()> {
     );
     Ok(())
 }
+/// Catalog and connection checks use a disposable profile without the user's
+/// fx settings, MCPs or instructions. Share the runner's login lock and preserve
+/// refreshed credentials so a check cannot invalidate the next agent run.
+pub(crate) async fn inspect(
+    store: &Store,
+    provider: &str,
+    model: Option<&crate::preferences::Model>,
+) -> Result<Value> {
+    let provider = if provider == "vercel" {
+        "gateway"
+    } else {
+        provider
+    };
+    ensure!(
+        matches!(provider, "gateway" | "codex" | "grok"),
+        "unsupported provider"
+    );
+    let config = Config::from_env();
+    let home = tempfile::Builder::new()
+        .prefix("hx-model-check-")
+        .tempdir()?;
+    let profile = home.path().join(".fx");
+    std::fs::create_dir(&profile)?;
+    let _credential = login_file(provider)
+        .map(|name| {
+            CredentialLease::acquire(&credential_path(&config, provider), profile.join(name))
+        })
+        .transpose()?;
+    let mut command = tokio::process::Command::new(&config.binary);
+    command
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("FX_PROVIDER", provider)
+        .env(
+            "FX_MODEL",
+            model.map(|m| m.model.as_str()).unwrap_or("catalog"),
+        )
+        .env("FX_AUTO_UPGRADE", "0")
+        .env("FX_DISABLE_KEYCHAIN", "1")
+        .env("FX_NO_OPEN_BROWSER", "1")
+        .env("FX_PERMISSION_MODE", "ask")
+        .current_dir(home.path());
+    if provider == "gateway"
+        && let Some(key) = crate::preferences::gateway_key(store)?
+    {
+        command.env("AI_GATEWAY_API_KEY", key);
+    }
+    let input = if let Some(model) = model {
+        std::fs::write(profile.join("settings.json"), br#"{"context":false,"max_agent_steps":1,"permission":{"*":"deny"},"prompt_history":{"enabled":false},"auto_upgrade":false}"#)?;
+        command.args([
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-fast",
+            "--no-ultrafast",
+            "--model",
+            &model.model,
+            "--system",
+            "Reply with OK. Do not use tools.",
+        ]);
+        if let Some(effort) = &model.effort {
+            command.args(["--effort", effort]);
+        }
+        "Reply with OK."
+    } else {
+        command.args(["models", "--json"]);
+        ""
+    };
+    let response = output(command, input, Duration::from_secs(45)).await?;
+    ensure!(response.status.success(), "provider request failed");
+    let value: Value = serde_json::from_slice(&response.stdout)?;
+    if model.is_some() {
+        ensure!(
+            value["exit_code"] == 0
+                && model.is_some_and(|model| value["model"] == model.model)
+                && value["final_output"]
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty()),
+            "model did not complete"
+        );
+    }
+    Ok(value)
+}
+
 // Share fx's own advisory lock name so refreshed subscription credentials survive
 // the isolated profile and concurrent jobs cannot rotate the same refresh token.
 struct CredentialLease {
@@ -409,7 +555,7 @@ pub async fn run(config: &Config, broker: &Broker, instruction: &str) -> Result<
         config.timeout,
         run_limited(
             config,
-            &Selection::from_env()?,
+            &Selection::for_store(&broker.store).await?,
             broker,
             instruction,
             config.max_steps,
@@ -444,7 +590,11 @@ async fn run_limited(
     // A regular credential file is required by fx; a symlink is rejected by fx.
     let _credential = login_file(&selection.provider)
         .map(|name| {
-            CredentialLease::acquire(&config.credential, profile.join(name)).with_context(|| {
+            CredentialLease::acquire(
+                &credential_path(config, &selection.provider),
+                profile.join(name),
+            )
+            .with_context(|| {
                 format!(
                     "fx {} credential unavailable; check HX_FX_CREDENTIAL or run fx login {}",
                     selection.provider, selection.provider
@@ -453,7 +603,7 @@ async fn run_limited(
         })
         .transpose()?;
     let gateway_key = if selection.provider == "gateway" {
-        let key = std::env::var("AI_GATEWAY_API_KEY").unwrap_or_default();
+        let key = crate::preferences::gateway_key(&broker.store)?.unwrap_or_default();
         if key.trim().is_empty() {
             return Err(anyhow::Error::new(hx_jobs::Deferred::Until(
                 chrono::Utc::now() + chrono::Duration::minutes(5),
@@ -478,14 +628,21 @@ async fn run_limited(
     let _server = Server(tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     }));
+    let mut settings = json!({
+        "provider":selection.provider,"models":{(selection.provider.clone()):selection.model},"context":false,"max_agent_steps":steps,
+        "effort":selection.effort,"fast_mode":false,"max_tool_result_bytes":65536,"auto_upgrade":false,"session_titles":false,
+        "permission_mode":"ask","permission":{"*":"deny","capability_search":"allow","mcp_select_tool":"allow","mcp_hyperthymesia_*":"allow"},
+        "prompt_history":{"enabled":false},"notifications":{"turn_end":false,"attention_required":false}
+    });
+    if selection.effort.is_empty() {
+        settings
+            .as_object_mut()
+            .expect("settings object")
+            .remove("effort");
+    }
     std::fs::write(
         profile.join("settings.json"),
-        serde_json::to_vec(&json!({
-            "provider":selection.provider,"models":{(selection.provider.clone()):selection.model},"context":false,"max_agent_steps":steps,
-            "effort":selection.effort,"fast_mode":true,"max_tool_result_bytes":65536,"auto_upgrade":false,"session_titles":false,
-            "permission_mode":"ask","permission":{"*":"deny","capability_search":"allow","mcp_select_tool":"allow","mcp_hyperthymesia_*":"allow"},
-            "prompt_history":{"enabled":false},"notifications":{"turn_end":false,"attention_required":false}
-        }))?,
+        serde_json::to_vec(&settings)?,
     )?;
     std::fs::write(
         work.join(".fx.json"),
@@ -533,14 +690,15 @@ async fn run_limited(
         "--json",
         "--model",
         &selection.model,
-        "--effort",
-        &selection.effort,
-        "--fast",
+        "--no-fast",
         "--no-ultrafast",
         "--no-save",
         "--system",
         &system,
     ]);
+    if !selection.effort.is_empty() {
+        cmd.args(["--effort", &selection.effort]);
+    }
     // Dropping output kills the child (kill_on_drop), including an fx process
     // waiting on a broker response or retrying after a denied tool call.
     let response = tokio::select! {
@@ -627,7 +785,7 @@ pub(crate) async fn interpret_window_with_settle(
     if require_settled {
         crate::processing::ensure_settled(store, window, generation).await?;
     }
-    let selection = Selection::from_env()?;
+    let selection = Selection::for_store(store).await?;
     let policy = crate::disclosure::current(store).await?;
     let sensitive = SensitiveEgress::from_env();
     let identity = json!({"input_generation":generation,"provider":selection.manifest_provider(),"model":selection.model,"effort":selection.effort,"fx_version":FX_VERSION,
@@ -878,7 +1036,7 @@ pub(crate) async fn interpret_window_with_settle(
     let source_addons = json!(audit.source_addons.values().flatten().collect::<Vec<_>>());
     ensure!(source_addons == serde_json::to_value(crate::setup::active_addons(store, &namespaces).await?)?, "source add-ons changed during run");
     value["input_manifest"]["source_addons"] = source_addons;
-    value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":selection.model,"effort":selection.effort,"fast":true,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
+    value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":selection.model,"effort":selection.effort,"fast":false,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     let value = broker.secret_filter().await?.scrub_json(&value);
     Ok(store
         .publish_disclosed_revision_manifest(window, generation, value, output_key, &namespaces)

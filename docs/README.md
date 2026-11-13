@@ -8,6 +8,7 @@ or correct model-generated claims.
 
 - [Installation, providers, upgrades and recovery](install.md)
 - [Mac permissions and pairing](mac-pairing.md)
+- [Guided setup for AI agents](setup-for-agents.md)
 - [Server, authentication, API and disclosure policy](../crates/hx-server/README.md)
 - [Provider limitations](provider-limitations.md)
 - [Garbage-collection safety](gc-safety.md)

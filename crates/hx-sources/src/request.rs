@@ -426,13 +426,44 @@ impl Request {
         gate: &impl RequestGate,
     ) -> Result<Value, RequestError> {
         self.validate_cli()?;
+        let credentials = crate::connection::Credentials::parse(values.key)?;
+        if let Some(credentials) = &credentials {
+            credentials.authorize(self)?;
+        }
+        let values = Placeholders {
+            key: credentials
+                .as_ref()
+                .map_or(values.key, |c| c.key.as_deref()),
+            cursor: values.cursor,
+        };
         match self {
-            Self::Http { .. } => self.execute_http_guarded(values, timeout, gate).await,
+            Self::Http { .. } => {
+                let mut request = self.clone();
+                if let (Some(c), Self::Http { headers, .. }) = (&credentials, &mut request) {
+                    for name in c.headers.keys() {
+                        headers.retain(|k, _| !k.eq_ignore_ascii_case(name));
+                    }
+                    headers.extend(c.headers.clone());
+                }
+                request.execute_http_guarded(values, timeout, gate).await
+            }
             Self::Mcp {
                 transport,
                 tool,
                 arguments,
-            } => crate::mcp::execute(transport, tool, arguments, values, timeout, host, gate).await,
+            } => {
+                crate::mcp::execute(
+                    transport,
+                    tool,
+                    arguments,
+                    values,
+                    timeout,
+                    host,
+                    gate,
+                    credentials.as_ref(),
+                )
+                .await
+            }
             Self::Cli { argv, env, text } => {
                 if timeout.is_zero() || argv.first().is_none_or(String::is_empty) {
                     return Err(RequestError::CliInvalid);
@@ -445,6 +476,9 @@ impl Request {
                     .iter()
                     .map(|(key, value)| Ok((key.clone(), substitute(value, values)?)))
                     .collect::<Result<BTreeMap<_, _>, RequestError>>()?;
+                if let Some(c) = &credentials {
+                    env.extend(c.env.clone());
+                }
                 if let Some(key) = values.key {
                     env.insert("SOURCE_KEY".into(), key.into());
                 }

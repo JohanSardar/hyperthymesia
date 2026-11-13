@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 hx-schema.workspace = true
 hx-sources = { path = "../hx-sources" }
 hx-visual.workspace = true

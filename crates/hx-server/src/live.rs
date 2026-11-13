@@ -23,9 +23,12 @@ fn request_error(error: RequestError) -> anyhow::Error {
 
 impl Broker {
     pub(crate) async fn secret_filter(&self) -> Result<Scrubber> {
-        crate::sources::scrubber(&self.store, None)
-            .await
-            .map_err(|_| failure("source secret filter unavailable", false))
+        crate::sources::scrubber(
+            &self.store,
+            crate::preferences::gateway_key(&self.store)?.as_deref(),
+        )
+        .await
+        .map_err(|_| failure("source secret filter unavailable", false))
     }
 
     pub(crate) async fn connected_sources(&self) -> Result<Value> {
@@ -76,6 +79,16 @@ impl Broker {
         let key = KeyStore::new(&self.store.data_dir)
             .and_then(|keys| keys.read(source_id))
             .map_err(|_| failure("source key unavailable", false))?;
+        if request.is_none()
+            && hx_sources::connection::Credentials::parse(key.as_deref())
+                .map_err(request_error)?
+                .is_some()
+        {
+            return Err(failure(
+                "Structured connections require structured requests; transport credentials are injected by the server",
+                false,
+            ));
+        }
         // OAuth bundles never enter a host process or its environment.
         if request.is_none() && self.store.source_cli(source_id).await?.is_some() {
             return Err(failure(
@@ -107,6 +120,9 @@ impl Broker {
         );
         if let Some(Request::Http { headers, .. }) = &mut request
             && key.is_some()
+            && hx_sources::connection::Credentials::parse(key.as_deref())
+                .map_err(request_error)?
+                .is_none()
             && !args["request"].to_string().contains("{{key}}")
             && !headers
                 .keys()

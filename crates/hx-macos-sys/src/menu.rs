@@ -1,12 +1,16 @@
 use super::*;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSMenu, NSMenuItem, NSStatusBar, NSStatusItem};
+use objc2_app_kit::{
+    NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSStatusBar,
+    NSStatusItem,
+};
 use objc2_foundation::NSObject;
 struct Actions {
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     quit_requested: Arc<AtomicBool>,
     pair_requested: AtomicBool,
+    app_requested: AtomicBool,
 }
 define_class!(
     #[unsafe(super = NSObject)]
@@ -14,9 +18,24 @@ define_class!(
     #[ivars = Actions]
     struct MenuActions;
     unsafe impl NSObjectProtocol for MenuActions {}
+    unsafe impl NSApplicationDelegate for MenuActions {
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn reopen(&self, _app: &NSApplication, _visible: bool) -> bool {
+            self.ivars().app_requested.store(true, Ordering::Relaxed);
+            false
+        }
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn terminate(&self, _app: &NSApplication) -> NSApplicationTerminateReply {
+            self.ivars().quit_requested.store(true, Ordering::Relaxed);
+            self.ivars().stop.store(true, Ordering::Relaxed);
+            NSApplicationTerminateReply::TerminateCancel
+        }
+    }
     impl MenuActions {
         #[unsafe(method(grantPermissions:))]
         fn grant_permissions(&self, _sender: &objc2::runtime::AnyObject) { onboard(); }
+        #[unsafe(method(openApp:))]
+        fn open_app(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().app_requested.store(true, Ordering::Relaxed); }
         #[unsafe(method(pair:))]
         fn pair(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().pair_requested.store(true, Ordering::Relaxed); }
         #[unsafe(method(toggle:))]
@@ -34,6 +53,7 @@ pub struct MenuBar {
     permissions: Retained<NSMenuItem>,
     pair: Retained<NSMenuItem>,
     paired: bool,
+    window: Option<super::app_window::AppWindow>,
 }
 impl MenuBar {
     pub fn new(
@@ -48,9 +68,22 @@ impl MenuBar {
                 stop,
                 quit_requested,
                 pair_requested: AtomicBool::new(false),
+                app_requested: AtomicBool::new(true),
             });
             msg_send![super(obj), init]
         };
+        unsafe {
+            objc2_foundation::NSDistributedNotificationCenter::defaultCenter()
+                .addObserver_selector_name_object_suspensionBehavior(
+                    &actions,
+                    sel!(openApp:),
+                    Some(&NSString::from_str("com.hyperthymesia.openApp")),
+                    None,
+                    objc2_foundation::NSNotificationSuspensionBehavior::DeliverImmediately,
+                );
+        }
+        let application = NSApplication::sharedApplication(mtm);
+        application.setDelegate(Some(ProtocolObject::from_ref(&*actions)));
         let status = NSStatusBar::systemStatusBar().statusItemWithLength(-1.0);
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
@@ -112,6 +145,17 @@ impl MenuBar {
             )
         };
         health.setEnabled(false);
+        let app = unsafe {
+            let item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Open Hyperthymesia"),
+                Some(sel!(openApp:)),
+                &NSString::from_str(""),
+            );
+            item.setTarget(Some(&actions));
+            item
+        };
+        menu.addItem(&app);
         menu.addItem(&pairing);
         menu.addItem(&health);
         menu.addItem(&toggle);
@@ -119,6 +163,66 @@ impl MenuBar {
         menu.addItem(&pair);
         menu.addItem(&quit);
         status.setMenu(Some(&menu));
+        let main = NSMenu::new(mtm);
+        for (title, entries) in [
+            (
+                "Hyperthymesia",
+                vec![
+                    ("About Hyperthymesia", "orderFrontStandardAboutPanel:", ""),
+                    ("Hide Hyperthymesia", "hide:", "h"),
+                    ("Quit Hyperthymesia", "quit:", "q"),
+                ],
+            ),
+            (
+                "Edit",
+                vec![
+                    ("Undo", "undo:", "z"),
+                    ("Redo", "redo:", "Z"),
+                    ("Cut", "cut:", "x"),
+                    ("Copy", "copy:", "c"),
+                    ("Paste", "paste:", "v"),
+                    ("Select All", "selectAll:", "a"),
+                ],
+            ),
+            (
+                "Window",
+                vec![
+                    ("Open Hyperthymesia", "openApp:", "0"),
+                    ("Minimize", "performMiniaturize:", "m"),
+                    ("Zoom", "performZoom:", ""),
+                    ("Close", "performClose:", "w"),
+                ],
+            ),
+        ] {
+            let root = NSMenuItem::new(mtm);
+            root.setTitle(&NSString::from_str(title));
+            let submenu = NSMenu::new(mtm);
+            submenu.setTitle(&NSString::from_str(title));
+            for (label, action, key) in entries {
+                let item = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &NSString::from_str(label),
+                        Some(objc2::runtime::Sel::register(
+                            &std::ffi::CString::new(action).expect("static menu selector"),
+                        )),
+                        &NSString::from_str(key),
+                    )
+                };
+                if action == "quit:" || action == "openApp:" {
+                    unsafe {
+                        item.setTarget(Some(&actions));
+                    }
+                }
+                submenu.addItem(&item);
+            }
+            root.setSubmenu(Some(&submenu));
+            main.addItem(&root);
+            if title == "Window" {
+                application.setWindowsMenu(Some(&submenu));
+            }
+        }
+        application.setMainMenu(Some(&main));
         let mut this = Self {
             status,
             toggle,
@@ -128,9 +232,22 @@ impl MenuBar {
             permissions,
             pair,
             paired: false,
+            window: None,
         };
         this.update(None);
         Some(this)
+    }
+    pub fn open_app(&mut self, url: &str, token: Option<&str>) -> Result<(), String> {
+        let mtm = self.actions.mtm();
+        self.window
+            .get_or_insert_with(|| super::app_window::AppWindow::new(mtm))
+            .show(url, token, mtm)
+    }
+    pub fn take_open_app(&self) -> bool {
+        self.actions
+            .ivars()
+            .app_requested
+            .swap(false, Ordering::Relaxed)
     }
     pub fn set_paired(&mut self, paired: bool) {
         self.paired = paired;
@@ -186,6 +303,11 @@ impl MenuBar {
 }
 impl Drop for MenuBar {
     fn drop(&mut self) {
+        NSApplication::sharedApplication(self.actions.mtm()).setDelegate(None);
+        unsafe {
+            objc2_foundation::NSDistributedNotificationCenter::defaultCenter()
+                .removeObserver(&self.actions);
+        }
         NSStatusBar::systemStatusBar().removeStatusItem(&self.status);
     }
 }
