@@ -1,5 +1,9 @@
 import { lazy, Suspense, type ReactNode } from "react"
 import { createBrowserRouter, Navigate, Outlet, RouterProvider, type RouteObject } from "react-router"
+import { AddConnectionPage } from "./connections/add"
+import { BrowsePage } from "./connections/browse"
+import { ConnectionPage } from "./connections/connection"
+import { CatalogDetailPage } from "./connections/detail"
 import { FirstRunPage } from "./first-run/first-run"
 import { AgentPage } from "./pages/agent"
 import { ConnectionsPage } from "./pages/connections"
@@ -15,6 +19,10 @@ const children: RouteObject[] = [
   { index: true, element: <Navigate to="/today" replace /> },
   { path: "today", element: <TodayPage /> },
   { path: "connections", element: <ConnectionsPage /> },
+  { path: "connections/browse", element: <BrowsePage /> },
+  { path: "connections/new", element: <AddConnectionPage /> },
+  { path: "connections/catalog/:id", element: <CatalogDetailPage /> },
+  { path: "connections/:id", element: <ConnectionPage /> },
   { path: "agent", element: <AgentPage /> },
   { path: "runs", element: <RunsPage /> },
   { path: "settings", element: <SettingsPage /> },
