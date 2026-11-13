@@ -119,7 +119,7 @@
     "id": "notion",
     "name": "Notion",
     "category": "Notes",
-    "description": "Read pages shared with your integration. Use search with last_edited_time sorting and bounded page/block reads. Only shared pages are accessible. Send Notion-Version: 2025-09-03.",
+    "description": "Read pages shared with your integration. Use search with last_edited_time sorting and bounded page/block reads. Only shared pages are accessible.",
     "auth": "key",
     "requirements": "A read-only API token with access to the described personal data.",
     "variables": [],
