@@ -98,12 +98,20 @@ function RunsPage() {
   const [now, setNow] = useState(() => Date.now())
   const [loadingMore, setLoadingMore] = useState(false)
 
+  // Refresh the newest page; rows and cursors from "Load older" stay.
   const load = useCallback(async () => {
     try {
       const page = await api.runs()
-      setPasses(page.passes)
-      setPulls(page.pulls)
-      setCursor({ pass: page.next_pass_before, pull: page.next_pull_before })
+      const merge = <T extends { id: number }>(fresh: T[], current: T[] | null) => {
+        const oldest = fresh.at(-1)?.id
+        return oldest === undefined ? fresh : [...fresh, ...(current ?? []).filter((row) => row.id < oldest)]
+      }
+      setPasses((current) => merge(page.passes, current))
+      setPulls((current) => merge(page.pulls, current))
+      setCursor((current) => ({
+        pass: current.pass !== null && page.next_pass_before !== null && current.pass < page.next_pass_before ? current.pass : page.next_pass_before,
+        pull: current.pull !== null && page.next_pull_before !== null && current.pull < page.next_pull_before ? current.pull : page.next_pull_before,
+      }))
       setError(null)
       setNow(Date.now())
     } catch (cause) {
