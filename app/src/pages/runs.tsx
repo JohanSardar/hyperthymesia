@@ -1,5 +1,5 @@
 import { RefreshCw } from "lucide-react"
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { api, type Pass, type Pull, type Source } from "../server/api"
 import { PageHeader } from "../shell"
 import { Badge, Button, Empty, IconButton, Page, PageIntro, SearchInput, Segmented, Skeleton, StatusDot } from "../ui"
@@ -97,6 +97,8 @@ function RunsPage() {
   const [query, setQuery] = useState("")
   const [now, setNow] = useState(() => Date.now())
   const [loadingMore, setLoadingMore] = useState(false)
+  // Once older pages are loaded, their cursor (even when used up) outlives refreshes.
+  const paged = useRef({ pass: false, pull: false })
 
   // Refresh the newest page; rows and cursors from "Load older" stay.
   const load = useCallback(async () => {
@@ -109,8 +111,8 @@ function RunsPage() {
       setPasses((current) => merge(page.passes, current))
       setPulls((current) => merge(page.pulls, current))
       setCursor((current) => ({
-        pass: current.pass !== null && page.next_pass_before !== null && current.pass < page.next_pass_before ? current.pass : page.next_pass_before,
-        pull: current.pull !== null && page.next_pull_before !== null && current.pull < page.next_pull_before ? current.pull : page.next_pull_before,
+        pass: paged.current.pass ? current.pass : page.next_pass_before,
+        pull: paged.current.pull ? current.pull : page.next_pull_before,
       }))
       setError(null)
       setNow(Date.now())
@@ -133,10 +135,12 @@ function RunsPage() {
     setLoadingMore(true)
     try {
       if (tab === "passes" && cursor.pass) {
+        paged.current.pass = true
         const page = await api.runs({ pass_before: cursor.pass })
         setPasses((current) => [...(current ?? []), ...page.passes])
         setCursor((c) => ({ ...c, pass: page.passes.length ? page.next_pass_before : null }))
       } else if (tab === "pulls" && cursor.pull) {
+        paged.current.pull = true
         const page = await api.runs({ pull_before: cursor.pull })
         setPulls((current) => [...(current ?? []), ...page.pulls])
         setCursor((c) => ({ ...c, pull: page.pulls.length ? page.next_pull_before : null }))
