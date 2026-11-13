@@ -1,0 +1,71 @@
+.inline-code {
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  background: var(--secondary);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.path {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.row-value {
+  color: var(--muted-1);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.key-row {
+  animation: fade-in var(--duration-base) var(--ease-out);
+}
+
+.key-row[data-revoked] .row-label {
+  color: var(--muted-2);
+  text-decoration: line-through;
+  text-decoration-color: var(--border-3);
+}
+
+.key-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: var(--hairline) solid var(--border-1);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  color: var(--muted-1);
+}
+
+.token-reveal {
+  display: flex;
+  gap: 8px;
+}
+
+.token-reveal .input-secret {
+  flex: 1;
+}
+
+.reach {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 16px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.reach legend {
+  margin-bottom: 6px;
+  padding: 0;
+}
+
+.reach-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}

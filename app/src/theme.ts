@@ -45,5 +45,5 @@ function useTheme() {
   return [theme, useCallback(setTheme, [])] as const
 }
 
-export { useTheme }
+export { setTheme, useTheme }
 export type { Theme }
