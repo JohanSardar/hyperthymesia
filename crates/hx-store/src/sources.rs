@@ -166,6 +166,21 @@ impl Store {
         Ok(source)
     }
 
+    /// Bounded keyset pagination over this source's saved evidence, including undated context.
+    pub async fn source_entries(
+        &self,
+        connector: &str,
+        before: Option<i64>,
+        limit: u16,
+    ) -> Result<Vec<Value>> {
+        let rows: Vec<(i64, Value)> = sqlx::query_as("SELECT id,envelope FROM events WHERE connector_instance=$1 AND ($2 IS NULL OR id<$2) ORDER BY id DESC LIMIT $3")
+            .bind(connector).bind(before).bind(i64::from(limit)).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, envelope)| json!({"id":id,"envelope":envelope}))
+            .collect())
+    }
+
     pub async fn source_cli(&self, id: &str) -> Result<Option<hx_sources::request::CliIdentity>> {
         let row: Option<(String, String, String)> =
             sqlx::query_as("SELECT command,executable,home FROM source_cli WHERE source_id=$1")
@@ -189,11 +204,22 @@ impl Store {
     ) -> Result<(Request, hx_sources::host::HostRunner)> {
         request.validate_cli()?;
         let mut host = host.clone();
+        let mut request = request.clone();
+        if let (
+            Some(Request::Mcp {
+                transport: configured,
+                ..
+            }),
+            Request::Mcp { transport, .. },
+        ) = (self.source_check(id).await?, &mut request)
+        {
+            *transport = configured;
+        }
         let request = if let Some(cli) = self.source_cli(id).await? {
             host.home = cli.home.clone();
-            cli.pin(request)?
+            cli.pin(&request)?
         } else {
-            request.clone()
+            request
         };
         Ok((request, host))
     }
@@ -502,6 +528,15 @@ impl Store {
         sqlx::query("INSERT INTO jobs(output_key,kind,payload,available_at) SELECT 'pull:' || r.id,'pull',json_object('recipe',r.id),$1 FROM recipes r JOIN sources s ON s.id=r.source_id JOIN recipe_state rs ON rs.recipe_id=r.id WHERE r.enabled AND NOT r.owner_off AND s.enabled AND s.status='ready' AND rs.next_run_at<=$1 ON CONFLICT(output_key) DO UPDATE SET state='ready',attempts=0,available_at=EXCLUDED.available_at,last_error=NULL,request_version=jobs.request_version+1 WHERE jobs.state IN ('done','failed')")
             .bind(Ts::from(now)).execute(&mut *tx).await?;
         tx.commit().await
+    }
+
+    /// Retry a ready source's enabled pull without changing its cursor or switches.
+    pub async fn retry_recipe(&self, id: &str) -> Result<bool> {
+        let mut tx = self.begin_write().await?;
+        let changed = sqlx::query("UPDATE recipe_state SET next_run_at=$2 WHERE recipe_id=$1 AND EXISTS(SELECT 1 FROM recipes r JOIN sources s ON s.id=r.source_id WHERE r.id=$1 AND r.enabled AND NOT r.owner_off AND s.enabled AND s.status='ready') AND NOT EXISTS(SELECT 1 FROM jobs WHERE output_key='pull:' || $1 AND state='running')")
+            .bind(id).bind(Ts::now()).execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(changed == 1)
     }
 
     /// Owner-only, and the sole path that may clear a recipe's owner_off.

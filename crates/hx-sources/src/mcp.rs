@@ -90,6 +90,7 @@ fn mcp_error(error: &Value) -> RequestError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute(
     transport: &McpTransport,
     tool: &str,
@@ -98,6 +99,7 @@ pub(crate) async fn execute(
     timeout: Duration,
     host: &HostRunner,
     gate: &impl RequestGate,
+    credentials: Option<&crate::connection::Credentials>,
 ) -> Result<Value, RequestError> {
     if timeout.is_zero() || tool.is_empty() || tool.len() > 256 {
         return Err(RequestError::McpUnavailable);
@@ -105,8 +107,10 @@ pub(crate) async fn execute(
     let call = lookup(tool, substitute_json(arguments, values)?);
     tokio::time::timeout(timeout.min(MAX_TIMEOUT), async {
         match transport {
-            McpTransport::Http { url } => http(url, &call, values, gate).await,
-            McpTransport::Stdio { argv } => stdio(argv, &call, values, host, gate).await,
+            McpTransport::Http { url } => http(url, &call, values, gate, credentials).await,
+            McpTransport::Stdio { argv } => {
+                stdio(argv, &call, values, host, gate, credentials).await
+            }
         }
     })
     .await
@@ -118,6 +122,7 @@ async fn http(
     call: &Value,
     values: Placeholders<'_>,
     gate: &impl RequestGate,
+    credentials: Option<&crate::connection::Credentials>,
 ) -> Result<Value, RequestError> {
     let url = substitute_url(url, values)?;
     let client = reqwest::Client::builder()
@@ -132,13 +137,24 @@ async fn http(
         "accept",
         "application/json, text/event-stream".parse().unwrap(),
     );
-    if let Some(key) = values.key {
+    if let Some(key) = values.key.filter(|_| credentials.is_none()) {
         headers.insert(
             "authorization",
             format!("Bearer {key}")
                 .parse()
                 .map_err(|_| RequestError::Invalid)?,
         );
+    }
+    if let Some(c) = credentials {
+        for (name, value) in &c.headers {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| RequestError::Invalid)?,
+                substitute(value, values)?
+                    .parse()
+                    .map_err(|_| RequestError::Invalid)?,
+            );
+        }
     }
     gate.check().await?;
     let response = client
@@ -231,6 +247,7 @@ async fn stdio(
     values: Placeholders<'_>,
     host: &HostRunner,
     gate: &impl RequestGate,
+    credentials: Option<&crate::connection::Credentials>,
 ) -> Result<Value, RequestError> {
     if argv.first().is_none_or(String::is_empty) {
         return Err(RequestError::CliInvalid);
@@ -240,10 +257,13 @@ async fn stdio(
         .map(|arg| substitute(arg, values).map(|arg| format!("'{}'", arg.replace('\'', "'\\''"))))
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
-    let env = values
+    let mut env = values
         .key
         .map(|key| BTreeMap::from([("SOURCE_KEY".into(), key.into())]))
         .unwrap_or_default();
+    if let Some(c) = credentials {
+        env.extend(c.env.clone());
+    }
     gate.check().await?;
     let mut child = host
         .command(&command, &env)

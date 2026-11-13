@@ -7,6 +7,8 @@ is tokenized differently from the former search engine (for example, `example`
 can match `example.com`); sensitivity and literal namespace filters are unchanged.
 Fixtures in this crate are synthetic.
 
+Connections and Agent clients use the [JSON API contract](../../docs/connection-api.md).
+
 ## Run
 
 For installation, model-provider login and connecting a source, start with the

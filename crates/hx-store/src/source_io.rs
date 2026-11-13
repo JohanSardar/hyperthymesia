@@ -203,12 +203,13 @@ impl SourceExchange {
                 .map_err(|_| RequestError::MissingKey)?;
             // Owner-bound CLIs and OAuth are structured-only: bash must never
             // bypass the pinned identity or expose an opaque credential bundle.
-            if self
-                .store
-                .source_cli(&self.source)
-                .await
-                .map_err(|_| RequestError::Transport)?
-                .is_some()
+            if hx_sources::connection::Credentials::parse(key.as_deref())?.is_some()
+                || self
+                    .store
+                    .source_cli(&self.source)
+                    .await
+                    .map_err(|_| RequestError::Transport)?
+                    .is_some()
                 || key
                     .as_deref()
                     .map(hx_sources::oauth::Credential::parse)
