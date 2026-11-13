@@ -173,7 +173,7 @@ esac
     # Fail-first against the files-only installer: one command must initialize
     # private state and invoke a user service without exposing a supplied secret.
     h = home()
-    result = run(h, '--provider', 'gateway')
+    result = run(h, '--provider', 'vercel', '--model', 'synthetic-model')
     assert result.returncode == 0, result.stderr
     state = h / '.local/state/hyperthymesia'
     assert (state / 'core.sqlite').is_file(), 'one-command install did not migrate'

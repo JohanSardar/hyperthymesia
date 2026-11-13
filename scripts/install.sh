@@ -18,9 +18,9 @@ start_fresh=false
 server_only=false
 app_only=false
 requested_state=
-provider=codex
-model=gpt-6.1-sol
-effort=xhigh
+provider=
+model=
+effort=
 configured=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -41,7 +41,7 @@ while [ "$#" -gt 0 ]; do
                 --state-dir) requested_state=$1 ;;
             esac ;;
         --help)
-            printf '%s\n' 'Usage: install.sh [--provider codex|grok|gateway --model M --effort E --state-dir D] [--dry-run] [--no-setup] [--start-fresh] [--uninstall] [--server-only|--app-only]' \
+            printf '%s\n' 'Usage: install.sh [--provider vercel|codex|grok|gateway --model M --effort E --state-dir D] [--dry-run] [--no-setup] [--start-fresh] [--uninstall] [--server-only|--app-only]' \
                 'Installs a loopback user service; upgrades are backed up and refused during interpret leases.' \
                 'HX_RELEASE_BASE: release download directory (default: GitHub latest/download).' \
                 'HX_FX_RELEASE_BASE: fx download directory; pinned SHA-256 checks always apply.'
@@ -50,8 +50,10 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
-case "$provider" in codex|grok|gateway) ;; *) die 'provider must be codex, grok or gateway' ;; esac
-[ -n "$model" ] && [ -n "$effort" ] || die 'model and effort must not be empty'
+case "$provider" in ""|vercel|codex|grok|gateway) ;; *) die 'provider must be vercel, codex or grok' ;; esac
+if [ -n "$provider$model$effort" ]; then
+    [ -n "$provider" ] && [ -n "$model" ] || die 'choose both provider and model, or leave both for app setup'
+fi
 [ "$server_only$app_only" != truetrue ] || die '--server-only and --app-only conflict'
 : "${HOME:?HOME must be set}"
 case "$HOME" in /*) ;; *) die 'HOME must be absolute' ;; esac
@@ -752,7 +754,7 @@ if [ "$app_only" = false ]; then
             printf 'HX_FX_PROVIDER='; quote "$provider"; printf '\n'
             printf 'HX_FX_MODEL='; quote "$model"; printf '\n'
             printf 'HX_FX_EFFORT='; quote "$effort"; printf '\n'
-            if [ "$provider" = gateway ]; then
+            if { [ "$provider" = gateway ] || [ "$provider" = vercel ]; }; then
                 printf 'AI_GATEWAY_API_KEY='; quote "${AI_GATEWAY_API_KEY:-}"; printf '\n'
             fi
         } > "$state/server.env"
@@ -805,7 +807,7 @@ stopped=false
 trap - 0 HUP INT TERM
 printf 'Installed Hyperthymesia %s. State: %s\n' "${version_dir##*/}" "$state"
 printf 'PATH configured in %s. Open a new shell, or export PATH="$HOME/.local/bin:$PATH".\n' "$startup"
-if [ "$app_only" = false ] && [ "$new_env" = true ] && [ "$provider" = gateway ]; then
+if [ "$app_only" = false ] && [ "$new_env" = true ] && { [ "$provider" = gateway ] || [ "$provider" = vercel ]; }; then
     printf 'Next: set AI_GATEWAY_API_KEY privately in server.env (mode 600).\n'
 fi
 LIFECYCLE

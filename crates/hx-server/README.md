@@ -74,8 +74,9 @@ hold OS locks in `<state-dir>/locks/interpret-<window-start>` so a manual run an
 the job worker cannot buy the same window concurrently. Lock files remain on
 disk; dropping the guard or killing its process releases the lock immediately.
 
-Interpretation uses a stub provider by default. `HX_PROVIDER=fx` selects the
-day-page agent described in the [quickstart](../../README.md); `HX_PROVIDER=claude`
+Interpretation uses the fx day-page agent described in the
+[quickstart](../../README.md), and waits for an explicit provider and model
+choice. `HX_PROVIDER=stub` selects synthetic development; `HX_PROVIDER=claude`
 selects the legacy `claude -p` CLI (model from `HX_MODEL`, default `sonnet`).
 The structured evidence packet excludes restricted content. The fx agent also
 has full host bash: this filter does not isolate files, keys or CLI logins from
@@ -188,7 +189,8 @@ Publishing checks current generation and monotonically advancing revision
 identity. Retry output keys preserve one immutable result per job.
 
 The coordinator's provider wiring point is processing::coordinator_provider.
-The default stub returns empty synthetic interpretations. `HX_PROVIDER=claude`
+The default fx runner waits for a provider and model choice. Explicit
+`HX_PROVIDER=stub` returns empty synthetic interpretations for development. `HX_PROVIDER=claude`
 selects the local Claude CLI, with `HX_MODEL` choosing its model.
 
 Normalize and compile jobs use one durable slot per four-hour window. Ingest
@@ -321,7 +323,7 @@ with mode 0600, including on cancellation. Busy credentials defer the job withou
 spending attempts. Environment variables (including API keys,
 tracing, additional workspaces and user shell configuration) are not inherited.
 No full-access flag is used. The network boundary is fx's denied tools, not an OS
-network sandbox; the harness itself still contacts ChatGPT and the loopback MCP
+network sandbox; the harness itself still contacts the selected model provider and the loopback MCP
 server. Automatic upgrades, session saves, prompt history, titles and sounds are
 disabled. `--system` accepts text, so the compiled-in versioned prompt file's
 contents are passed verbatim, with its version and SHA-256 recorded.

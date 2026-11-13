@@ -23,9 +23,12 @@ fn request_error(error: RequestError) -> anyhow::Error {
 
 impl Broker {
     pub(crate) async fn secret_filter(&self) -> Result<Scrubber> {
-        crate::sources::scrubber(&self.store, None)
-            .await
-            .map_err(|_| failure("source secret filter unavailable", false))
+        crate::sources::scrubber(
+            &self.store,
+            crate::preferences::gateway_key(&self.store)?.as_deref(),
+        )
+        .await
+        .map_err(|_| failure("source secret filter unavailable", false))
     }
 
     pub(crate) async fn connected_sources(&self) -> Result<Value> {

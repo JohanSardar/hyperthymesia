@@ -60,7 +60,7 @@ Only a person (shown one at a time, easy first, only when not done yet):
    requesting to bypass the system private window picker"); the guide says
    "Click Allow." If System Settings also asks "Quit & Reopen / Later", the
    guide says "Click Later.", because it already restarted the app.
-4. Sign in to the model provider in the browser (Codex/ChatGPT or Grok).
+4. Sign in to the model provider in the browser (the provider chosen in Settings).
 
 Setup never clicks, approves or types into a system prompt. The guide panel never
 takes keyboard focus, so every keystroke goes to the password prompt beside it.

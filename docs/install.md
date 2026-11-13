@@ -23,11 +23,11 @@ latest-release installer for the reviewed pin. For workflow-artifact testing,
 run its local install.sh with `HX_RELEASE_BASE=file:///absolute/artifact/directory`;
 that developer path is not the independent public pin or clean-machine proof.
 
-Options: `--provider codex|grok|gateway`, `--model M`, `--effort E`,
+Options: `--provider vercel|codex|grok`, `--model M`, `--effort E`,
 `--state-dir /absolute/local/path`, `--server-only`, `--app-only`, `--dry-run`,
-`--uninstall`, `--start-fresh`. Defaults explicitly select **fx / codex / gpt-6.1-sol / xhigh**.
-Grok/gateway users should select their supported model. Real logins beyond
-Codex still need owner validation; see [provider limitations](provider-limitations.md).
+`--uninstall`, `--start-fresh`. No provider, model or effort is preselected.
+Choose them in the app, or pass both provider and model explicitly. Effort is
+optional and depends on the model. See [provider limitations](provider-limitations.md).
 
 Dry runs verify downloads and list files/service contents without executing
 downloaded binaries, initializing state or contacting service managers. Release
@@ -81,23 +81,19 @@ doctor fails until configured. Missing logins defer jobs without spending an
 attempt. Installation never invokes login, pairing, interpretation or a paid
 model call. Background work follows existing admission and paid sweep rules.
 
-Run the printed private-fx command for Codex/Grok:
+Choose a provider and model in the app. Vercel AI Gateway accepts an API key;
+subscription providers use their own sign-in. The guide names the provider you
+chose. No account with any particular provider is required.
 
-```sh
-FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 \
-  "$HOME/.local/share/hyperthymesia/tools/fx-0.0.16/fx" login codex
-```
+For CLI installations, use the private fx binary with `login PROVIDER`, replacing
+`PROVIDER` with your chosen subscription provider. Doctor requires private login
+files; the login and its parents below HOME must not be symlinks.
 
-Doctor requires a 0600 login file with one hard link. The login and its parents
-below HOME must not be symlinks; a symlinked HOME or HOME ancestor is allowed.
-Defaults: `~/.fx/chatgpt-auth.json` or `~/.fx/grok-auth.json`. A login delayed
-past window end +24h leaves old windows on the one-window-per-day paid sweep.
-
-For gateway, supply `AI_GATEWAY_API_KEY` in the installer's environment or edit
-it privately in `server.env`. Never paste that file into logs/issues. The
-installer never prints it and **keeps the whole file unchanged on rerun**,
-including custom model/credential settings. Passing provider/model/effort
-again does not replace it. Restart the service after environment edits.
+Gateway keys can be saved through the app's Settings API. The server stores them
+privately under `secrets/`, never returns them, and applies changes on the next
+run without restarting. `AI_GATEWAY_API_KEY` in `server.env` remains supported
+for CLI installations. The installer keeps that file unchanged on rerun.
+See the [app API](reference/app-api.md) for the model, Settings and Runs contract.
 
 Load the environment before provider-dependent CLI commands; choose the state
 path above:

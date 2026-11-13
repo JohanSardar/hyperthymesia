@@ -14,14 +14,15 @@ pub enum ProviderConfig {
     ClaudeCli { model: String },
 }
 impl ProviderConfig {
-    /// Select `fx` for the tool agent or `claude` for the legacy CLI; otherwise use the stub.
+    /// Use fx by default. Synthetic development must explicitly select `stub`.
     pub fn from_env() -> Self {
         match std::env::var("HX_PROVIDER").as_deref() {
             Ok("fx") => Self::Fx,
             Ok("claude") => Self::ClaudeCli {
                 model: std::env::var("HX_MODEL").unwrap_or_else(|_| "sonnet".into()),
             },
-            _ => Self::Stub,
+            Ok("stub") => Self::Stub,
+            _ => Self::Fx,
         }
     }
 }

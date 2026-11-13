@@ -9,10 +9,10 @@ Never attach that file to an issue. Restart the service after changing it.
 | --- | --- |
 | `HX_APP_DIST` | Optional runtime web build directory; otherwise debug uses `app/dist` when present and release uses the embedded web build |
 | `HX_STATE_DIR` | No implicit state directory; CLI `--state-dir` takes precedence |
-| `HX_PROVIDER` | Stub unless `fx` or legacy `claude`; installer explicitly writes `fx` |
-| `HX_FX_PROVIDER` | `codex`; supported alternatives `grok`, `gateway` |
-| `HX_FX_MODEL` | `gpt-6.1-sol`; choose a model your selected provider supports |
-| `HX_FX_EFFORT` | `xhigh`; provider/model support is not guaranteed |
+| `HX_PROVIDER` | `fx`; explicit `stub` for synthetic development or legacy `claude` |
+| `HX_FX_PROVIDER` | No default; `vercel`, `codex`, `grok` (`gateway` is a CLI alias) |
+| `HX_FX_MODEL` | No default; choose a model your selected provider supports |
+| `HX_FX_EFFORT` | No default; optional, depends on the selected model |
 | `HX_FX_BINARY` | `$HOME/.local/bin/fx` in source runs; installer sets its private fx 0.0.16 |
 | `HX_FX_CREDENTIAL` | Provider login file override; normally under `~/.fx/` |
 | `HX_FX_TIMEOUT_S` | 1200; positive seconds, invalid/nonpositive values use default |
@@ -31,3 +31,6 @@ Internal installer/recovery variables in the inventory are implementation
 interfaces, not a way to bypass ownership, checksums or migration checks.
 `FX_AUTO_UPGRADE=0`, `FX_DISABLE_KEYCHAIN=1` and `FX_NO_OPEN_BROWSER=1` are fixed
 in managed model execution; do not assume a globally installed fx is used.
+
+The app persists settings in `core.sqlite`; saved app settings override these
+provider/model environment values. See [app API](app-api.md).
