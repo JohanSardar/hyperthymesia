@@ -18,8 +18,7 @@ Opening `Hyperthymesia.app` shows `/app` from the configured server in its own
 WebKit window, with a Dock entry and native Hyperthymesia, Edit and Window menus.
 The menu bar's **Open Hyperthymesia**, Dock reopening, and **Window → Open
 Hyperthymesia** focus the same window. Closing it keeps recording; Quit stops the
-app and recording. The window remembers its size and position, and WebKit keeps
-the web session across launches. Server connection failures offer **Try again**
+app and recording. The window remembers its size and position. Server connection failures offer **Try again**
 in the window. For a paired app using the local server, server startup publishes
 an owner-only `desktop-session.json` in its private state directory. The app
 uses that reader credential to sign its WebKit session in automatically, then

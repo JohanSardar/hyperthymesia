@@ -122,8 +122,10 @@ impl AppWindow {
             let request = NSURLRequest::requestWithURL(&target);
             if let Some(token) = token {
                 let name = NSString::from_str("Set-Cookie");
+                // The native app reseeds this session on launch. A fixed expiry
+                // would send a still-open window back to the token-entry page.
                 let header = NSString::from_str(&format!(
-                    "hx_token={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"
+                    "hx_token={token}; HttpOnly; SameSite=Strict; Path=/"
                 ));
                 let headers = NSDictionary::from_slices(&[&*name], &[&*header]);
                 let cookies =
