@@ -19,7 +19,7 @@ const providers: Provider[] = [
   {
     id: "codex",
     name: "Codex",
-    host: "chatgpt.com",
+    host: "openai.com",
     kind: "signin",
     blurb: "Your ChatGPT plan, signed in through fx on this Mac",
     icon: SquareTerminal,
