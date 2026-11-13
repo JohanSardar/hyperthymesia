@@ -508,6 +508,7 @@ async fn main() -> Result<()> {
             let policy = hx_server::disclosure::DisclosurePolicy::from_env()?;
             let shutdown = shutdown_signal()?;
             let listener = tokio::net::TcpListener::bind(listen).await?;
+            hx_server::desktop::prepare_session(&store, listener.local_addr()?).await?;
             let provider = ProviderConfig::from_env();
             if matches!(provider, ProviderConfig::Stub) {
                 eprintln!(

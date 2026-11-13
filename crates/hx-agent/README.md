@@ -20,7 +20,13 @@ The menu bar's **Open Hyperthymesia**, Dock reopening, and **Window → Open
 Hyperthymesia** focus the same window. Closing it keeps recording; Quit stops the
 app and recording. The window remembers its size and position, and WebKit keeps
 the web session across launches. Server connection failures offer **Try again**
-in the window. No browser tab or extra setup step is added.
+in the window. For a paired app using the local server, server startup publishes
+an owner-only `desktop-session.json` in its private state directory. The app
+uses that reader credential to sign its WebKit session in automatically, then
+loads `/app`. The pairing token stays ingest-only. Installed state is located
+through the installer's `.state-dir` pointer, with `state/` under the agent's
+support directory as the source-install fallback. No browser tab or extra setup
+step is added.
 
 Configuration is read from `~/Library/Application Support/Hyperthymesia/agent.json`;
 missing fields use the defaults in `src/config.rs`. An empty token disables upload.

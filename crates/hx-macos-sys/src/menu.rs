@@ -237,11 +237,11 @@ impl MenuBar {
         this.update(None);
         Some(this)
     }
-    pub fn open_app(&mut self, url: &str) -> Result<(), String> {
+    pub fn open_app(&mut self, url: &str, token: Option<&str>) -> Result<(), String> {
         let mtm = self.actions.mtm();
         self.window
             .get_or_insert_with(|| super::app_window::AppWindow::new(mtm))
-            .show(url, mtm)
+            .show(url, token, mtm)
     }
     pub fn take_open_app(&self) -> bool {
         self.actions

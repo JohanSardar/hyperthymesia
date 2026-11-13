@@ -2,7 +2,9 @@
 use super::*;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSBackingStoreType, NSWindow, NSWindowStyleMask};
-use objc2_foundation::{NSError, NSObject, NSPoint, NSRect, NSSize, NSURL, NSURLRequest};
+use objc2_foundation::{
+    NSDictionary, NSError, NSHTTPCookie, NSObject, NSPoint, NSRect, NSSize, NSURL, NSURLRequest,
+};
 use objc2_web_kit::{
     WKNavigation, WKNavigationAction, WKNavigationDelegate, WKUIDelegate, WKWebView,
     WKWebViewConfiguration, WKWindowFeatures,
@@ -56,6 +58,7 @@ pub(crate) struct AppWindow {
     window: Retained<NSWindow>,
     web: Retained<WKWebView>,
     url: String,
+    token: Option<String>,
     delegate: Retained<WebDelegate>,
 }
 impl AppWindow {
@@ -100,18 +103,52 @@ impl AppWindow {
             window,
             web,
             url: String::new(),
+            token: None,
             delegate,
         }
     }
-    pub fn show(&mut self, url: &str, mtm: MainThreadMarker) -> Result<(), String> {
+    pub fn show(
+        &mut self,
+        url: &str,
+        token: Option<&str>,
+        mtm: MainThreadMarker,
+    ) -> Result<(), String> {
         let target = NSURL::URLWithString(&NSString::from_str(url)).ok_or("Invalid app URL")?;
-        if self.url != url {
+        let at_login = unsafe { self.web.URL() }
+            .and_then(|url| url.path())
+            .is_some_and(|path| path.to_string() == "/login");
+        if self.url != url || self.token.as_deref() != token || (token.is_some() && at_login) {
             *self.delegate.ivars().borrow_mut() = url.to_owned();
             let request = NSURLRequest::requestWithURL(&target);
-            unsafe {
-                self.web.loadRequest(&request);
+            if let Some(token) = token {
+                let name = NSString::from_str("Set-Cookie");
+                let header = NSString::from_str(&format!(
+                    "hx_token={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"
+                ));
+                let headers = NSDictionary::from_slices(&[&*name], &[&*header]);
+                let cookies =
+                    NSHTTPCookie::cookiesWithResponseHeaderFields_forURL(&headers, &target);
+                let cookie = cookies
+                    .firstObject()
+                    .ok_or("Could not establish app session")?;
+                let web = self.web.clone();
+                let ready = RcBlock::new(move || unsafe {
+                    web.loadRequest(&request);
+                });
+                unsafe {
+                    self.web
+                        .configuration()
+                        .websiteDataStore()
+                        .httpCookieStore()
+                        .setCookie_completionHandler(&cookie, Some(&ready));
+                }
+            } else {
+                unsafe {
+                    self.web.loadRequest(&request);
+                }
             }
             self.url = url.to_owned();
+            self.token = token.map(str::to_owned);
         }
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Regular);
@@ -119,7 +156,8 @@ impl AppWindow {
             self.window.deminiaturize(None);
         }
         self.window.makeKeyAndOrderFront(None);
-        app.activate();
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
         Ok(())
     }
 }
