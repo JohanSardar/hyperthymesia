@@ -767,3 +767,6 @@ mod tests {
 
 mod startup;
 pub use startup::register_launch_agent;
+
+mod app_window;
+pub use app_window::request_app_window;

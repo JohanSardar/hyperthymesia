@@ -14,6 +14,14 @@ cargo run -p hx-agent -- run --dry-run --duration-s 62
 scripts/build-app.sh
 ```
 
+Opening `Hyperthymesia.app` shows `/app` from the configured server in its own
+WebKit window, with a Dock entry and native Hyperthymesia, Edit and Window menus.
+The menu bar's **Open Hyperthymesia**, Dock reopening, and **Window → Open
+Hyperthymesia** focus the same window. Closing it keeps recording; Quit stops the
+app and recording. The window remembers its size and position, and WebKit keeps
+the web session across launches. Server connection failures offer **Try again**
+in the window. No browser tab or extra setup step is added.
+
 Configuration is read from `~/Library/Application Support/Hyperthymesia/agent.json`;
 missing fields use the defaults in `src/config.rs`. An empty token disables upload.
 Normal capture uses a WAL SQLite outbox and `agent.sock` in the same directory.

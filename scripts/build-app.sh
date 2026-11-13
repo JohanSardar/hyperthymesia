@@ -28,7 +28,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
 <key>CFBundleVersion</key><string>${version%%[-+]*}</string>
-<key>LSUIElement</key><true/>
+<key>LSUIElement</key><false/>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSAccessibilityUsageDescription</key><string>Record focused window context for your private activity timeline.</string>
 <key>NSScreenCaptureUsageDescription</key><string>Capture screenshots, never video, for your private activity timeline.</string>

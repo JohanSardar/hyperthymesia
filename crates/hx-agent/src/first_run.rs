@@ -64,12 +64,11 @@ impl Onboarding {
     }
     pub fn update(&mut self, menu: &mut MenuBar, warning: Option<&str>) {
         self.setup_guide();
-        if menu.take_open_app() && !cfg!(feature = "e2e-harness") {
+        if menu.take_open_app() {
             match Config::load_at(&self.dir) {
                 Ok(config) => {
                     let url = format!("{}/app", config.server_url.trim_end_matches('/'));
-                    if let Err(error) = std::process::Command::new("/usr/bin/open").arg(url).spawn()
-                    {
+                    if let Err(error) = menu.open_app(&url) {
                         self.message = Some(format!("App could not open: {error}"));
                     }
                 }

@@ -3,7 +3,10 @@
 pub fn run() -> anyhow::Result<()> {
     if !std::env::args_os().any(|arg| arg == "--managed") {
         match hx_agent::startup::install() {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                hx_macos_sys::request_app_window();
+                return Ok(());
+            }
             // Opening the app must still record, even when login startup is off.
             // The singleton socket stops a second copy if launchd did start one.
             Err(error) => eprintln!("recording without login startup: {error}"),
