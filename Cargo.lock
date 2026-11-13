@@ -1214,6 +1214,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "futures-util",
  "getrandom 0.4.3",
  "hex",
  "http-body-util",

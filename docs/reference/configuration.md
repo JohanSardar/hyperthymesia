@@ -7,6 +7,7 @@ Never attach that file to an issue. Restart the service after changing it.
 
 | Setting | Default / meaning |
 | --- | --- |
+| `HX_APP_DIST` | Optional runtime web build directory; otherwise debug uses `app/dist` when present and release uses the embedded web build |
 | `HX_STATE_DIR` | No implicit state directory; CLI `--state-dir` takes precedence |
 | `HX_PROVIDER` | Stub unless `fx` or legacy `claude`; installer explicitly writes `fx` |
 | `HX_FX_PROVIDER` | `codex`; supported alternatives `grok`, `gateway` |
