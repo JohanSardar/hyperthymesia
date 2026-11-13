@@ -19,6 +19,7 @@ Commands:
   serve
   token
   pair       Print a single-use pairing link, valid for 15 minutes
+  setup      Set up this computer: pair the Mac app, guide the few steps only you can do (macOS permissions, model sign-in), then open the dashboard signed in. Safe to run again; it only shows what is left
   compile
   interpret
   gc         Disabled: deleting old media is not yet safe for referenced evidence
@@ -221,6 +222,26 @@ Options:
       --url <URL>              [default: http://127.0.0.1:7377]
       --name <NAME>
   -h, --help                   Print help
+```
+
+## hx-server setup
+
+```text
+Set up this computer: pair the Mac app, guide the few steps only you can do (macOS permissions, model sign-in), then open the dashboard signed in. Safe to run again; it only shows what is left
+
+Usage: hx-server setup [OPTIONS]
+
+Options:
+      --json
+          One JSON line per change for an agent; `say` is what to tell the person
+      --state-dir <STATE_DIR>
+          Local state folder; required for every command except doctor and version [env: HX_STATE_DIR=]
+      --no-open
+          Do not open the dashboard at the end
+      --timeout-minutes <TIMEOUT_MINUTES>
+          Stop waiting after this many minutes; the next run continues [default: 20]
+  -h, --help
+          Print help
 ```
 
 ## hx-server compile

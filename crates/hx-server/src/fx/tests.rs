@@ -7,42 +7,43 @@ fn configured_fx_is_isolated_and_rejects_bad_logins_before_launch() {
     if let Ok(case) = std::env::var("HX_FX_TEST_CASE") {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-                let config = Config::from_env();
-                if case == "default" {
-                    let window = Interval {
-                        start: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        end: "2026-01-01T04:00:00Z".parse().unwrap(),
-                    };
-                    let policy = DisclosurePolicy::default();
-                    let sensitive = SensitiveEgress::from_env();
-                    let namespaces = vec!["synthetic:".into()];
-                    // Verbatim legacy shape, with literal defaults: serialized bytes are the contract.
-                    let legacy = json!({"window":window,"timeline_hash":"synthetic-hash","input_generation":7,"provider":"fx","fx_version":"0.0.16","model":"gpt-6.1-sol","effort":"xhigh","fast":true,"prompt_version":PROMPT_VERSION,"prompt_sha256":hx_store::hash(PROMPT.as_bytes()),"sensitive_egress":sensitive,"disclosure_policy":{"digest":policy.digest(),"policy":policy},"input_namespaces":namespaces});
-                    let manifest = Selection::from_env().unwrap().input_manifest(window, "synthetic-hash", 7, &policy, sensitive, &namespaces);
-                    assert_eq!(serde_json::to_vec(&manifest).unwrap(), serde_json::to_vec(&legacy).unwrap());
-                }
-                let pool = sqlx::sqlite::SqlitePoolOptions::new()
-                    .connect_lazy("sqlite:///nonexistent-fx-fixture.sqlite")
-                    .unwrap();
-                let broker = Broker::new(
-                    Store::new(pool, std::env::var_os("HOME").unwrap()),
-                    DisclosurePolicy::default(),
-                    SensitiveEgress::from_env(),
-                    Interval {
-                        start: "2026-01-01T00:00:00Z".parse().unwrap(),
-                        end: "2026-01-01T04:00:00Z".parse().unwrap(),
-                    },
+            let config = Config::from_env();
+            let store = Store::create(
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("state"),
+            )
+            .await
+            .unwrap();
+            let broker = Broker::new(
+                store,
+                DisclosurePolicy::default(),
+                SensitiveEgress::from_env(),
+                Interval {
+                    start: "2026-01-01T00:00:00Z".parse().unwrap(),
+                    end: "2026-01-01T04:00:00Z".parse().unwrap(),
+                },
+            );
+            let result = run(&config, &broker, "synthetic instruction").await;
+            if case == "default" {
+                assert!(result.is_err());
+                assert!(!config.binary.with_extension("called").exists());
+            } else if let Some(reason) = case.strip_prefix("bad-") {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(
+                    error.contains(reason.split(':').next().unwrap()),
+                    "{case}: {error}"
                 );
-                let result = run(&config, &broker, "synthetic instruction").await;
-                if let Some(reason) = case.strip_prefix("bad-") {
-                    let error = format!("{:#}", result.unwrap_err());
-                    assert!(error.contains(reason.split(':').next().unwrap()), "{case}: {error}");
-                    assert!(!config.binary.with_extension("called").exists());
-                } else {
-                    let result = result.unwrap_or_else(|error| panic!("{error:#}: {}", std::fs::read_to_string(config.binary.with_extension("error")).unwrap_or_default()));
-                    assert_eq!(result["model"], std::env::var("HX_FX_MODEL").unwrap_or_else(|_| MODEL.into()));
-                }
-            });
+                assert!(!config.binary.with_extension("called").exists());
+            } else {
+                let result = result.unwrap_or_else(|error| {
+                    panic!(
+                        "{error:#}: {}",
+                        std::fs::read_to_string(config.binary.with_extension("error"))
+                            .unwrap_or_default()
+                    )
+                });
+                assert_eq!(result["model"], std::env::var("HX_FX_MODEL").unwrap());
+            }
+        });
         return;
     }
     let mut failures = vec![];
@@ -81,11 +82,7 @@ assert settings['provider'] == provider and settings['models'] == {provider: mod
 assert sys.argv[sys.argv.index('--model')+1] == model
 assert sys.argv[sys.argv.index('--effort')+1] == settings['effort']
 assert settings['permission']['*'] == 'deny' and settings['context'] is False
-if model == 'gpt-6.1-sol':
- legacy = {"provider":"codex","models":{"codex":"gpt-6.1-sol"},"context":False,"max_agent_steps":120,"effort":"xhigh","fast_mode":True,"max_tool_result_bytes":65536,"auto_upgrade":False,"session_titles":False,"permission_mode":"ask","permission":{"*":"deny","capability_search":"allow","mcp_select_tool":"allow","mcp_hyperthymesia_*":"allow"},"prompt_history":{"enabled":False},"notifications":{"turn_end":False,"attention_required":False}}
- assert settings_bytes == json.dumps(legacy, sort_keys=True, separators=(',', ':')).encode()
-else:
- assert settings['effort'] == 'low'
+assert settings['effort'] == 'low'
 if provider == 'gateway':
  assert os.environ['AI_GATEWAY_API_KEY'] == 'synthetic-key'
  assert not list((home/'.fx').glob('*auth.json'))
@@ -192,7 +189,7 @@ print(json.dumps({'exit_code':0,'model':model,'steps':2,'final_output':'syntheti
             ));
             continue;
         }
-        if matches!(case, "default" | "codex" | "grok") {
+        if matches!(case, "codex" | "grok") {
             assert_eq!(
                 std::fs::read_to_string(credential).unwrap(),
                 "{\"synthetic_refreshed\":true}"

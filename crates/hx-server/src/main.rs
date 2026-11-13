@@ -209,7 +209,13 @@ async fn main() -> Result<()> {
         if matches!(ProviderConfig::from_env(), ProviderConfig::Stub) {
             bail!("HX_PROVIDER selects the stub; set HX_PROVIDER=fx for real interpretation");
         }
-        hx_server::fx::doctor(&hx_server::fx::Config::from_env()).await?;
+        if let Some(dir) = &cli.state_dir {
+            let store = Store::open(dir).await?;
+            hx_server::fx::doctor_store(&store).await?;
+            store.pool.close().await;
+        } else {
+            hx_server::fx::doctor(&hx_server::fx::Config::from_env()).await?;
+        }
         println!("ok: provider configured, fx version and login checks passed (no model call)");
         return Ok(());
     }

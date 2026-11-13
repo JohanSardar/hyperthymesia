@@ -10,8 +10,10 @@ mod live;
 pub mod mcp;
 mod oauth;
 pub mod ocr;
+mod preferences;
 pub mod processing;
 pub mod pull;
+mod settings_api;
 mod setup;
 pub mod sources;
 use axum::{
@@ -106,6 +108,7 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
             post(connections::switch).layer(DefaultBodyLimit::max(32 * 1024)),
         )
         .merge(sources::router())
+        .merge(settings_api::router())
         .route(
             "/connect/oauth",
             get(oauth::page)

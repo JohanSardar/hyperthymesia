@@ -137,6 +137,8 @@ async fn start_server(cli: &impl Fn() -> Command, scratch: &Path) -> (String, Ch
     let running = cli()
         .args(["serve", "--listen", &address])
         .env("HX_PROVIDER", "fx")
+        .env("HX_FX_PROVIDER", "codex")
+        .env("HX_FX_MODEL", "synthetic-model")
         .env("HX_FX_BINARY", write_scripted_fx(scratch))
         .env("HX_FX_CREDENTIAL", &credential)
         .env("HX_INTERPRET_SETTLE_S", "0")
@@ -197,7 +199,7 @@ print(json.dumps({'exit_code':0,'model':'FX_MODEL','steps':2,'final_output':json
         &binary,
         script
             .replace("FX_VERSION", hx_server::fx::FX_VERSION)
-            .replace("FX_MODEL", hx_server::fx::MODEL)
+            .replace("FX_MODEL", "synthetic-model")
             .replace("SUBJECT", SUBJECT),
     )
     .unwrap();

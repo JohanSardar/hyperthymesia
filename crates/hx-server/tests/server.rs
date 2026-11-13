@@ -2233,6 +2233,7 @@ async fn fx_reads_the_digest_cites_its_printed_times_and_stops_at_the_lookup_cap
     let w = hx_store::window_at(base);
     f.store.normalize_window(w).await.unwrap();
     let scratch = tempfile::tempdir().unwrap();
+    select_test_model(&f.store).await;
     let config = fake_fx(scratch.path(), "digest");
     assert!(
         hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-digest", &config)
@@ -2266,6 +2267,14 @@ async fn fx_reads_the_digest_cites_its_printed_times_and_stops_at_the_lookup_cap
     f.close().await;
 }
 
+async fn select_test_model(store: &Store) {
+    let mut tx = store.begin_write().await.unwrap();
+    sqlx::query("INSERT INTO app_settings(id,value) VALUES(1,$1) ON CONFLICT(id) DO UPDATE SET value=excluded.value")
+        .bind(json!({"model":{"provider":"codex","model":"gpt-6.1-sol","effort":"xhigh"}}).to_string())
+        .execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
 #[cfg(unix)]
 fn fake_fx(dir: &std::path::Path, mode: &str) -> hx_server::fx::Config {
     use std::os::unix::fs::PermissionsExt;
@@ -2283,7 +2292,7 @@ assert settings['context'] is False and settings['permission']['*']=='deny'
 assert settings['permission']['mcp_hyperthymesia_*']=='allow'
 assert 0<settings['max_agent_steps']<=120
 assert work.name=='work' and not (home/'.codex').exists() and not (home/'.claude').exists()
-assert '--no-save' in sys.argv and '--fast' in sys.argv and '--no-ultrafast' in sys.argv
+assert '--no-save' in sys.argv and '--no-fast' in sys.argv and '--no-ultrafast' in sys.argv
 assert sys.argv[sys.argv.index('--effort')+1]=='xhigh'
 assert sys.argv[sys.argv.index('--model')+1]=='gpt-6.1-sol'
 assert 'hx-replica/v9' in sys.argv[sys.argv.index('--system')+1]
@@ -2436,6 +2445,7 @@ async fn fx_attention_intervals_are_citable_time_support() {
     let w = hx_store::window_at(base);
     f.store.normalize_window(w).await.unwrap();
     let scratch = tempfile::tempdir().unwrap();
+    select_test_model(&f.store).await;
     let config = fake_fx(scratch.path(), "attention");
     assert!(
         hx_server::fx::interpret_window(&f.store, w, "synthetic-attention", &config)
@@ -2525,6 +2535,7 @@ async fn fx_validation_supports_citations_beyond_the_exploration_row_cap() {
     let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
     f.store.normalize_window(w).await.unwrap();
     let scratch = tempfile::tempdir().unwrap();
+    select_test_model(&f.store).await;
     let config = fake_fx(scratch.path(), "late");
     assert!(
         hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-late", &config)
@@ -2549,6 +2560,7 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
     f.store.normalize_window(w).await.unwrap();
     let scratch = tempfile::tempdir().unwrap();
+    select_test_model(&f.store).await;
     let config = fake_fx(scratch.path(), "success");
     assert!(
         hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-success", &config)
@@ -2570,7 +2582,7 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     );
     assert_eq!(run["fx_version"], "0.0.16");
     assert_eq!(run["effort"], "xhigh");
-    assert_eq!(run["fast"], true);
+    assert_eq!(run["fast"], false);
     let id = value["episodes"][0]["evidence"][0].as_i64().unwrap();
     assert_eq!(run["evidence"][id.to_string()]["id"], id);
     assert_eq!(
@@ -2625,6 +2637,7 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     // Exercise failures on genuinely new input; identical input now short-circuits.
     f.store.advance_window_generation(w.start).await.unwrap();
     for mode in ["invalid", "failure", "timeout", "rate", "rate-retrying"] {
+        select_test_model(&f.store).await;
         let mut config = fake_fx(scratch.path(), mode);
         if mode == "timeout" {
             config.timeout = std::time::Duration::from_millis(100);
@@ -2669,6 +2682,7 @@ async fn fx_job_success_audit_citations_failure_timeout_and_repair_retention() {
     );
     let stale: i64 = f.store.stale_agent_revision_count().await.unwrap();
     assert_eq!(stale, 0);
+    select_test_model(&f.store).await;
     let config = fake_fx(scratch.path(), "repair-failure");
     assert!(
         hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-repaired", &config)
@@ -2689,6 +2703,7 @@ async fn fx_keeps_the_fuller_answer_when_a_repair_comes_back_empty() {
     let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
     f.store.normalize_window(w).await.unwrap();
     let scratch = tempfile::tempdir().unwrap();
+    select_test_model(&f.store).await;
     let config = fake_fx(scratch.path(), "empty-repair");
     assert!(
         hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-empty-repair", &config)
@@ -2710,6 +2725,7 @@ async fn fx_repair_replaces_only_rejected_episodes_and_keeps_the_rest() {
     let w = hx_store::window_at(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
     f.store.normalize_window(w).await.unwrap();
     let scratch = tempfile::tempdir().unwrap();
+    select_test_model(&f.store).await;
     let config = fake_fx(scratch.path(), "merge-repair");
     assert!(
         hx_server::fx::interpret_window(&f.store, w, "synthetic-fx-merge-repair", &config)
@@ -3082,6 +3098,9 @@ async fn close_launched_fx_errors_spend_paid_budgets() {
                         "--nocapture",
                     ])
                     .env(CASE_ENV, format!("{cadence}:{mode}"))
+                    .env("HX_FX_PROVIDER", "codex")
+                    .env("HX_FX_MODEL", "gpt-6.1-sol")
+                    .env("HX_FX_EFFORT", "xhigh")
                     .env("HX_FX_BINARY", config.binary)
                     .env("HX_FX_CREDENTIAL", config.credential)
                     .env("HX_FX_TIMEOUT_S", "5")
@@ -3244,7 +3263,7 @@ async fn changed_fx_identity_calls_provider(field: &str) {
         .await
         .unwrap();
     let mut identity = json!({"input_generation":generation,"provider":"fx",
-        "model":std::env::var("HX_FX_MODEL").unwrap_or_else(|_| hx_server::fx::MODEL.into()),
+        "model":std::env::var("HX_FX_MODEL").unwrap_or_else(|_| "gpt-6.1-sol".into()),
         "effort":std::env::var("HX_FX_EFFORT").unwrap_or_else(|_| "xhigh".into()),
         "fx_version":hx_server::fx::FX_VERSION,"prompt_version":hx_server::fx::PROMPT_VERSION,
         "sensitive_egress":hx_server::processing::SensitiveEgress::from_env(),
@@ -3255,6 +3274,7 @@ async fn changed_fx_identity_calls_provider(field: &str) {
         .await
         .unwrap();
     let scratch = tempfile::tempdir().unwrap();
+    select_test_model(&f.store).await;
     let config = fake_fx(scratch.path(), "rate");
     let result = hx_server::fx::interpret_window(&f.store, w, "changed-fx-identity", &config).await;
     let calls = std::fs::read_to_string(scratch.path().join("paid-calls")).unwrap_or_default();

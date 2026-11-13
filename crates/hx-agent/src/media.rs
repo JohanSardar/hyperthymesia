@@ -14,6 +14,16 @@ use std::{
     time::{Duration, Instant},
 };
 pub(crate) type LiveHealth = Arc<Mutex<Option<serde_json::Value>>>;
+#[derive(Clone)]
+pub(crate) struct CaptureSwitch {
+    pub paused: Arc<AtomicBool>,
+    pub recording: Arc<AtomicBool>,
+}
+impl CaptureSwitch {
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed) || !self.recording.load(Ordering::Relaxed)
+    }
+}
 struct Session {
     stream: ScreenStream,
     focus: Focus,
@@ -47,7 +57,7 @@ fn run_inner(
     config: Config,
     tx: tokio::sync::mpsc::Sender<Submission>,
     context: Arc<Mutex<Option<Focus>>>,
-    paused: Arc<AtomicBool>,
+    control: CaptureSwitch,
     stop: Arc<AtomicBool>,
     mut failure: Option<String>,
     live: LiveHealth,
@@ -81,7 +91,7 @@ fn run_inner(
             hx_macos_sys::display_asleep(),
         );
         let allowed = active
-            && !paused.load(Ordering::Relaxed)
+            && !control.is_paused()
             && !hx_macos_sys::secure_input()
             && screen
             && focus.as_ref().is_some_and(|f| {
@@ -183,7 +193,7 @@ fn run_inner(
                     f.title = hx_macos_sys::window_title(f);
                 }
                 if now.as_ref() != Some(&s.focus)
-                    || paused.load(Ordering::Relaxed)
+                    || control.is_paused()
                     || hx_macos_sys::secure_input()
                     || !capture_active(
                         hx_macos_sys::idle_seconds(),
@@ -206,7 +216,7 @@ fn run_inner(
                 f.title = hx_macos_sys::window_title(f);
             }
             if now.as_ref() != Some(&s.focus)
-                || paused.load(Ordering::Relaxed)
+                || control.is_paused()
                 || hx_macos_sys::secure_input()
                 || !hx_macos_sys::permissions().screen
                 || !capture_active(
@@ -341,7 +351,7 @@ pub(crate) fn run(
     config: Config,
     tx: tokio::sync::mpsc::Sender<Submission>,
     context: Arc<Mutex<Option<Focus>>>,
-    paused: Arc<AtomicBool>,
+    control: CaptureSwitch,
     stop: Arc<AtomicBool>,
     live: LiveHealth,
 ) -> anyhow::Result<()> {
@@ -355,7 +365,7 @@ pub(crate) fn run(
             config.clone(),
             tx.clone(),
             context.clone(),
-            paused.clone(),
+            control.clone(),
             stop.clone(),
             failure.clone(),
             live.clone(),
@@ -383,7 +393,7 @@ pub(crate) fn run(
         let resume = Instant::now() + backoff;
         let mut was_paused = false;
         while Instant::now() < resume {
-            let is_paused = paused.load(Ordering::Relaxed);
+            let is_paused = control.is_paused();
             if is_paused != was_paused {
                 send_health(
                     &mut producer,

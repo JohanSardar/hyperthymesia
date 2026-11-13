@@ -109,7 +109,7 @@ The separate `e2e-harness` build cannot request permissions or build in release.
     routes = HEADER + "# HTTP route inventory\n\n"
     routes += "All public route registrations, including dashboard forms. See [API contracts](api.md).\n\n"
     routes += "| Method | Path | Implementation |\n| --- | --- | --- |\n"
-    for name in ("lib", "sources", "mcp"):
+    for name in ("lib", "sources", "settings_api", "mcp"):
         path = ROOT / f"crates/hx-server/src/{name}.rs"
         text = path.read_text()
         for match in re.finditer(r'\.route\(\s*"([^"]+)"\s*,', text):

@@ -595,7 +595,7 @@ async fn sigterm_during_fx_run_leaves_no_child() {
 }
 
 #[tokio::test]
-async fn default_stub_warns_even_when_logging_is_disabled() {
+async fn explicit_stub_warns_even_when_logging_is_disabled() {
     use tokio::io::AsyncBufReadExt;
     let f = Fixture::new().await;
     let scratch = tempfile::tempdir().unwrap();
@@ -605,6 +605,7 @@ async fn default_stub_warns_even_when_logging_is_disabled() {
         .env("HOME", scratch.path())
         .env("HX_STATE_DIR", &f.store.data_dir)
         .env("RUST_LOG", "off")
+        .env("HX_PROVIDER", "stub")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

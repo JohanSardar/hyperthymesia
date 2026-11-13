@@ -101,18 +101,29 @@ fn io_worker(
     config: Config,
     rx: tokio::sync::mpsc::Receiver<Submission>,
     stop: Arc<AtomicBool>,
+    recording: Arc<AtomicBool>,
 ) -> Result<()> {
-    let result = io_worker_at(config, rx, stop.clone(), support_dir());
+    let result = io_worker_recording(config, rx, stop.clone(), support_dir(), recording);
     if result.is_err() {
         stop.store(true, Ordering::Relaxed);
     }
     result
 }
+#[cfg(any(test, feature = "e2e-harness"))]
 pub(crate) fn io_worker_at(
     config: Config,
     rx: tokio::sync::mpsc::Receiver<Submission>,
     stop: Arc<AtomicBool>,
     dir: std::path::PathBuf,
+) -> Result<()> {
+    io_worker_recording(config, rx, stop, dir, Arc::new(AtomicBool::new(true)))
+}
+fn io_worker_recording(
+    config: Config,
+    rx: tokio::sync::mpsc::Receiver<Submission>,
+    stop: Arc<AtomicBool>,
+    dir: std::path::PathBuf,
+    recording: Arc<AtomicBool>,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -143,6 +154,24 @@ pub(crate) fn io_worker_at(
                 if ocr_uploader.ocr_once(&mut ocr_outbox,saver).await.is_err() {eprintln!("device OCR retained for retry");}
             }
         });
+        let recording_state = recording.clone();
+        let recording_dir = dir.clone();
+        let recording_config = config.clone();
+        ocr_workers.spawn(async move {
+            let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() else { return; };
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let config = Config::load_at(&recording_dir).unwrap_or_else(|_| recording_config.clone());
+                if config.token.is_empty() { continue; }
+                if let Ok(response) = client.get(format!("{}/v1/recording", config.server_url.trim_end_matches('/'))).bearer_auth(&config.token).send().await
+                    && response.status().is_success()
+                    && let Ok(value) = response.json::<serde_json::Value>().await
+                    && let Some(enabled) = value["enabled"].as_bool() {
+                    recording_state.store(enabled, Ordering::Relaxed);
+                }
+            }
+        });
         loop {tokio::select! {
             _=reload.tick()=>match uploader.reload(&dir) {
                 Ok(true) => next=tokio::time::Instant::now(),
@@ -152,6 +181,10 @@ pub(crate) fn io_worker_at(
             item=rx.recv()=>match item {Some(Submission {mut envelope,reply,focus,secure,blobs})=>{
                 if envelope.kind.as_str()=="collector.health" {envelope.payload["queue_age_ms"]=serde_json::json!(outbox.queue_age_ms()?);
                     if let Some(name)=envelope.payload["collector"].as_str(){let mut payload=envelope.payload.clone();payload["observed_at"]=serde_json::json!(envelope.time.observed_at);latest_health.insert(name.into(),payload);save_health(&dir,&latest_health)?;}
+                }
+                if !recording.load(Ordering::Relaxed) && envelope.kind.as_str() != "collector.health" {
+                    if let Some(reply) = reply { let _=reply.send(true); }
+                    continue;
                 }
                 if let Err(e)=envelope.validate() {eprintln!("dropped invalid {} record: {e}",envelope.kind.as_str());if let Some(reply)=reply {let _=reply.send(false);}continue;}
                 let result=crate::policy::persist(&mut outbox,&policy,focus.as_ref(),secure,&envelope,&blobs);if let Some(reply)=reply {let _=reply.send(matches!(&result,Ok(true)));}
@@ -347,6 +380,7 @@ pub fn run(options: RunOptions) -> Result<()> {
         menu.set_paired(!cfg.token.is_empty());
         menu.update(None);
     }
+    let recording = Arc::new(AtomicBool::new(options.dry_run));
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     let (companion_tx, companion_rx) = mpsc::sync_channel(128);
     let socket = if options.dry_run {
@@ -362,7 +396,12 @@ pub fn run(options: RunOptions) -> Result<()> {
     } else {
         let cfg = cfg.clone();
         let stop = stop.clone();
-        Some(std::thread::spawn(move || io_worker(cfg, rx, stop)))
+        {
+            let recording = recording.clone();
+            Some(std::thread::spawn(move || {
+                io_worker(cfg, rx, stop, recording)
+            }))
+        }
     };
     let capture_context = Arc::new(std::sync::Mutex::new(None::<Focus>));
     let live_media_health = Arc::new(std::sync::Mutex::new(None));
@@ -375,8 +414,16 @@ pub fn run(options: RunOptions) -> Result<()> {
         let context = capture_context.clone();
         let paused = paused.clone();
         let live = live_media_health.clone();
+        let recording = recording.clone();
         Some(std::thread::spawn(move || {
-            crate::media::run(cfg, tx, context, paused, media_stop, live)
+            crate::media::run(
+                cfg,
+                tx,
+                context,
+                crate::media::CaptureSwitch { paused, recording },
+                media_stop,
+                live,
+            )
         }))
     };
     let emit = |envelope: Envelope, reply: Option<mpsc::SyncSender<bool>>| {
@@ -654,7 +701,8 @@ pub fn run(options: RunOptions) -> Result<()> {
                 emit_gap(gap)?;
                 last_gap_update = Instant::now();
             }
-            let content_allowed = !paused.load(Ordering::Relaxed)
+            let content_allowed = recording.load(Ordering::Relaxed)
+                && !paused.load(Ordering::Relaxed)
                 && !locked
                 && !sleeping
                 && !display_off

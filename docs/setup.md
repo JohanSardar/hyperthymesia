@@ -68,36 +68,28 @@ history. Existing installations should follow the [upgrade guide](install.md#upg
 ```sh
 export HX_STATE_DIR="$HOME/.local/state/hyperthymesia-source"
 export HX_PROVIDER=fx
-export HX_FX_PROVIDER=codex
-export HX_FX_MODEL=gpt-6.1-sol
-export HX_FX_EFFORT=xhigh
 umask 077
 hx-server migrate
 touch "$HX_STATE_DIR/server.env" "$HX_STATE_DIR/server.log"
-FX_AUTO_UPGRADE=0 FX_DISABLE_KEYCHAIN=1 "$HX_FX_BINARY" login codex
-chmod 600 "$HOME/.fx/chatgpt-auth.json"
-hx-server doctor
 hx-server token create --name dashboard --prefix source: \
   --prefix macos-agent: --prefix macos-media: --prefix companion: \
   --scopes read_raw,read_l3
 hx-server serve --listen 127.0.0.1:7388
 ```
 
-The login command signs in to your model provider. `doctor` checks local setup
-without calling a model; a successful check does not prove that a real provider
-request will succeed. The empty `server.env` and `server.log` files satisfy its
-service-file checks; this foreground run uses your shell's exports and terminal
-output. The dashboard token prints once. Keep it private: it grants
-raw evidence access and source administration for the listed namespaces.
-Open <http://127.0.0.1:7388/login> and paste it there. Leave the server running;
-Ctrl-C stops it. These exports last for this shell; repeat them when restarting.
-The server listens only on loopback. For another machine, use a private HTTPS
-proxy or SSH tunnel as described in the installer guide.
+No provider, model or effort is preselected. Choose them through the
+[app API](reference/app-api.md), then save a Vercel AI Gateway API key or sign in
+to the subscription provider you chose using `fx login PROVIDER`. Set
+`HX_FX_PROVIDER` and `HX_FX_MODEL` explicitly for an environment-only CLI setup;
+`vercel` selects AI Gateway (`gateway` is also accepted for older installations).
+Set `HX_FX_EFFORT` only when the selected model supports it.
 
-Grok uses `HX_FX_PROVIDER=grok` and `fx login grok`; select a supported model.
-Gateway uses `HX_FX_PROVIDER=gateway` and `AI_GATEWAY_API_KEY` instead of a login
-file. See [provider limitations](provider-limitations.md); real logins beyond Codex
-still need validation.
+The dashboard token prints once. Keep it private: it grants raw evidence access
+and administration for the listed namespaces. Open <http://127.0.0.1:7388/login>
+and paste it there. Leave the server running; Ctrl-C stops it.
+`hx-server doctor` checks local setup without calling a model. The app's explicit
+model check makes one small provider request, which may consume paid usage.
+See [provider limitations](provider-limitations.md).
 
 The state folder contains `core.sqlite`, `agent.sqlite`, `blobs/`, `locks/` and
 source keys in `secrets/`. Keep it private and back it up with

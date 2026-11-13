@@ -2,11 +2,11 @@
 
 Hyperthymesia pins fx 0.0.16. `HX_PROVIDER=fx` selects it;
 `HX_FX_PROVIDER`, `HX_FX_MODEL` and `HX_FX_EFFORT` select the provider/model.
-The installer defaults to `codex`, `gpt-6.1-sol`, `xhigh`.
+Nothing is preselected. The app lists the providers and models fx can use.
 
-- Codex uses a ChatGPT login in `~/.fx/chatgpt-auth.json`.
-- Grok uses `~/.fx/grok-auth.json`.
-- Gateway uses `AI_GATEWAY_API_KEY`.
+- Subscription providers use their own fx login.
+- Vercel AI Gateway uses an API key saved privately through Settings, or
+  `AI_GATEWAY_API_KEY` for CLI installations.
 - Login files must be private regular files with one hard link. fx Keychain
   access and auto-upgrade are disabled. The installer keeps its own fx binary.
 - `doctor` performs local checks, not a provider request. A passing doctor does
@@ -17,7 +17,8 @@ The installer defaults to `codex`, `gpt-6.1-sol`, `xhigh`.
 - Model calls may cost money or consume subscription usage. Installation never
   performs a login or a model request. Source connection setup and day-page runs
   can call models after configuration.
-- The default `HX_PROVIDER` is a stub, not a working AI provider. The legacy
+- The default runner is fx; no inference starts without a chosen model.
+  `HX_PROVIDER=stub` is available for synthetic development. The legacy
   `HX_PROVIDER=claude` path requires a separately installed/authenticated Claude
   CLI; it is not bundled by the installer.
 

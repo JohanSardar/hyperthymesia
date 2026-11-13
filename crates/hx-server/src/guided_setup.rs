@@ -69,16 +69,22 @@ pub async fn run(store: &Store, options: Options) -> Result<i32> {
     }
 
     // 3. Provider sign-in: needed only when doctor fails for a missing login.
-    let provider = std::env::var("HX_FX_PROVIDER").unwrap_or_else(|_| "codex".into());
-    let signin_needed = std::env::var("HX_PROVIDER").as_deref() == Ok("fx")
-        && matches!(provider.as_str(), "codex" | "grok")
-        && crate::fx::doctor(&crate::fx::Config::from_env())
-            .await
-            .is_err();
-    let signin_title = match provider.as_str() {
-        "grok" => "Grok",
-        _ => "ChatGPT",
-    };
+    let provider = crate::preferences::load(store)
+        .await?
+        .model
+        .map(|m| m.provider)
+        .unwrap_or_default();
+    let provider_ready = !provider.is_empty() && crate::fx::doctor_store(store).await.is_ok();
+    let signin_needed = matches!(provider.as_str(), "codex" | "grok") && !provider_ready;
+    let signin_title = provider_title(&provider);
+
+    if provider.is_empty() {
+        out.event(
+            "model",
+            "needs_choice",
+            "Choose your provider and model in the app. Nothing is preselected.",
+        );
+    }
 
     // 4. Human-only steps, guided where they happen.
     let run = ulid::Ulid::generate().to_string();
@@ -88,12 +94,22 @@ pub async fn run(store: &Store, options: Options) -> Result<i32> {
         if signin_needed {
             wanted.push("signin");
         }
-        steps = guide(&out, app, &run, &wanted, signin_title, &options).await?;
+        steps = guide(&out, app, &run, &wanted, &provider, &options, store).await?;
     } else if signin_needed {
-        let state = signin_terminal(&out, &provider, signin_title).await;
+        let state = signin_terminal(&out, &provider, signin_title, store).await;
         steps.push(json!({"id":"signin","state":state}));
     }
-    if !signin_needed && std::env::var("HX_PROVIDER").as_deref() == Ok("fx") {
+    if provider.is_empty() {
+        steps.push(json!({"id":"model","state":"needs_choice"}));
+    } else if !signin_needed && !provider_ready {
+        out.event(
+            "signin",
+            "needs_configuration",
+            &format!("Add your {signin_title} API key in Settings."),
+        );
+        steps.push(json!({"id":"signin","state":"needs_configuration"}));
+    }
+    if provider_ready {
         steps.push(json!({"id":"signin","state":"already_done"}));
     }
 
@@ -339,9 +355,11 @@ async fn guide(
     app: &Path,
     run: &str,
     wanted: &[&str],
-    signin_title: &str,
+    provider: &str,
     options: &Options,
+    store: &Store,
 ) -> Result<Vec<Value>> {
+    let signin_title = provider_title(provider);
     let dir = support_dir().join("setup");
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(dir.join("signin.json"));
@@ -380,7 +398,7 @@ async fn guide(
                 // Start the provider sign-in when the guide reaches it.
                 if id == "signin" {
                     if now == "waiting_user" && signin.is_none() {
-                        signin = Some(Signin::start(&dir, run)?);
+                        signin = Some(Signin::start(&dir, run, provider)?);
                     }
                     if matches!(now.as_str(), "skipped" | "refused" | "failed")
                         && let Some(s) = signin.as_mut()
@@ -403,7 +421,7 @@ async fn guide(
             }
         }
         if let Some(s) = signin.as_mut() {
-            s.poll(&dir, run).await?;
+            s.poll(&dir, run, store).await?;
         }
         if Instant::now() > deadline {
             if let Some(s) = signin.as_mut() {
@@ -440,6 +458,15 @@ fn state_steps(dir: &Path, run: &str) -> Vec<Value> {
         .collect()
 }
 
+fn provider_title(provider: &str) -> &'static str {
+    match provider {
+        "grok" => "Grok",
+        "codex" => "Codex",
+        "vercel" | "gateway" => "Vercel AI Gateway",
+        _ => "your chosen provider",
+    }
+}
+
 // MARK: provider sign-in
 
 /// `fx login` with the browser opening suppressed: the guide opens the page
@@ -452,11 +479,10 @@ struct Signin {
     finished: bool,
 }
 impl Signin {
-    fn start(dir: &Path, run: &str) -> Result<Self> {
+    fn start(dir: &Path, run: &str, provider: &str) -> Result<Self> {
         let config = crate::fx::Config::from_env();
-        let provider = std::env::var("HX_FX_PROVIDER").unwrap_or_else(|_| "codex".into());
         let mut child = Command::new(&config.binary)
-            .args(["login", &provider])
+            .args(["login", provider])
             .env("FX_NO_OPEN_BROWSER", "1")
             .env("FX_AUTO_UPGRADE", "0")
             .env("FX_DISABLE_KEYCHAIN", "1")
@@ -503,7 +529,7 @@ impl Signin {
             finished: false,
         })
     }
-    async fn poll(&mut self, dir: &Path, run: &str) -> Result<()> {
+    async fn poll(&mut self, dir: &Path, run: &str, store: &Store) -> Result<()> {
         if self.finished {
             return Ok(());
         }
@@ -522,10 +548,7 @@ impl Signin {
         if let Some(status) = child.try_wait()? {
             self.finished = true;
             self.child = None;
-            let ok = status.success()
-                && crate::fx::doctor(&crate::fx::Config::from_env())
-                    .await
-                    .is_ok();
+            let ok = status.success() && crate::fx::doctor_store(store).await.is_ok();
             let value = if ok {
                 json!({"run":run,"state":"done"})
             } else {
@@ -545,19 +568,19 @@ impl Signin {
 }
 
 /// Linux has no app to dock a guide in: open the page and wait in the terminal.
-async fn signin_terminal(out: &Out, provider: &str, title: &str) -> &'static str {
+async fn signin_terminal(out: &Out, provider: &str, title: &str, store: &Store) -> &'static str {
     let dir = std::env::temp_dir().join(format!("hx-signin-{}", std::process::id()));
     if std::fs::create_dir_all(&dir).is_err() {
         return "failed";
     }
-    let Ok(mut signin) = Signin::start(&dir, "terminal") else {
+    let Ok(mut signin) = Signin::start(&dir, "terminal", provider) else {
         return "failed";
     };
     let _ = provider;
     let deadline = Instant::now() + Duration::from_secs(600);
     let mut opened = false;
     while Instant::now() < deadline {
-        let _ = signin.poll(&dir, "terminal").await;
+        let _ = signin.poll(&dir, "terminal", store).await;
         if !opened && let Some(url) = signin.url.lock().expect("url").clone() {
             opened = true;
             out.event(
