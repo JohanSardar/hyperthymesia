@@ -36,6 +36,7 @@ for directory in companions/*/; do
     (cd "$directory" && bun install --frozen-lockfile && bun run typecheck && bun run build && bun test)
   fi
 done
+(cd app && bun install --frozen-lockfile && bun run typecheck && bun run build)
 bun test companions/shell-hook
 zsh -n companions/shell-hook/hyperthymesia.zsh
 python3 scripts/scan-personal-data.py
