@@ -64,12 +64,12 @@ impl Onboarding {
     }
     pub fn update(&mut self, menu: &mut MenuBar, warning: Option<&str>) {
         self.setup_guide();
-        if menu.take_open_app() && !cfg!(feature = "e2e-harness") {
+        if menu.take_open_app() {
             match Config::load_at(&self.dir) {
                 Ok(config) => {
                     let url = format!("{}/app", config.server_url.trim_end_matches('/'));
-                    if let Err(error) = std::process::Command::new("/usr/bin/open").arg(url).spawn()
-                    {
+                    let session = desktop_session(&self.dir, &config);
+                    if let Err(error) = menu.open_app(&url, session.as_deref()) {
                         self.message = Some(format!("App could not open: {error}"));
                     }
                 }
@@ -121,4 +121,35 @@ impl Onboarding {
         menu.set_paired(self.paired);
         menu.update(self.message.as_deref().or(warning));
     }
+}
+
+/// Read only same-user local server credentials. Never turn an ingest token into
+/// a reader token, or send the local owner's credential to a remote server.
+fn desktop_session(dir: &std::path::Path, config: &Config) -> Option<String> {
+    let server = reqwest::Url::parse(&config.server_url).ok()?;
+    let host = server.host_str()?;
+    if config.token.is_empty()
+        || server.scheme() != "http"
+        || !host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return None;
+    }
+    let mut state = dir.join("state");
+    if !cfg!(feature = "e2e-harness") {
+        let pointer = std::path::PathBuf::from(std::env::var_os("HOME")?)
+            .join(".local/share/hyperthymesia/.state-dir");
+        if let Ok(path) = std::fs::read_to_string(pointer) {
+            state = path.trim().into();
+        }
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.join("desktop-session.json")).ok()?).ok()?;
+    let session_server = reqwest::Url::parse(value["server_url"].as_str()?).ok()?;
+    if server.origin() != session_server.origin() {
+        return None;
+    }
+    let token = value["token"].as_str()?;
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then(|| token.to_owned())
 }

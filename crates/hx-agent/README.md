@@ -14,6 +14,19 @@ cargo run -p hx-agent -- run --dry-run --duration-s 62
 scripts/build-app.sh
 ```
 
+Opening `Hyperthymesia.app` shows `/app` from the configured server in its own
+WebKit window, with a Dock entry and native Hyperthymesia, Edit and Window menus.
+The menu bar's **Open Hyperthymesia**, Dock reopening, and **Window → Open
+Hyperthymesia** focus the same window. Closing it keeps recording; Quit stops the
+app and recording. The window remembers its size and position. Server connection failures offer **Try again**
+in the window. For a paired app using the local server, server startup publishes
+an owner-only `desktop-session.json` in its private state directory. The app
+uses that reader credential to sign its WebKit session in automatically, then
+loads `/app`. The pairing token stays ingest-only. Installed state is located
+through the installer's `.state-dir` pointer, with `state/` under the agent's
+support directory as the source-install fallback. No browser tab or extra setup
+step is added.
+
 Configuration is read from `~/Library/Application Support/Hyperthymesia/agent.json`;
 missing fields use the defaults in `src/config.rs`. An empty token disables upload.
 Normal capture uses a WAL SQLite outbox and `agent.sock` in the same directory.
