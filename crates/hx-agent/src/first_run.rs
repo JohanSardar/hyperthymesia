@@ -64,6 +64,20 @@ impl Onboarding {
     }
     pub fn update(&mut self, menu: &mut MenuBar, warning: Option<&str>) {
         self.setup_guide();
+        if menu.take_open_app() && !cfg!(feature = "e2e-harness") {
+            match Config::load_at(&self.dir) {
+                Ok(config) => {
+                    let url = format!("{}/app", config.server_url.trim_end_matches('/'));
+                    if let Err(error) = std::process::Command::new("/usr/bin/open").arg(url).spawn()
+                    {
+                        self.message = Some(format!("App could not open: {error}"));
+                    }
+                }
+                Err(error) => {
+                    self.message = Some(format!("App configuration unavailable: {error}"))
+                }
+            }
+        }
         if self.checked.elapsed() >= Duration::from_secs(1) {
             // A malformed edit must not claim that a configured device is unpaired.
             if let Ok(cfg) = Config::load_at(&self.dir) {

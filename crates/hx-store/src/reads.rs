@@ -166,3 +166,45 @@ impl Store {
         sqlx::query_scalar("SELECT json_object('id',a.id,'entity',a.entity,'assertion',json(a.assertion),'evidence',json(a.evidence)) FROM entity_assertions a WHERE ($1 OR sensitivity='normal') AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id IN (SELECT value FROM json_each(a.evidence)) AND NOT EXISTS(SELECT 1 FROM json_each($2) p WHERE substr(e.connector_instance,1,length(p.value))=p.value))").bind(raw).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await
     }
 }
+
+impl Store {
+    /// Committed ingest order, including connector pulls that bypass HTTP ingest.
+    pub async fn entry_log(
+        &self,
+        after: Option<i64>,
+        prefixes: &[String],
+    ) -> Result<Vec<EventRecord>> {
+        let order = if after.is_none() { "DESC" } else { "ASC" };
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT id,received_at,envelope FROM events e WHERE id>$1 AND EXISTS(SELECT 1 FROM json_each($2) p WHERE e.connector_instance=p.value OR (substr(e.connector_instance,1,length(p.value))=p.value AND (substr(p.value,-1)=':' OR substr(e.connector_instance,length(p.value)+1,1)=':'))) ORDER BY id ",
+        );
+        query.push(order).push(" LIMIT 100");
+        let mut rows = query
+            .build_query_as::<EventRecord>()
+            .bind(after.unwrap_or(0))
+            .bind(sqlx::types::Json(prefixes))
+            .fetch_all(&self.pool)
+            .await?;
+        if after.is_none() {
+            rows.reverse();
+        }
+        Ok(rows)
+    }
+
+    pub async fn today_figures(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        prefixes: &[String],
+    ) -> Result<Value> {
+        let (entries, active): (i64, i64) = sqlx::query_as(
+            "SELECT count(*),count(DISTINCT connector_instance) FROM events e WHERE received_at >= $1 AND received_at < $2 AND EXISTS(SELECT 1 FROM json_each($3) p WHERE e.connector_instance=p.value OR (substr(e.connector_instance,1,length(p.value))=p.value AND (substr(p.value,-1)=':' OR substr(e.connector_instance,length(p.value)+1,1)=':')))",
+        ).bind(Ts::from(start)).bind(Ts::from(end)).bind(sqlx::types::Json(prefixes)).fetch_one(&self.pool).await?;
+        let last: Option<Ts> = sqlx::query_scalar(
+            "SELECT max(last_pull_at) FROM sources s WHERE EXISTS(SELECT 1 FROM json_each($1) p WHERE s.connector_instance=p.value OR (substr(s.connector_instance,1,length(p.value))=p.value AND (substr(p.value,-1)=':' OR substr(s.connector_instance,length(p.value)+1,1)=':')))",
+        ).bind(sqlx::types::Json(prefixes)).fetch_one(&self.pool).await?;
+        Ok(
+            json!({"entries_today": entries, "active_sources": active, "last_pull_at": last.map(DateTime::<Utc>::from), "start":start, "end":end}),
+        )
+    }
+}

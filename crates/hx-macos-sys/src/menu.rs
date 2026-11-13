@@ -7,6 +7,7 @@ struct Actions {
     stop: Arc<AtomicBool>,
     quit_requested: Arc<AtomicBool>,
     pair_requested: AtomicBool,
+    app_requested: AtomicBool,
 }
 define_class!(
     #[unsafe(super = NSObject)]
@@ -17,6 +18,8 @@ define_class!(
     impl MenuActions {
         #[unsafe(method(grantPermissions:))]
         fn grant_permissions(&self, _sender: &objc2::runtime::AnyObject) { onboard(); }
+        #[unsafe(method(openApp:))]
+        fn open_app(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().app_requested.store(true, Ordering::Relaxed); }
         #[unsafe(method(pair:))]
         fn pair(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().pair_requested.store(true, Ordering::Relaxed); }
         #[unsafe(method(toggle:))]
@@ -48,6 +51,7 @@ impl MenuBar {
                 stop,
                 quit_requested,
                 pair_requested: AtomicBool::new(false),
+                app_requested: AtomicBool::new(false),
             });
             msg_send![super(obj), init]
         };
@@ -112,6 +116,17 @@ impl MenuBar {
             )
         };
         health.setEnabled(false);
+        let app = unsafe {
+            let item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Open Hyperthymesia"),
+                Some(sel!(openApp:)),
+                &NSString::from_str(""),
+            );
+            item.setTarget(Some(&actions));
+            item
+        };
+        menu.addItem(&app);
         menu.addItem(&pairing);
         menu.addItem(&health);
         menu.addItem(&toggle);
@@ -131,6 +146,12 @@ impl MenuBar {
         };
         this.update(None);
         Some(this)
+    }
+    pub fn take_open_app(&self) -> bool {
+        self.actions
+            .ivars()
+            .app_requested
+            .swap(false, Ordering::Relaxed)
     }
     pub fn set_paired(&mut self, paired: bool) {
         self.paired = paired;

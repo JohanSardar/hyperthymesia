@@ -331,7 +331,7 @@ pub async fn sign_in(
     );
     Ok((
         [(axum::http::header::SET_COOKIE, cookie)],
-        axum::response::Redirect::to("/"),
+        axum::response::Redirect::to("/app"),
     )
         .into_response())
 }
@@ -369,7 +369,7 @@ pub async fn sign_in_link(
             (axum::http::header::SET_COOKIE, cookie),
             (axum::http::header::CACHE_CONTROL, "no-store".into()),
         ],
-        axum::response::Redirect::to("/"),
+        axum::response::Redirect::to("/app"),
     )
         .into_response())
 }

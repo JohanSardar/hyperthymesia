@@ -8,19 +8,21 @@ Production variable names and their implementation references. See [configuratio
 | --- | --- |
 | `AI_GATEWAY_API_KEY` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `CARGO_TARGET_DIR` | [crates/hx-visual/src/lib.rs](../../crates/hx-visual/src/lib.rs) |
-| `FX_AUTO_UPGRADE` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [scripts/install.sh](../../scripts/install.sh) |
-| `FX_DISABLE_KEYCHAIN` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [scripts/install.sh](../../scripts/install.sh) |
+| `FX_AUTO_UPGRADE` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [scripts/install.sh](../../scripts/install.sh) |
+| `FX_DISABLE_KEYCHAIN` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [scripts/install.sh](../../scripts/install.sh) |
 | `FX_HERDR` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_MAX_AGENT_STEPS` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_MODEL` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
-| `FX_NO_OPEN_BROWSER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [scripts/install.sh](../../scripts/install.sh) |
+| `FX_NO_OPEN_BROWSER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [scripts/install.sh](../../scripts/install.sh) |
 | `FX_PERMISSION_MODE` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_PROVIDER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_SOUND` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `GIT_OPTIONAL_LOCKS` | [connectors/git/src/lib.rs](../../connectors/git/src/lib.rs) |
 | `GIT_TERMINAL_PROMPT` | [connectors/git/src/lib.rs](../../connectors/git/src/lib.rs) |
-| `HOME` | [crates/hx-agent/src/config.rs](../../crates/hx-agent/src/config.rs), [crates/hx-agent/src/native_messaging.rs](../../crates/hx-agent/src/native_messaging.rs), [crates/hx-agent/src/startup.rs](../../crates/hx-agent/src/startup.rs), [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs), [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-sources/src/host.rs](../../crates/hx-sources/src/host.rs) |
+| `HOME` | [crates/hx-agent/src/config.rs](../../crates/hx-agent/src/config.rs), [crates/hx-agent/src/native_messaging.rs](../../crates/hx-agent/src/native_messaging.rs), [crates/hx-agent/src/startup.rs](../../crates/hx-agent/src/startup.rs), [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs), [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [crates/hx-server/src/main.rs](../../crates/hx-server/src/main.rs), [crates/hx-sources/src/host.rs](../../crates/hx-sources/src/host.rs) |
+| `HX_APP` | [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs) |
 | `HX_APPLE_TOKEN` | [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs) |
+| `HX_APP_DIST` | [crates/hx-server/src/app.rs](../../crates/hx-server/src/app.rs) |
 | `HX_DISCLOSURE` | [crates/hx-server/src/disclosure.rs](../../crates/hx-server/src/disclosure.rs) |
 | `HX_EGRESS_SENSITIVE` | [crates/hx-server/src/processing.rs](../../crates/hx-server/src/processing.rs) |
 | `HX_FX_BINARY` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [scripts/install.sh](../../scripts/install.sh) |
@@ -28,7 +30,7 @@ Production variable names and their implementation references. See [configuratio
 | `HX_FX_EFFORT` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [scripts/install.sh](../../scripts/install.sh) |
 | `HX_FX_MAX_STEPS` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `HX_FX_MODEL` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [scripts/install.sh](../../scripts/install.sh) |
-| `HX_FX_PROVIDER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [scripts/install.sh](../../scripts/install.sh) |
+| `HX_FX_PROVIDER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [scripts/install.sh](../../scripts/install.sh) |
 | `HX_FX_RELEASE_BASE` | [scripts/install.sh](../../scripts/install.sh) |
 | `HX_FX_TIMEOUT_S` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `HX_HOST_BASH` | [crates/hx-server/src/mcp/schema.rs](../../crates/hx-server/src/mcp/schema.rs) |
@@ -41,10 +43,12 @@ Production variable names and their implementation references. See [configuratio
 | `HX_MCP_TOKEN` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `HX_MODEL` | [crates/hx-server/src/processing.rs](../../crates/hx-server/src/processing.rs) |
 | `HX_MOVE_POSTGRES_URL` | [crates/hx-move/src/main.rs](../../crates/hx-move/src/main.rs) |
-| `HX_PROVIDER` | [crates/hx-server/src/processing.rs](../../crates/hx-server/src/processing.rs), [scripts/install.sh](../../scripts/install.sh) |
+| `HX_PROVIDER` | [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [crates/hx-server/src/processing.rs](../../crates/hx-server/src/processing.rs), [scripts/install.sh](../../scripts/install.sh) |
 | `HX_RELEASE_BASE` | [docs/install](../../docs/install), [scripts/install.sh](../../scripts/install.sh) |
 | `HX_RELEASE_SHA256` | [docs/install](../../docs/install), [scripts/install.sh](../../scripts/install.sh) |
 | `HX_SERVER` | [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs) |
+| `HX_SETUP_DIR` | [crates/hx-agent/src/first_run.rs](../../crates/hx-agent/src/first_run.rs) |
+| `HX_SETUP_ENV` | [crates/hx-server/src/main.rs](../../crates/hx-server/src/main.rs) |
 | `HX_SOURCE` | [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs) |
 | `HX_STATE_DIR` | [crates/hx-move/src/main.rs](../../crates/hx-move/src/main.rs), [crates/hx-server/src/main.rs](../../crates/hx-server/src/main.rs) |
 | `HX_TOKEN` | [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs) |

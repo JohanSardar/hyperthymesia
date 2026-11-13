@@ -1,5 +1,6 @@
 //! Authenticated ingest, evidence API, and a local, escaped day view.
 mod agent_sql;
+mod app;
 mod connections;
 pub mod dashboard;
 pub mod disclosure;
@@ -85,6 +86,11 @@ pub async fn auth(store: &Store, headers: &HeaderMap, scope: &str) -> ApiResult<
 }
 pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
     Router::new()
+        .route("/app", get(app::index))
+        .route("/app/", get(app::index))
+        .route("/app/{*path}", get(app::asset))
+        .route("/v1/entries/stream", get(app::stream))
+        .route("/v1/today", get(app::today))
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/v1/pair", post(pair).layer(DefaultBodyLimit::max(4096)))
         .route("/login", get(dashboard::login).post(dashboard::sign_in))

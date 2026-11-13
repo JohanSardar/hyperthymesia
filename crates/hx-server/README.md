@@ -401,3 +401,46 @@ CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="$PWD/scripts/synthetic-test-runner.py"
 Use the runner variable for your Rust host triple on other platforms. The runner
 keeps connector fixtures from consulting real home directories. The live smoke
 requires explicit binary and credential paths because its test home is empty.
+
+### Web app and Today
+
+`/app` serves the React build from `app/dist`, including nested client routes.
+Sign in through the existing `/login` flow (setup's one-use link now lands on
+`/app`). The Mac menu's **Open Hyperthymesia** opens `/app` on its paired server.
+The server requires `read_raw` for the app and Today endpoints; ingest-only
+credentials cannot read the log. Namespace permissions apply to every figure
+and entry. The existing historical dashboard remains at `/`.
+
+Run `scripts/build-web.sh` before building the server to install dependencies
+with Bun's frozen lockfile and build the UI. Release builds do this automatically
+and embed the result inside `hx-server`: the existing installer, upgrades and
+rollback carry the matching web build without a separate asset directory.
+Until the UI source exists, the binary embeds a placeholder. Debug servers read
+`app/dist` directly when present. `HX_APP_DIST=/absolute/build/path` overrides the
+embedded build at runtime; a missing override returns 503 instead of silently
+showing an old build. Configure the UI bundler's base URL as `/app/`.
+
+Today API (same HttpOnly cookie as the dashboard, or a bearer token):
+
+- `GET /v1/today?utc_offset_min=-360`: JSON with `entries_today`,
+  `active_sources`, `last_pull_at`, `start`, `end`. The offset is minutes east of
+  UTC; omitted means the server's current local offset. Day bounds are fixed
+  offset midnight to midnight. Entries count committed arrivals (`received_at`),
+  including imports of older activity. Active sources count distinct connector
+  instances with arrivals in that day, including Mac recording. Last pull is the
+  latest recorded source pull timestamp, or `null` before any pull.
+- `GET /v1/entries/stream`: Server-Sent Events. An `entries` event contains
+  `{"entries":[{"id":1,"received_at":"…","envelope":{…}}],"cursor":1}`,
+  with the cursor also in the SSE `id` field. Initial connection sends up to 100
+  most recent entries in ascending ingest order. Empty polls send a keepalive
+  comment. Committed arrivals from every producer are polled once per second;
+  duplicates rejected by ingest never appear twice. This is raw owner evidence,
+  so render payload strings as text, never HTML.
+
+Use `new EventSource('/v1/entries/stream')` and listen for `entries` events.
+Browser reconnects send `Last-Event-ID` automatically; it takes precedence over
+`?after=ID`, which can restore a saved cursor after a full page reload. Replay
+returns up to 100 entries per batch in ascending ID order and catches up without
+skipping entries. IDs need not be consecutive. Refresh the figures on arrivals
+and periodically (pulls can finish without adding entries). Token revocation
+ends an open stream at the next poll; a new connection returns 401.

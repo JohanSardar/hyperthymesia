@@ -30,6 +30,7 @@ if [[ "${GITHUB_REF:-}" == refs/tags/* && "${GITHUB_REF#refs/tags/}" != "v$versi
     exit 1
 fi
 
+scripts/build-web.sh
 cargo build --locked --release -p hx-server
 mkdir "$work/server"
 cp "$CARGO_TARGET_DIR/release/hx-server" "$work/server/"
