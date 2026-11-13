@@ -117,6 +117,8 @@ const api = {
     request<{ id: string; connector_instance: string; enabled: boolean; status: SourceStatus }>("/v1/connections", { method: "POST", body }),
   setEnabled: (id: string, enabled: boolean) => request<unknown>(`/v1/connections/${id}`, { method: "PATCH", body: { enabled } }),
   retrySetup: (id: string) => request<unknown>(`/v1/connections/${id}/setup`, { method: "POST", body: {} }),
+  oauthReconnect: (id: string) =>
+    request<{ state: string; authorization_url: string }>("/v1/connections/oauth", { method: "POST", body: { source: id } }),
   reconnect: (id: string, key?: string) => request<unknown>(`/v1/connections/${id}/reconnect`, { method: "POST", body: key ? { key } : {} }),
   setPullEnabled: (id: string, enabled: boolean) => request<unknown>(`/v1/recipes/${id}`, { method: "PATCH", body: { enabled } }),
   setAddonEnabled: (id: string, enabled: boolean) => request<unknown>(`/v1/addons/${id}`, { method: "PATCH", body: { enabled } }),

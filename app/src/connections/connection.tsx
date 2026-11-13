@@ -62,6 +62,17 @@ function ReconnectDialog({ id, name, hasKey, open, onOpenChange, done }: { id: s
   )
 }
 
+/** OAuth grants can't be rechecked; the person signs in again with the provider. */
+async function signInAgain(id: string, name: string) {
+  try {
+    const started = await api.oauthReconnect(id)
+    window.open(started.authorization_url, "_blank", "noopener")
+    toast.info(`Sign in to ${name} in the new tab`, { description: "It reconnects when you're done" })
+  } catch (e) {
+    toast.error(`Couldn't start signing in to ${name}`, { description: e instanceof Error ? e.message : undefined })
+  }
+}
+
 function ConnectionPage() {
   const { id = "" } = useParams()
   const sources = usePolled(api.connections, 5000)
@@ -119,7 +130,7 @@ function ConnectionPage() {
                   </p>
                 </div>
                 {source.status === "needs_reconnect" && (
-                  <Button variant="primary" size="md" onClick={() => setReconnect(true)}>
+                  <Button variant="primary" size="md" onClick={() => (source.oauth ? signInAgain(source.id, source.name) : setReconnect(true))}>
                     Reconnect
                   </Button>
                 )}
