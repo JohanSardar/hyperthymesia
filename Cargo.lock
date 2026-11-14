@@ -1046,42 +1046,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hx-connector-claude-code"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "hx-connector-sdk",
- "hx-schema",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "hx-connector-codex"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "hx-connector-sdk",
- "hx-schema",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "hx-connector-git"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "hx-connector-sdk",
- "hx-schema",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "hx-connector-sdk"
 version = "0.1.0"
 dependencies = [
@@ -1098,18 +1062,6 @@ dependencies = [
  "tempfile",
  "ulid",
  "zstd",
-]
-
-[[package]]
-name = "hx-connector-t3code"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "hx-connector-sdk",
- "hx-schema",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

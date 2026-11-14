@@ -50,7 +50,7 @@ if [[ "${1:-}" == "--anonymize" ]]; then
 fi
 command -v cargo >/dev/null || { echo 'Fixture extraction requires cargo on PATH' >&2; exit 1; }
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-for connector in t3code codex claude-code git apple-bridge; do
+for connector in apple-bridge; do
     destination="fixtures/sources/$connector/envelopes.ndjson"
     # Only anonymized data reaches the temporary file, atomically replacing the sample.
     temporary=$(mktemp "${destination}.XXXXXX")
