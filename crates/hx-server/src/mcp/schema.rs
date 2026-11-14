@@ -11,7 +11,10 @@ fn tool_schema(name: &str) -> (Value, Vec<&str>) {
     let timeout = json!({"type":"integer","minimum":1,"maximum":180});
     let request = json!({"type":"object","description":"Request: {kind:http,method:GET|POST,url,headers?,body?}, {kind:cli,argv,env?}, or {kind:mcp,transport:http|stdio,url|argv,tool,arguments?}. Use tool:tools/list to discover MCP tools. HTTP origin or literal CLI command must be named in the owner's description. Use {{key}}, never a credential value. HTTP defaults to bearer auth; CLI/MCP stdio receive SOURCE_KEY."});
     match name {
-        "read_evidence" => (json!({"id":{"type":"integer"}}), vec!["id"]),
+        "read_evidence" => (
+            json!({"id":{"type":"integer"},"offset":{"type":"integer","minimum":0,"description":"Character offset for the next page of screen text; follow next_offset until null."}}),
+            vec!["id"],
+        ),
         "screen_at" => (
             json!({"time":{"type":"string","format":"date-time"}}),
             vec!["time"],

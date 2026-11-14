@@ -472,6 +472,7 @@ fn doctor_needs_no_database_or_model() {
         command
             .arg("doctor")
             .env_clear()
+            .env("HX_FX_MODEL", "synthetic-model")
             .env("HOME", &home)
             .env("HX_FX_BINARY", binary)
             .env("HX_FX_CREDENTIAL", credential)
@@ -522,6 +523,8 @@ async fn sigterm_during_fx_run_leaves_no_child() {
         .env("HOME", scratch.path())
         .env("HX_STATE_DIR", &f.store.data_dir)
         .env("HX_PROVIDER", "fx")
+        .env("HX_FX_PROVIDER", "codex")
+        .env("HX_FX_MODEL", "synthetic-model")
         .env("HX_FX_BINARY", binary)
         .env("HX_FX_CREDENTIAL", login)
         .env("HX_INTERPRET_SETTLE_S", "0")

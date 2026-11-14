@@ -1,10 +1,30 @@
 # Mac first run and pairing
 
-The unreleased app saves foreground-window JPEG screenshots only, never video
-or audio. Published 0.1.3 and earlier builds also capture video. The macOS
-permission is still named **Screen Recording**. Screenshots default to at most one per 60 seconds in a focused session; unchanged images are
-skipped, and idle/locked/secure/excluded windows remain suppressed. Existing
-video evidence from older builds is retained; this change does not delete it.
+The unreleased app captures the foreground window in memory, reads it locally
+with Apple Vision, and merges the recognized text with accessibility text into
+one `text.snapshot` record. OCR reading order, geometry, confidence and the raw
+accessibility sample are preserved. No new image or video is written to the
+outbox or uploaded. The macOS permission is still named **Screen Recording**.
+Records default to at most one per 60 seconds in a focused session; unchanged
+images are skipped, and idle/locked/secure/excluded windows remain suppressed.
+Only the latest frame waits in memory for the record interval. JPEG encoding and
+recognition run at the cadence tick, just before sending text; unchanged frames
+skip recognition. Images never enter a file, the outbox, or an upload.
+Historical server images and video are unchanged. Pending media from an older
+local build is quarantined in dead letters before upload, so it cannot upload
+pixels or block new text. Preexisting historical bytes are not silently deleted.
+
+`hx-agent screen-text` reads the foreground window once and prints the same
+merged text JSON without opening an outbox, contacting a server, enabling the
+service or requesting permissions. `hx-agent screen-text --replay record.json`
+replays an existing historical JPEG plus an accessibility sample; the JSON names
+`image_path`, `app_bundle_id`, `app_name`, `window_title`, and `accessibility`.
+Neither command writes screen images. Interpreter `read_evidence` supports a
+character `offset` for these records; follow `next_offset` until null to recover
+the full merged text beyond the packet excerpts. The main interpreter digest
+keeps the existing accessibility selection and appends complete OCR plus unique
+accessibility additions in a separate section, so OCR cannot crowd out earlier
+screen content.
 
 `hx-server setup` does all of this for you: it pairs the app with the local
 server and guides each permission beside its System Settings pane. The rest of

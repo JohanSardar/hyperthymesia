@@ -50,7 +50,7 @@ define_class!(
             }).unwrap_or(false);
             if !complete {return;}
             let sample=unsafe {CFRetained::retain(NonNull::from(sample))};
-            if self.ivars().frames.push(Frame {sample,nanos:continuous_nanos()}).is_err(){self.ivars().dropped.fetch_add(1,Ordering::Relaxed);}
+            if self.ivars().frames.force_push(Frame {sample,nanos:continuous_nanos()}).is_some(){self.ivars().dropped.fetch_add(1,Ordering::Relaxed);}
         }
     }
 );
@@ -146,7 +146,8 @@ impl ScreenStream {
                         config.setShowsCursor(false);
                         config.setCapturesAudio(false);
                         let state = Arc::new(OutputState {
-                            frames: ArrayQueue::new(3),
+                            // Consumers only need the newest frame for the next cadence tick.
+                            frames: ArrayQueue::new(1),
                             dropped: AtomicU64::new(0),
                             failure: Mutex::new(None),
                         });

@@ -180,7 +180,7 @@ func stepCopy(_ id: String) -> Copy {
                     done: "Input Monitoring is on", symbol: "keyboard")
     case "screen":
         return Copy(title: "Screen Recording", action: "Switch on Hyperthymesia.",
-                    why: "So it can save one screenshot a minute of the window you’re in.",
+                    why: "So it can read text from the window you’re in. Screen images are never saved.",
                     done: "Screen Recording is on", symbol: "record.circle")
     default:
         return Copy(title: "Sign in to \(signinTitle)", action: "Sign in on the page that just opened.",
@@ -446,7 +446,7 @@ final class Guide: NSObject {
         dock()
     }
 
-    /// Done when the restarted app has saved a screenshot.
+    /// Done when the restarted app has read screen text.
     func tickConfirm() {
         if capturePromptVisible() {
             set(index, "waiting_system", detail: "macos asks")
@@ -462,7 +462,7 @@ final class Guide: NSObject {
         }
         why.stringValue = "macOS may ask once more before the first screenshot."
         if state.steps[index].detail == "macos asks" { set(index, "waiting_system", detail: "confirming") }
-        action.stringValue = "Waiting for the first screenshot…"
+        action.stringValue = "Waiting for the first screen text…"
         let health = support.deletingLastPathComponent().appendingPathComponent("health.json")
         guard let data = try? Data(contentsOf: health),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -472,7 +472,7 @@ final class Guide: NSObject {
         if media["status"] as? String == "running", let last, last >= since.addingTimeInterval(-1) {
             complete()
         } else if Date().timeIntervalSince(since) > 90 {
-            set(index, "done", detail: "switched on; first screenshot not seen yet")
+            set(index, "done", detail: "switched on; first screen text not seen yet")
             advance()
         }
     }
@@ -486,7 +486,7 @@ final class Guide: NSObject {
     func showConfirm() {
         show("screen")
         title.stringValue = "Screen Recording"
-        action.stringValue = "Waiting for the first screenshot…"
+        action.stringValue = "Waiting for the first screen text…"
         why.stringValue = "macOS may ask once more before the first screenshot."
     }
 
@@ -529,7 +529,7 @@ final class Guide: NSObject {
     @objc func skip() {
         guard !advancing else { return }
         if phase == "confirm" {
-            set(index, "done", detail: "switched on; first screenshot not confirmed")
+            set(index, "done", detail: "switched on; first screen text not confirmed")
             next()
             return
         }

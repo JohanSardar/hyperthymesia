@@ -293,10 +293,22 @@ async fn blob(
     axum::http::StatusCode::CREATED
 }
 #[tokio::test]
-async fn uploader_retry_after_restart_deduplicates_without_loss() {
+async fn uploader_retry_after_restart_quarantines_legacy_media_and_delivers_text() {
     let (dir, mut out) = db();
     let (e, b) = media(b"payload");
     out.enqueue(&e, &[b]).unwrap();
+    let mut text = event();
+    text.kind = Kind::new("text.snapshot");
+    text.payload = serde_json::to_value(TextSnapshot {
+        surface: "synthetic.app".into(),
+        source: TextSource::Ocr,
+        text: "Synthetic on-screen text".into(),
+        text_sha256: sha256_hex(b"Synthetic on-screen text"),
+        completeness: Completeness::Partial,
+        visible: Some(true),
+    })
+    .unwrap();
+    out.enqueue(&text, &[]).unwrap();
     let state = Mock::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = listener.local_addr().unwrap();
@@ -319,10 +331,11 @@ async fn uploader_retry_after_restart_deduplicates_without_loss() {
     let mut out = Outbox::open(&dir.path().join("outbox"), 100_000, 8).unwrap();
     let mut uploader = Uploader::new(&config).unwrap();
     uploader.once(&mut out).await.unwrap();
-    assert_eq!(out.stats().unwrap(), (0, 0, 0));
+    assert_eq!(out.stats().unwrap(), (0, 0, 7));
+    assert_eq!(out.dead_letter_count().unwrap(), 1);
     assert_eq!(state.seen.lock().unwrap().len(), 1);
     assert_eq!(state.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(state.blobs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(state.blobs.load(std::sync::atomic::Ordering::SeqCst), 0);
     task.abort();
 }
 

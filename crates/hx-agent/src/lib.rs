@@ -9,6 +9,7 @@ pub mod upload;
 pub use runtime::{RunOptions, run, status};
 
 mod media;
+pub mod screen_text;
 
 mod accessibility;
 

@@ -6,6 +6,7 @@ use crate::{
 };
 use hx_macos_sys::{Focus, Frame, ScreenStream};
 use hx_schema::{kinds::*, *};
+use hx_visual::VisionCliEngine;
 use std::{
     sync::{
         Arc, Mutex,
@@ -52,6 +53,10 @@ impl<T> StillFrames<T> {
         self.last_attempt = Some(now);
         self.latest.as_ref()
     }
+    fn take_sample(&mut self, now: Instant, cadence_s: u64) -> Option<T> {
+        self.sample(now, cadence_s)?;
+        self.latest.take()
+    }
 }
 fn run_inner(
     config: Config,
@@ -72,8 +77,7 @@ fn run_inner(
         blobs: vec![],
     })?;
     let mut session: Option<Session> = None;
-    let mut hour = Instant::now();
-    let mut spent = 0u64;
+    let engine = VisionCliEngine::default();
     let mut last_hash = String::new();
     let mut last_health = Instant::now() - Duration::from_secs(45);
     let mut last_screen = None;
@@ -140,9 +144,9 @@ fn run_inner(
             } else if !allowed {
                 "Screenshots are paused.".into()
             } else {
-                failure
-                    .clone()
-                    .unwrap_or_else(|| "Taking screenshots of the foreground window.".into())
+                failure.clone().unwrap_or_else(|| {
+                    "Reading foreground screen text; images are never saved.".into()
+                })
             };
             send_health(
                 &mut producer,
@@ -178,16 +182,16 @@ fn run_inner(
                 }
             }
         }
-        if hour.elapsed() >= Duration::from_secs(3600) {
-            hour = Instant::now();
-            spent = 0;
-        }
         if let Some(s) = &mut session {
             if let Some(error) = s.stream.failure() {
                 anyhow::bail!("Screen capture stopped: {error}");
             }
+            let mut newest = s.stream.pop();
             while let Some(frame) = s.stream.pop() {
-                // Recheck native focus immediately before encoding or writing any frame.
+                newest = Some(frame);
+            }
+            if let Some(frame) = newest {
+                // Recheck native focus immediately before recognizing any frame.
                 let mut now = hx_macos_sys::frontmost();
                 if let Some(f) = now.as_mut() {
                     f.title = hx_macos_sys::window_title(f);
@@ -206,11 +210,13 @@ fn run_inner(
                 {
                     continue;
                 }
+                // Replace the previous sample without encoding or recognizing it.
+                // Only the latest frame waits in memory for the next cadence tick.
                 s.stills.latest = Some(frame);
             }
             // SCK may stop sending complete frames after the last visual change.
-            // Keep the newest approved sample so the interval can observe a change
-            // that happened between ticks. The hash below suppresses static frames.
+            // Retain the latest frame in memory until its cadence tick, even if
+            // SCK goes idle. Pixels never enter the outbox or a file.
             let mut now = hx_macos_sys::frontmost();
             if let Some(f) = now.as_mut() {
                 f.title = hx_macos_sys::window_title(f);
@@ -237,71 +243,64 @@ fn run_inner(
                 Profile::Balanced => 30,
                 Profile::Saver => 120,
             });
-            if let Some(frame) = s.stills.sample(Instant::now(), cadence) {
-                match frame.jpeg() {
-                    Ok(bytes) => {
-                        let hash = sha256_hex(&bytes);
-                        let Some(trigger) = still_trigger(&last_hash, &hash) else {
-                            continue;
-                        };
-                        if spent.saturating_add(bytes.len() as u64)
-                            > config.still_budget_bytes_per_hour
-                        {
-                            send_health(
-                                &mut producer,
-                                &tx,
-                                &live,
-                                CollectorStatus::Running,
-                                "still skipped: hourly byte budget".into(),
-                                1,
-                            )?;
-                            continue;
-                        }
-                        spent += bytes.len() as u64;
-                        last_hash = hash.clone();
-                        let mut e = producer.core(
-                            format!("still:{}", ulid::Ulid::generate()),
-                            "0",
-                            Operation::Observe,
-                            CorePayload::MediaStill(MediaStill {
-                                display: "main:foreground_window_only".into(),
-                                trigger,
-                                width: s.stream.width,
-                                height: s.stream.height,
-                                app_bundle_id: Some(s.focus.bundle_id.clone()),
-                                window_title: s.focus.title.clone(),
-                            }),
-                        );
-                        e.time = frame_time(e.time, frame.nanos);
-                        let blob = BlobRef {
-                            sha256: hash,
-                            media_type: "image/jpeg".into(),
-                            bytes: bytes.len() as u64,
-                        };
-                        e.blobs.push(blob.clone());
-                        tx.blocking_send(Submission {
-                            envelope: e,
-                            reply: None,
-                            focus: Some(s.focus.clone()),
-                            secure: false,
-                            blobs: vec![(blob, bytes)],
-                        })?;
-                        if failure.take().is_some() {
-                            send_health(
-                                &mut producer,
-                                &tx,
-                                &live,
-                                CollectorStatus::Running,
-                                "Screenshots recovered.".into(),
-                                0,
-                            )?;
-                        }
-                    }
-                    Err(error) => {
-                        failure = Some(error.clone());
-                        send_health(&mut producer, &tx, &live, CollectorStatus::Failed, error, 1)?
-                    }
+            if let Some(frame) = s.stills.take_sample(Instant::now(), cadence) {
+                // Encoding, hashing and OCR happen only for the selected frame.
+                let nanos = frame.nanos;
+                let bytes = frame.jpeg().map_err(anyhow::Error::msg)?;
+                drop(frame);
+                let hash = sha256_hex(&bytes);
+                if hash == last_hash {
+                    continue;
                 }
+                let mut payload = crate::screen_text::recognize(&s.focus, bytes, &engine, || {
+                    hx_macos_sys::window_text(&s.focus, 256, Duration::from_millis(150), 65536)
+                })?;
+                // Recognition may outlive a focus, pause, or policy change.
+                let mut now = hx_macos_sys::frontmost();
+                if let Some(f) = now.as_mut() {
+                    f.title = hx_macos_sys::window_title(f);
+                }
+                if now.as_ref() != Some(&s.focus)
+                    || control.is_paused()
+                    || hx_macos_sys::secure_input()
+                    || !hx_macos_sys::permissions().screen
+                    || !capture_active(
+                        hx_macos_sys::idle_seconds(),
+                        config.idle_threshold_s,
+                        hx_macos_sys::session_locked().unwrap_or(true),
+                        hx_macos_sys::display_asleep(),
+                    )
+                    || !policy.allows(&s.focus.bundle_id, s.focus.title.as_deref())
+                {
+                    continue;
+                }
+                payload["visual_sha256"] = serde_json::json!(hash);
+                last_hash = hash;
+                let mut e = producer.core(
+                    format!("screen-text:{}", ulid::Ulid::generate()),
+                    "0",
+                    Operation::Observe,
+                    CorePayload::TextSnapshot(serde_json::from_value(payload.clone())?),
+                );
+                e.payload = payload;
+                e.time = frame_time(e.time, nanos);
+                tx.blocking_send(Submission {
+                    envelope: e,
+                    reply: None,
+                    focus: Some(s.focus.clone()),
+                    secure: false,
+                    blobs: vec![],
+                })?;
+                s.stills.latest = None;
+                failure = None;
+                send_health(
+                    &mut producer,
+                    &tx,
+                    &live,
+                    CollectorStatus::Running,
+                    "Screen text captured; images are never saved.".into(),
+                    0,
+                )?;
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -317,7 +316,7 @@ fn send_health(
     detail: String,
     dropped: u64,
 ) -> anyhow::Result<()> {
-    let last = p.last_for("media");
+    let last = p.last_for("text");
     let e = p.core(
         format!("media-health:{}", ulid::Ulid::generate()),
         "0",
@@ -355,7 +354,7 @@ pub(crate) fn run(
     stop: Arc<AtomicBool>,
     live: LiveHealth,
 ) -> anyhow::Result<()> {
-    // One failed capture or JPEG conversion must not end screenshots for
+    // One failed capture or OCR operation must not end screenshots for
     // the rest of the session: report it, back off, and start a fresh capture.
     let mut backoff = RESTART_MIN;
     let mut failure = None;
@@ -434,6 +433,7 @@ fn next_backoff(current: Duration) -> Duration {
 fn capture_active(idle_s: f64, threshold_s: u32, locked: bool, asleep: bool) -> bool {
     idle_s.is_finite() && idle_s < threshold_s as f64 && !locked && !asleep
 }
+#[cfg(test)]
 fn still_trigger(previous_hash: &str, hash: &str) -> Option<StillTrigger> {
     if previous_hash == hash {
         None
@@ -472,6 +472,28 @@ mod statechart_regressions {
     }
     #[test]
     fn periodic_still_uses_retained_change_and_skips_static_window() {
+        // One changed frame each second: select exactly the frame at the tick,
+        // with no selections (and hence no encoding/OCR) between ticks.
+        for cadence in [30, 120] {
+            let start = Instant::now();
+            let mut frames = StillFrames::new();
+            let mut selected = Vec::new();
+            for second in 0..=240 {
+                frames.latest = Some(second);
+                if let Some(frame) =
+                    frames.take_sample(start + Duration::from_secs(second), cadence)
+                {
+                    selected.push(frame);
+                    assert!(frames.latest.is_none(), "release the selected frame");
+                }
+            }
+            let expected: Vec<_> = (0..=240).step_by(cadence as usize).collect();
+            assert_eq!(selected, expected);
+            println!(
+                "cadence {cadence}s: 241 changed frames, {} selected for encoding/OCR: {selected:?}",
+                selected.len()
+            );
+        }
         let cadence = Config::default().still_cadence_s;
         assert_eq!(cadence, 60);
         assert_eq!(
