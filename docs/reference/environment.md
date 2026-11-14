@@ -17,9 +17,7 @@ Production variable names and their implementation references. See [configuratio
 | `FX_PERMISSION_MODE` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_PROVIDER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_SOUND` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
-| `GIT_OPTIONAL_LOCKS` | [connectors/git/src/lib.rs](../../connectors/git/src/lib.rs) |
-| `GIT_TERMINAL_PROMPT` | [connectors/git/src/lib.rs](../../connectors/git/src/lib.rs) |
-| `HOME` | [crates/hx-agent/src/config.rs](../../crates/hx-agent/src/config.rs), [crates/hx-agent/src/native_messaging.rs](../../crates/hx-agent/src/native_messaging.rs), [crates/hx-agent/src/startup.rs](../../crates/hx-agent/src/startup.rs), [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs), [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [crates/hx-server/src/main.rs](../../crates/hx-server/src/main.rs), [crates/hx-sources/src/host.rs](../../crates/hx-sources/src/host.rs) |
+| `HOME` | [crates/hx-agent/src/config.rs](../../crates/hx-agent/src/config.rs), [crates/hx-agent/src/first_run.rs](../../crates/hx-agent/src/first_run.rs), [crates/hx-agent/src/native_messaging.rs](../../crates/hx-agent/src/native_messaging.rs), [crates/hx-agent/src/startup.rs](../../crates/hx-agent/src/startup.rs), [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs), [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [crates/hx-server/src/main.rs](../../crates/hx-server/src/main.rs), [crates/hx-sources/src/host.rs](../../crates/hx-sources/src/host.rs) |
 | `HX_APP` | [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs) |
 | `HX_APPLE_TOKEN` | [crates/hx-connector-sdk/src/lib.rs](../../crates/hx-connector-sdk/src/lib.rs) |
 | `HX_APP_DIST` | [crates/hx-server/src/app.rs](../../crates/hx-server/src/app.rs) |

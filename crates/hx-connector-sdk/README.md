@@ -1,21 +1,18 @@
 # Connector SDK
 
-All five binaries support:
+The Apple Bridge connector (`connectors/apple-bridge`) supports:
 
 ```sh
-hx-connector-t3code describe
-hx-connector-t3code sync --dry-run --limit 20
-hx-connector-t3code sync --since 2000-01-01T00:00:00Z
+hx-connector-apple-bridge describe
+hx-connector-apple-bridge sync --dry-run --limit 20
+hx-connector-apple-bridge sync --since 2000-01-01T00:00:00Z
 ```
 
 Set `HX_SERVER` and `HX_TOKEN` for delivery (or `--server` and `--token`).
 `HX_INSTANCE` / `--instance` selects the installation namespace. The default
 hashes the hostname and source location; set an explicit stable instance when
 moving a source or changing hostnames. `HX_SOURCE` / `--source` overrides the
-source database, directory, file, or Apple Bridge base URL. Git also accepts
-repeated `--root` and `--depth` (default: home, depth three); discovery skips
-Library, .Trash, .cache, node_modules, target, and .git directories and symlinks.
-Apple Bridge defaults to its loopback API on port 7780, and uses
+Apple Bridge base URL. Apple Bridge defaults to its loopback API on port 7780, and uses
 `HX_APPLE_TOKEN` / `--apple-token` if authentication is needed. Only its
 `records.query` read operation is invoked.
 
@@ -34,26 +31,12 @@ uploads and checkpoints up to 100 bounded batches per invocation, stopping when
 between batches. A slow source read or upload can exceed that soft time budget.
 Repeat sync if the final report still has `complete:false`. Every batch has its
 own durable pending record and matching acknowledgement before the next scan.
-`--limit` bounds each batch. T3 and Codex consume older records without spending
-the envelope limit on them; source scans also cap raw records at 100,000 per T3
-scan or JSONL file to bound work when everything is excluded. Other sources may
+`--limit` bounds each batch. Sources may
 emit fewer envelopes for metadata-only or excluded records. `--since` filters
 source timestamps inclusively; records with unknown timestamps remain eligible.
 Use a new instance for an independent historical backfill.
 
-Codex cursor maps use versioned, lossless zstd compression (hex encoded in the
-state JSON); legacy maps are read and upgraded on the next acknowledged batch.
-Offsets, rotation anchors, and parsing context remain intact. File names and
-mtime are not used as timestamp filters: rollouts may contain later appended
-records or timestamps out of order.
 
-Codex tails both plain and zstd rollouts, with offsets in decompressed bytes for
-zstd. Claude tails project/subagent logs and the history index. Native identities
-survive replay and rotation. History index entries and T3-linked provider records
-carry `claim_scope` provenance labels; normalizers must use their `session`,
-`same_as`, and `parent` links when reconciling evidence. Neither source proves
-human attention. Agent strings, including nested native tool provenance, are
-capped at 32 KiB per string and marked `text_truncated` if any string was capped.
 
 Apple snapshots include tombstones and resume pagination; a completed snapshot
 starts another revision reconciliation pass on the next sync. No absence is
