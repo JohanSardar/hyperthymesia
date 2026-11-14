@@ -59,14 +59,16 @@ pub fn persist(
     envelope: &hx_schema::Envelope,
     blobs: &[(hx_schema::BlobRef, Vec<u8>)],
 ) -> anyhow::Result<bool> {
-    // Capture is screenshots-only, including companion submissions. Keep legacy
-    // video readable on the server, but never persist new video on this Mac.
-    if envelope.kind.as_str() == "media.chunk"
+    // No screen images or video may enter the outbox, including companion submissions.
+    if matches!(envelope.kind.as_str(), "media.chunk" | "media.still")
         || envelope
             .blobs
             .iter()
             .chain(blobs.iter().map(|(blob, _)| blob))
-            .any(|blob| blob.media_type.to_ascii_lowercase().starts_with("video/"))
+            .any(|blob| {
+                blob.media_type.to_ascii_lowercase().starts_with("video/")
+                    || blob.media_type.to_ascii_lowercase().starts_with("image/")
+            })
     {
         return Ok(false);
     }

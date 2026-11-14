@@ -25,12 +25,6 @@ pub struct Loss {
     pub sha256: String,
     pub bytes: u64,
 }
-/// Durable OCR metadata only. Recognized text never enters SQLite.
-#[derive(Clone)]
-pub(crate) struct OcrJob {
-    pub sha: String,
-    pub attempts: u32,
-}
 impl Outbox {
     pub fn open(path: &Path, event_budget: u64, media_budget: u64) -> Result<Self> {
         let db = Connection::open(path)?;
@@ -444,6 +438,30 @@ impl Outbox {
         tx.commit()?;
         Ok(())
     }
+    /// Isolate records left by older capture builds without sending their pixels
+    /// or letting them block delivery of new text. Preserve historical bytes in
+    /// dead letters; this upgrade never silently destroys preexisting evidence.
+    pub(crate) fn quarantine_screen_media(&mut self) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let rows = tx.prepare("SELECT id,json FROM events WHERE json_extract(json,'$.kind') IN ('media.still','media.chunk') OR EXISTS (SELECT 1 FROM json_each(events.json,'$.blobs') WHERE lower(json_extract(value,'$.media_type')) LIKE 'image/%' OR lower(json_extract(value,'$.media_type')) LIKE 'video/%')")?
+            .query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,Vec<u8>>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !rows.is_empty() {
+            // A replacement batch gets a new id; safe events remain queued and
+            // server observation identity still provides retry deduplication.
+            tx.execute("DELETE FROM pending", [])?;
+        }
+        for (id, bytes) in rows {
+            let e: Envelope = serde_json::from_slice(&bytes)?;
+            let identity = e.observation_id.to_string();
+            tx.execute("INSERT OR IGNORE INTO dead_letters(identity,batch_id,json,reason) VALUES(?,'text-only-upgrade',?,'legacy_screen_media_never_upload')", params![identity,bytes])?;
+            tx.execute("INSERT OR IGNORE INTO dead_letter_refs(identity,sha) SELECT ?,sha FROM refs WHERE event=?", params![identity,id])?;
+            tx.execute("DELETE FROM refs WHERE event=?", [id])?;
+            tx.execute("DELETE FROM events WHERE id=?", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn batch(&mut self) -> Result<Option<UploadBatch>> {
         if let Some(json) = self
             .db
@@ -487,9 +505,6 @@ impl Outbox {
             .optional()?)
     }
     pub fn ack(&mut self, ack: &UploadAck) -> Result<()> {
-        self.ack_with_ocr(ack, false)
-    }
-    pub(crate) fn ack_with_ocr(&mut self, ack: &UploadAck, device_ocr: bool) -> Result<()> {
         let Some(batch) = self.batch()? else {
             anyhow::bail!("no pending batch");
         };
@@ -518,18 +533,6 @@ impl Outbox {
             }
         }
         for e in batch.envelopes {
-            if device_ocr
-                && e.kind.as_str() == "media.still"
-                && !ack
-                    .rejected
-                    .iter()
-                    .any(|r| r.observation_id == e.observation_id)
-            {
-                for blob in &e.blobs {
-                    tx.execute("INSERT OR IGNORE INTO ocr_queue(sha,connector,device,display,app,captured) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM blobs WHERE sha=?) AND NOT EXISTS(SELECT 1 FROM ocr_history WHERE sha=?)",
-                        params![blob.sha256,e.connector_instance.as_str(),e.device.as_ref().map(|d| d.as_str()),e.payload["display"].as_str(),e.payload["app_bundle_id"].as_str(),e.time.source_start.unwrap_or(e.time.observed_at).timestamp_millis(),blob.sha256,blob.sha256])?;
-                }
-            }
             tx.execute(
                 "DELETE FROM refs WHERE event IN (SELECT id FROM events WHERE identity=?)",
                 [e.observation_id.to_string()],
@@ -548,41 +551,6 @@ impl Outbox {
             [],
         )?;
         tx.execute("DELETE FROM pending", [])?;
-        tx.commit()?;
-        Ok(())
-    }
-    pub(crate) fn next_ocr(&self, now_ms: i64) -> Result<Option<OcrJob>> {
-        Ok(self.db.query_row("SELECT sha,attempts FROM ocr_queue WHERE available<=? ORDER BY captured,sha LIMIT 1", [now_ms], |r| Ok(OcrJob { sha: r.get(0)?, attempts: r.get(1)? })).optional()?)
-    }
-    pub(crate) fn previous_ocr(&self, sha: &str, version: &str) -> Result<Option<(String, u64)>> {
-        let prior: Option<(String, String)> = self.db.query_row("SELECT h.sha,h.perceptual_hash FROM ocr_history h JOIN ocr_queue q ON q.sha=? WHERE h.engine_version=? AND h.connector=q.connector AND h.device IS q.device AND h.display IS q.display AND h.app IS q.app AND h.captured BETWEEN q.captured-30000 AND q.captured ORDER BY h.captured DESC,h.rowid DESC LIMIT 1", params![sha,version], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-        prior
-            .map(|(sha, hash)| Ok((sha, u64::from_str_radix(&hash, 16)?)))
-            .transpose()
-    }
-    pub(crate) fn fail_ocr(&mut self, sha: &str, now_ms: i64) -> Result<()> {
-        self.db.execute(
-            "UPDATE ocr_queue SET attempts=attempts+1,available=? WHERE sha=?",
-            params![now_ms.saturating_add(30000), sha],
-        )?;
-        Ok(())
-    }
-    /// The server refused this still's result for good, so its text is given up.
-    pub(crate) fn discard_ocr(&mut self, sha: &str) -> Result<()> {
-        let tx = self.db.transaction()?;
-        tx.execute("DELETE FROM ocr_queue WHERE sha=?", [sha])?;
-        tx.execute("DELETE FROM blobs WHERE sha=? AND sha NOT IN (SELECT sha FROM refs UNION SELECT sha FROM dead_letter_refs)", [sha])?;
-        tx.commit()?;
-        Ok(())
-    }
-    pub(crate) fn finish_ocr(&mut self, sha: &str, request: &protocol::OcrRequest) -> Result<()> {
-        let tx = self.db.transaction()?;
-        if request.status == protocol::OcrStatus::Complete {
-            tx.execute("INSERT OR REPLACE INTO ocr_history SELECT sha,connector,device,display,app,captured,?,? FROM ocr_queue WHERE sha=?", params![request.engine_version,request.perceptual_hash,sha])?;
-            tx.execute("DELETE FROM ocr_history WHERE captured < (SELECT MAX(captured)-30000 FROM ocr_history)", [])?;
-        }
-        tx.execute("DELETE FROM ocr_queue WHERE sha=?", [sha])?;
-        tx.execute("DELETE FROM blobs WHERE sha NOT IN (SELECT sha FROM refs UNION SELECT sha FROM dead_letter_refs UNION SELECT sha FROM ocr_queue)", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -836,7 +804,12 @@ CREATE TABLE IF NOT EXISTS dead_letters (identity TEXT PRIMARY KEY, batch_id TEX
         );
         assert_eq!(outbox.batch().unwrap().unwrap(), batch);
         assert!(
-            outbox.next_ocr(i64::MAX).unwrap().is_none(),
+            outbox
+                .db
+                .query_row("SELECT COUNT(*) FROM ocr_queue", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap()
+                == 0,
             "no backfill of existing stills"
         );
         assert_eq!(outbox.blob(&sha).unwrap().unwrap().1, bytes);

@@ -31,6 +31,12 @@ enum Command {
         replace: bool,
     },
     Status,
+    /// Recognize the foreground screen once; output text JSON only, without recording.
+    ScreenText {
+        /// Replay an existing image with its accessibility sample from a JSON record.
+        #[arg(long)]
+        replay: Option<std::path::PathBuf>,
+    },
     Onboard,
     NmHost,
     InstallNmHost {

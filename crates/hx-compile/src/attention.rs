@@ -151,7 +151,21 @@ pub(super) fn derive(
                         still = None;
                         changed = None;
                     }
-                    Some(Ok(Payload::TextSnapshot(_))) => text = Some(o),
+                    Some(Ok(Payload::TextSnapshot(p))) => {
+                        text = Some(o);
+                        // Text-only screen capture retains a change fingerprint,
+                        // never pixels. Preserve the former still's attention signal.
+                        if let Some(hash) = o.envelope.payload["visual_sha256"].as_str() {
+                            let key = ("screen-text".to_owned(), p.surface);
+                            if let Some((previous_hash, previous)) =
+                                hashes.insert(key, (hash.to_owned(), o))
+                                && previous_hash != hash
+                            {
+                                changed = Some((previous, o));
+                            }
+                            still = Some(o);
+                        }
+                    }
                     Some(Ok(Payload::PresenceSpan(_))) => presence = Some(o),
                     Some(Ok(Payload::InputBucket(_))) if input(o) => last_input = Some(o),
                     Some(Ok(Payload::MediaStill(_))) | Some(Ok(Payload::MediaChunk(_))) => {

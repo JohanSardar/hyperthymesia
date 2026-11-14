@@ -354,7 +354,18 @@ impl Broker {
         if !self.visible(e) {
             return Ok(vec![]);
         }
-        let text = json!({"connector_instance":e.connector_instance,"observation_id":e.observation_id,"source_key":e.source_key,"revision":e.revision,"operation":e.operation,"actor":e.actor,"time":e.time,"device":e.device,"subject":e.subject,"resource":e.resource,"links":e.links,"payload":e.payload}).to_string();
+        // Project the readable union first. Duplicated raw OCR geometry and AX
+        // text must not crowd the actual screen content out of the packet.
+        let screen_text = e.kind.as_str() == "text.snapshot" && e.payload.get("ocr").is_some();
+        let text = if screen_text {
+            json!({"connector_instance":e.connector_instance,"time":e.time,
+                "app_bundle_id":e.payload["app_bundle_id"],"window_title":e.payload["window_title"],
+                "text":e.payload["text"],"completeness":e.payload["completeness"],
+                "full_text_tool":"read_evidence","offset":0})
+            .to_string()
+        } else {
+            json!({"connector_instance":e.connector_instance,"observation_id":e.observation_id,"source_key":e.source_key,"revision":e.revision,"operation":e.operation,"actor":e.actor,"time":e.time,"device":e.device,"subject":e.subject,"resource":e.resource,"links":e.links,"payload":e.payload}).to_string()
+        };
         let text = if text.len() > 12 * 1024 {
             json!({"connector_instance":e.connector_instance,"time":e.time,"device":e.device,"text_excerpt":bounded(&text,8192),"truncated":true}).to_string()
         } else {
@@ -847,8 +858,24 @@ impl Broker {
                         json!({"evidence":self.project(source, &e).await?.into_iter().filter(|e| e.id==id).collect::<Vec<_>>()}),
                     )
                 } else {
-                    let e = serde_json::from_value(value["envelope"].clone())?;
-                    Ok(json!({"evidence":self.project(id, &e).await?}))
+                    let e: Envelope = serde_json::from_value(value["envelope"].clone())?;
+                    if e.kind.as_str() == "text.snapshot" && e.payload.get("ocr").is_some() {
+                        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+                        let text = e.payload["text"].as_str().unwrap_or_default();
+                        let page: String = text.chars().skip(offset).take(4096).collect();
+                        let end = offset.saturating_add(page.chars().count());
+                        let total = text.chars().count();
+                        Ok(json!({"evidence":[EvidenceItem {
+                            effective_class:self.policy.effective_class(&e), id,
+                            at:e.time.source_start.unwrap_or(e.time.observed_at),
+                            kind:format!("normal:{}",e.kind),
+                            text:json!({"text":page,"offset":offset,"total_chars":total,
+                                "next_offset":if end < total {Some(end)} else {None}}).to_string(),
+                            self_generated:crate::processing::self_generated(&e),
+                        }]}))
+                    } else {
+                        Ok(json!({"evidence":self.project(id, &e).await?}))
+                    }
                 }
             }
             "screen_at" => {

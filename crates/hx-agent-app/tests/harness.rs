@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[tokio::test]
-async fn harness_pairs_after_start_and_uploads_synthetic_jpeg_without_capture() {
+async fn harness_pairs_after_start_and_uploads_only_synthetic_screen_text() {
     let scratch = tempfile::tempdir().unwrap();
     let support = scratch.path().join("support");
     let jpeg_path = scratch.path().join("synthetic.jpg");
@@ -86,7 +86,7 @@ async fn harness_pairs_after_start_and_uploads_synthetic_jpeg_without_capture() 
             .unwrap()
             .unwrap()
             .as_deref(),
-        Some("Synthetic JPEG queued.")
+        Some("Synthetic screen text queued.")
     );
     assert!(
         !support.join("agent.json").exists(),
@@ -102,15 +102,23 @@ async fn harness_pairs_after_start_and_uploads_synthetic_jpeg_without_capture() 
     let batch = result
         .expect("harness must hot-reload pairing and upload")
         .unwrap();
-    assert_eq!(*blobs.lock().unwrap(), vec![jpeg.clone()]);
+    assert!(
+        blobs.lock().unwrap().is_empty(),
+        "screen images must never upload"
+    );
     assert_eq!(batch.envelopes.len(), 1, "no native collectors may run");
     let still = &batch.envelopes[0];
-    assert_eq!(still.kind.as_str(), "media.still");
+    assert_eq!(still.kind.as_str(), "text.snapshot");
     assert_eq!(
         still.connector_instance.as_str(),
         "macos-media:synthetic-e2e"
     );
-    assert_eq!(still.blobs[0].sha256, hx_schema::sha256_hex(&jpeg));
-    assert_eq!(still.payload["width"], 8);
-    assert_eq!(still.payload["height"], 8);
+    assert!(still.blobs.is_empty());
+    assert_eq!(still.payload["source"], "ocr");
+    assert!(
+        still.payload["text"]
+            .as_str()
+            .unwrap()
+            .contains("Synthetic fixture")
+    );
 }

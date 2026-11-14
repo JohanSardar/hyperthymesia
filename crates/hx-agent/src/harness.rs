@@ -59,32 +59,18 @@ pub fn main() -> Result<()> {
     let worker = std::thread::spawn(move || io_worker_at(worker_cfg, rx, worker_stop, dir));
     let result = (|| -> Result<()> {
         if let Some(path) = options.seed_jpeg {
-            let data = std::fs::read(path)?;
-            let (width, height) = image::ImageReader::with_format(
-                std::io::Cursor::new(&data),
-                image::ImageFormat::Jpeg,
-            )
-            .into_dimensions()?;
-            let blob = BlobRef {
-                sha256: sha256_hex(&data),
-                media_type: "image/jpeg".into(),
-                bytes: data.len() as u64,
-            };
+            let payload = crate::screen_text::replay(&serde_json::json!({
+                "image_path":path, "app_bundle_id":"com.hyperthymesia.agent.e2e",
+                "app_name":"Synthetic", "window_title":"Synthetic fixture",
+            }))?;
             let mut producer = Producer::new(cfg.device_id)?.namespace("macos-media");
             let mut envelope = producer.core(
                 format!("synthetic:{}", ulid::Ulid::generate()),
                 "0",
                 Operation::Observe,
-                CorePayload::MediaStill(MediaStill {
-                    display: "synthetic".into(),
-                    trigger: StillTrigger::FocusChange,
-                    width,
-                    height,
-                    app_bundle_id: Some("com.hyperthymesia.agent.e2e".into()),
-                    window_title: Some("Synthetic fixture".into()),
-                }),
+                CorePayload::TextSnapshot(serde_json::from_value(payload.clone())?),
             );
-            envelope.blobs.push(blob.clone());
+            envelope.payload = payload;
             let (reply, ack) = mpsc::sync_channel(1);
             tx.blocking_send(Submission {
                 envelope,
@@ -97,13 +83,13 @@ pub fn main() -> Result<()> {
                     electron: false,
                 }),
                 secure: false,
-                blobs: vec![(blob, data)],
+                blobs: vec![],
             })?;
             ensure!(
                 ack.recv_timeout(Duration::from_secs(10))?,
-                "synthetic JPEG was not queued"
+                "synthetic screen text was not queued"
             );
-            println!("Synthetic JPEG queued.");
+            println!("Synthetic screen text queued.");
             std::io::stdout().flush()?;
         }
         let start = Instant::now();

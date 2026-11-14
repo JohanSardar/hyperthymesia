@@ -74,4 +74,4 @@ All public route registrations, including dashboard forms. See [API contracts](a
 | POST | `/v1/recipes/{id}/retry` | [connection_api.rs:597](../../crates/hx-server/src/connection_api.rs#L597) |
 | POST | `/v1/connections/oauth` | [connection_api.rs:598](../../crates/hx-server/src/connection_api.rs#L598) |
 | POST | `/v1/connections/oauth/finish` | [connection_api.rs:599](../../crates/hx-server/src/connection_api.rs#L599) |
-| POST | `/mcp` | [mcp.rs:1037](../../crates/hx-server/src/mcp.rs#L1037) |
+| POST | `/mcp` | [mcp.rs:1064](../../crates/hx-server/src/mcp.rs#L1064) |

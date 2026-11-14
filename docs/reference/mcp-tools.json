@@ -448,6 +448,11 @@
         "properties": {
           "id": {
             "type": "integer"
+          },
+          "offset": {
+            "description": "Character offset for the next page of screen text; follow next_offset until null.",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [

@@ -36,7 +36,7 @@ fn span(p: &mut Producer, presence: bool) -> Envelope {
     )
 }
 #[test]
-fn capture_accepts_screenshots_but_never_video() {
+fn capture_rejects_screen_images_and_video() {
     let dir = tempfile::tempdir().unwrap();
     let mut out = Outbox::open(&dir.path().join("db"), 100_000, 100_000).unwrap();
     let policy = Policy::new(&Config::default()).unwrap();
@@ -71,12 +71,9 @@ fn capture_accepts_screenshots_but_never_video() {
             &[(blob, bytes)],
         )
         .unwrap();
-        assert_eq!(accepted, mime == "image/jpeg", "{kind} {mime}");
+        assert!(!accepted, "{kind} {mime}");
     }
-    let batch = out.batch().unwrap().unwrap();
-    assert_eq!(batch.envelopes.len(), 1);
-    assert_eq!(batch.envelopes[0].kind.as_str(), "media.still");
-    assert_eq!(batch.envelopes[0].blobs[0].media_type, "image/jpeg");
+    assert!(out.batch().unwrap().is_none());
 }
 
 #[test]
@@ -106,12 +103,18 @@ fn browser_and_electron_content_is_allowed_but_privacy_gates_remain() {
                 .observe(false, p.time(), &mut p)
                 .is_none()
         );
-        for kind in ["text.snapshot", "ui.click", "media.still"] {
+        for kind in ["text.snapshot", "ui.click"] {
             let dir = tempfile::tempdir().unwrap();
             let mut out = Outbox::open(&dir.path().join("db"), 100_000, 100).unwrap();
             let mut event = p.calibration();
             event.kind = Kind::new(kind);
-            event.payload = serde_json::json!({"text":"synthetic content"});
+            event.payload = serde_json::json!({
+                "surface":bundle_id,"source":"ocr", "text":"synthetic OCR and AX content",
+                "text_sha256":sha256_hex(b"synthetic OCR and AX content"),"completeness":"partial",
+                "ocr":{"lines":[{"text":"synthetic OCR content"}]},
+                "accessibility":{"text":"synthetic AX content"},
+                "app_bundle_id":bundle_id,"window_title":"Synthetic window",
+            });
             assert!(!persist(&mut out, &policy, Some(&focus), true, &event, &[]).unwrap());
             assert!(!persist(&mut out, &policy, None, false, &event, &[]).unwrap());
             for config in [
@@ -720,7 +723,7 @@ fn told_when_screen_fails_and_clears_on_recovery_or_pause() {
         "status":"failed", "detail":"writer start: Cannot create file"
     }});
     let warning = screen_warning(Some(&health), false).unwrap();
-    assert!(warning.contains("Cannot save screenshots"));
+    assert!(warning.contains("Cannot save screen text"));
     assert!(warning.contains("permissions"));
     assert!(screen_warning(Some(&health), true).is_none());
     // Starting a stream is not recovery; only a successfully written frame is.

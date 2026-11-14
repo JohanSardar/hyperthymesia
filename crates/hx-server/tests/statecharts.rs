@@ -908,6 +908,13 @@ async fn revision24_compares_timeline_hash_instead_of_generation() {
 async fn fx_stops_on_changed_input_at_tool_boundary_and_failed_live_lookup_is_local() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new().await;
+    let mut tx = f.store.begin_write().await.unwrap();
+    sqlx::query("INSERT INTO app_settings(id,value) VALUES(1,$1)")
+        .bind(json!({"model":{"provider":"codex","model":"synthetic-model"}}).to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let w = window();
     ingest(&f.store, vec![event("before-run", 8)]).await;
     f.store.normalize_window(w).await.unwrap();

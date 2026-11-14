@@ -19,6 +19,12 @@ enum Command {
         replace: bool,
     },
     Status,
+    /// Recognize the foreground screen once; output text JSON only, without recording.
+    ScreenText {
+        /// Replay an existing image with its accessibility sample from a JSON record.
+        #[arg(long)]
+        replay: Option<std::path::PathBuf>,
+    },
     Onboard,
     NmHost,
     InstallNmHost {
@@ -43,6 +49,16 @@ fn main() -> anyhow::Result<()> {
                 &hx_agent::config::support_dir(),
             ))?;
             println!("Paired. Uploads will resume automatically.");
+            Ok(())
+        }
+        Command::ScreenText { replay } => {
+            let value = match replay {
+                Some(path) => {
+                    hx_agent::screen_text::replay(&serde_json::from_slice(&std::fs::read(path)?)?)?
+                }
+                None => hx_agent::screen_text::capture_once()?,
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         Command::Status => {

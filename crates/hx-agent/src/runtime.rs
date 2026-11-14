@@ -59,7 +59,7 @@ pub(crate) fn screen_warning(health: Option<&serde_json::Value>, paused: bool) -
             let detail = media["detail"].as_str().unwrap_or("The capture service stopped.");
             let lower = detail.to_lowercase();
             Some(if lower.contains("file") || lower.contains("folder") || lower.contains("writer") || lower.contains("permission denied") || lower.contains("disk") {
-                "Cannot save screenshots. Check free disk space and app permissions. Retrying automatically.".into()
+                "Cannot save screen text. Check free disk space and app permissions. Retrying automatically.".into()
             } else {
                 format!("Screenshot capture stopped: {}. Retrying automatically.", detail.chars().take(180).collect::<String>())
             })
@@ -137,27 +137,11 @@ fn io_worker_recording(
         let mut uploader=LiveUploader::new(&config)?;let mut rx=rx;let mut next=tokio::time::Instant::now()+uploader.delay();
         let mut reload = tokio::time::interval(Duration::from_secs(1));
         reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // OCR has a separate connection/task: slow helper or network work must
-        // never delay capture persistence, companion replies or credential reload.
-        let mut ocr_outbox=Outbox::open(&dir.join("outbox.sqlite"),config.event_budget_bytes,config.media_budget_bytes)?;
-        let mut ocr_uploader=LiveUploader::new(&config)?;
-        let ocr_config=config.clone();let ocr_dir=dir.clone();let ocr_stop=stop.clone();
-        let mut ocr_workers=tokio::task::JoinSet::new();
-        ocr_workers.spawn(async move {
-            let mut tick=tokio::time::interval(Duration::from_secs(5));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                if ocr_stop.load(Ordering::Relaxed) {break;}
-                if ocr_uploader.reload(&ocr_dir).is_err() {eprintln!("cannot reload device OCR credentials");continue;}
-                let saver=Profile::select(hx_macos_sys::power(),&ocr_config)==Profile::Saver;
-                if ocr_uploader.ocr_once(&mut ocr_outbox,saver).await.is_err() {eprintln!("device OCR retained for retry");}
-            }
-        });
+        let mut background_workers=tokio::task::JoinSet::new();
         let recording_state = recording.clone();
         let recording_dir = dir.clone();
         let recording_config = config.clone();
-        ocr_workers.spawn(async move {
+        background_workers.spawn(async move {
             let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() else { return; };
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {
@@ -1155,28 +1139,147 @@ mod delivery_regressions {
     }
 
     #[test]
+    fn slow_screen_recognition_does_not_block_text_or_metadata_persistence() {
+        use hx_visual::{OcrEngine, OcrResult};
+        struct HeldEngine {
+            started: mpsc::SyncSender<()>,
+            release: std::sync::Mutex<mpsc::Receiver<()>>,
+        }
+        impl OcrEngine for HeldEngine {
+            fn ocr(&self, _: &[u8], _: &str) -> Result<OcrResult> {
+                self.started.send(())?;
+                self.release.lock().unwrap().recv()?;
+                Ok(serde_json::from_value(serde_json::json!({
+                    "lines":[{"text":"recognized screen content","confidence":0.9,
+                        "bbox":{"x":0.0,"y":0.0,"width":1.0,"height":1.0}}],
+                    "engine_name":"apple-vision","engine_version":"synthetic","coverage":"partial"
+                }))?)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker_dir = dir.path().to_owned();
+        let worker = std::thread::spawn(move || {
+            io_worker_at(Config::default(), rx, worker_stop, worker_dir)
+        });
+        let (started, waiting) = mpsc::sync_channel(1);
+        let (release, held) = mpsc::sync_channel(1);
+        let engine = HeldEngine {
+            started,
+            release: std::sync::Mutex::new(held),
+        };
+        let focus = Focus {
+            bundle_id: "synthetic.app".into(),
+            name: "Synthetic".into(),
+            pid: 1,
+            title: Some("Public".into()),
+            electron: false,
+        };
+        let capture_tx = tx.clone();
+        let capture_focus = focus.clone();
+        let collector = std::thread::spawn(move || {
+            // The production recognizer is held before it can return any text.
+            // These bytes are synthetic, never screen pixels or a temp image.
+            let payload = crate::screen_text::recognize(
+                &capture_focus,
+                b"synthetic pixels".to_vec(),
+                &engine,
+                || None,
+            )
+            .unwrap();
+            let mut p = Producer::new("synthetic".into()).unwrap();
+            let mut envelope = p.core(
+                "screen-text:held",
+                "0",
+                Operation::Observe,
+                CorePayload::TextSnapshot(serde_json::from_value(payload.clone()).unwrap()),
+            );
+            envelope.payload = payload;
+            capture_tx
+                .blocking_send(Submission {
+                    envelope,
+                    reply: None,
+                    focus: Some(capture_focus),
+                    secure: false,
+                    blobs: vec![],
+                })
+                .unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut p = Producer::new("synthetic".into()).unwrap();
+        let metadata = p.calibration();
+        let ax = p.core(
+            "ax:while-ocr-held",
+            "0",
+            Operation::Observe,
+            CorePayload::TextSnapshot(TextSnapshot {
+                surface: "synthetic.app".into(),
+                source: TextSource::Accessibility,
+                text: "independent accessibility content".into(),
+                text_sha256: sha256_hex(b"independent accessibility content"),
+                completeness: Completeness::Partial,
+                visible: None,
+            }),
+        );
+        let mut acknowledgments = Vec::new();
+        for envelope in [metadata.clone(), ax.clone()] {
+            let (reply, persisted) = mpsc::sync_channel(1);
+            tx.blocking_send(Submission {
+                envelope,
+                reply: Some(reply),
+                focus: Some(focus.clone()),
+                secure: false,
+                blobs: vec![],
+            })
+            .unwrap();
+            acknowledgments.push(persisted.recv_timeout(Duration::from_secs(5)));
+        }
+        // Always release and join before asserting, including the failure path.
+        release.send(()).unwrap();
+        collector.join().unwrap();
+        drop(tx);
+        worker.join().unwrap().unwrap();
+        assert!(
+            acknowledgments.iter().all(|ack| matches!(ack, Ok(true))),
+            "persistence waited on recognition: {acknowledgments:?}"
+        );
+        assert!(!stop.load(Ordering::Relaxed));
+        let mut out = Outbox::open(&dir.path().join("outbox.sqlite"), 100_000, 100).unwrap();
+        let batch = out.batch().unwrap().unwrap();
+        for id in [metadata.observation_id, ax.observation_id] {
+            assert!(batch.envelopes.iter().any(|e| e.observation_id == id));
+        }
+        assert!(
+            batch
+                .envelopes
+                .iter()
+                .any(|e| e.payload["ocr"]["lines"][0]["text"] == "recognized screen content")
+        );
+        assert!(batch.envelopes.iter().all(|e| e.blobs.is_empty()));
+        assert_eq!(out.stats().unwrap().2, 0);
+    }
+
+    #[test]
     fn budget_rejection_keeps_io_worker_and_metadata_alive() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = Producer::new("synthetic".into()).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut rejected = p.calibration();
-        rejected.kind = Kind::new("media.still");
-        rejected.payload = serde_json::to_value(MediaStill {
-            display: "synthetic".into(),
-            trigger: StillTrigger::FocusChange,
-            width: 1,
-            height: 1,
-            app_bundle_id: None,
-            window_title: None,
-        })
-        .unwrap();
-        let bytes = b"oversized".to_vec();
-        let blob = BlobRef {
-            sha256: sha256_hex(&bytes),
-            media_type: "image/jpeg".into(),
-            bytes: bytes.len() as u64,
-        };
-        rejected.blobs.push(blob.clone());
+        let rejected = p.core(
+            "screen-text:budget",
+            "0",
+            Operation::Observe,
+            CorePayload::TextSnapshot(TextSnapshot {
+                surface: "synthetic.app".into(),
+                source: TextSource::Ocr,
+                text: "synthetic on-screen text".repeat(1024),
+                text_sha256: sha256_hex("synthetic on-screen text".repeat(1024).as_bytes()),
+                completeness: Completeness::Partial,
+                visible: Some(true),
+            }),
+        );
+        let rejected_id = rejected.observation_id;
         let focus = Focus {
             bundle_id: "synthetic.app".into(),
             name: "Synthetic".into(),
@@ -1190,7 +1293,7 @@ mod delivery_regressions {
             reply: Some(reply),
             focus: Some(focus),
             secure: false,
-            blobs: vec![(blob, bytes)],
+            blobs: vec![],
         })
         .unwrap();
         let metadata = p.calibration();
@@ -1207,7 +1310,7 @@ mod delivery_regressions {
         io_worker_at(
             Config {
                 device_id: "synthetic".into(),
-                media_budget_bytes: 1,
+                event_budget_bytes: 4_000,
                 ..Default::default()
             },
             rx,
@@ -1217,7 +1320,7 @@ mod delivery_regressions {
         .unwrap();
         assert!(!ack.recv().unwrap());
         assert!(!stop.load(Ordering::Relaxed));
-        let mut out = Outbox::open(&dir.path().join("outbox.sqlite"), 100_000, 1).unwrap();
+        let mut out = Outbox::open(&dir.path().join("outbox.sqlite"), 4_000, 1).unwrap();
         let batch = out.batch().unwrap().unwrap();
         assert!(
             batch
@@ -1229,6 +1332,12 @@ mod delivery_regressions {
             e.coverage
                 .as_ref()
                 .is_some_and(|c| c.scope == "capture_loss")
+                && e.payload["reason"] == "event_budget"
+                && e.payload["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&rejected_id.to_string())
+                && !e.payload.to_string().contains("synthetic on-screen text")
         }));
     }
 }
