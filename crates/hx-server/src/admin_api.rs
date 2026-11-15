@@ -939,7 +939,7 @@ async fn erase_log(State(store): State<Store>, headers: HeaderMap) -> ApiResult<
     // A "deleting" line is only news when nothing logged its outcome.
     let finished: std::collections::HashSet<String> = entries
         .iter()
-        .filter(|e| e["action"] != "deleting")
+        .filter(|e| e["action"] == "deleted_range" || e["action"] == "cleaned_up")
         .filter_map(|e| e["backup"].as_str().map(String::from))
         .collect();
     entries.retain(|e| {

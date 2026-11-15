@@ -173,3 +173,60 @@ async fn s3_erase_refuses_when_required_deletion_log_cannot_be_written() -> Resu
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn n1_deleting_backup_does_not_hide_unfinished_erase() -> Result<()> {
+    let _turn = TURN.lock().await;
+    let dir = tempfile::tempdir()?;
+    let store = Store::create(&dir.path().join("state")).await?;
+    let (backup, _) = hx_server::admin_api::take_backup(&store, "before-delete").await?;
+    // Durable state left by a delete interrupted before its completion entry.
+    std::fs::write(
+        dir.path().join("backups/deletions.jsonl"),
+        format!(
+            "{}\n",
+            json!({"at":at(), "action":"deleting", "start":at(),
+            "end":at()+Duration::hours(1), "backup":backup})
+        ),
+    )?;
+    let token = store
+        .create_token(
+            "review owner",
+            vec![
+                "source:".into(),
+                "macos-agent:".into(),
+                "macos-media:".into(),
+                "companion:".into(),
+            ],
+            vec!["read_raw".into()],
+        )
+        .await?;
+    let router = hx_server::router(store, DisclosurePolicy::default());
+    let response = router
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/backups/{backup}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = router
+        .oneshot(
+            Request::get("/v1/erase/log")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert!(
+        body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "deleting"),
+        "N1: deleting a backup hid the only unfinished erase record: {body}"
+    );
+    Ok(())
+}
