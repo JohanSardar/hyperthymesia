@@ -31,7 +31,7 @@ programmatic clients can use a bearer token without an Origin header.
      "model": {"provider":"vercel","model":"anthropic/claude-sonnet-4.5","effort":null},
      "mac_recording":true,
      "chunk_retention_days":30,
-     "appearance":"system"
+     "appearance":"dark"
    }
    ```
 
@@ -67,8 +67,8 @@ The local menu-bar pause remains independent.
 
 `chunk_retention_days` accepts 1–3650 and sets the policy for chunk collection.
 Automatic GC and the destructive GC CLI remain disabled; changing this policy
-alone does not delete data. `appearance` accepts `system`, `light`, or `dark`;
-the UI client reads this preference.
+alone does not delete data. `appearance` accepts `system`, `light`, or `dark`
+(default `dark`); the UI client reads this preference.
 
 `GET /v1/settings/tokens` returns `tokens` with safe IDs (hashes), names,
 namespace prefixes, scopes and revocation status. `POST` accepts:

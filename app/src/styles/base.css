@@ -23,8 +23,8 @@ body {
   background: var(--bg);
   color: var(--fg);
   font-family: var(--font-sans);
-  font-size: 14px;
-  line-height: 21px;
+  font-size: var(--text-base);
+  line-height: var(--leading-base);
   font-weight: var(--weight-normal);
   font-feature-settings: "cv11", "ss01";
   -webkit-font-smoothing: antialiased;
@@ -73,17 +73,17 @@ svg {
 }
 
 .h1 {
-  font-size: 22px;
-  line-height: 26.4px;
+  font-size: var(--text-xl);
+  line-height: var(--leading-xl);
   font-weight: var(--weight-medium);
-  letter-spacing: -0.44px;
+  letter-spacing: var(--tracking-xl);
 }
 
 .h2 {
-  font-size: 14px;
-  line-height: 16.8px;
+  font-size: var(--text-base);
+  line-height: var(--leading-base);
   font-weight: var(--weight-medium);
-  letter-spacing: -0.28px;
+  letter-spacing: var(--tracking-base);
 }
 
 .mono {

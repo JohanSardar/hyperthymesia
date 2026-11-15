@@ -7,17 +7,23 @@ import { CatalogDetailPage } from "./connections/detail"
 import { FirstRunPage } from "./first-run/first-run"
 import { AgentPage } from "./pages/agent"
 import { ConnectionsPage } from "./pages/connections"
+import { DevicesPage } from "./pages/devices"
 import { RunsPage } from "./pages/runs"
+import { SearchPage } from "./pages/search"
 import { SettingsPage } from "./pages/settings"
+import { TimelinePage } from "./pages/timeline"
 import { TodayPage } from "./pages/today"
 import { SettingsProvider, useSettings } from "./server/settings"
 import { Layout } from "./shell"
 
-const KitPage = import.meta.env.DEV ? lazy(() => import("./pages/kit").then((m) => ({ default: m.KitPage }))) : null
+// The kit is loaded only when opened, so it costs the other pages nothing.
+const KitPage = lazy(() => import("./pages/kit").then((m) => ({ default: m.KitPage })))
 
 const children: RouteObject[] = [
   { index: true, element: <Navigate to="/today" replace /> },
   { path: "today", element: <TodayPage /> },
+  { path: "timeline", element: <TimelinePage /> },
+  { path: "search", element: <SearchPage /> },
   { path: "connections", element: <ConnectionsPage /> },
   { path: "connections/browse", element: <BrowsePage /> },
   { path: "connections/new", element: <AddConnectionPage /> },
@@ -25,13 +31,11 @@ const children: RouteObject[] = [
   { path: "connections/:id", element: <ConnectionPage /> },
   { path: "agent", element: <AgentPage /> },
   { path: "runs", element: <RunsPage /> },
+  { path: "devices", element: <DevicesPage /> },
   { path: "settings", element: <SettingsPage /> },
+  { path: "kit", element: <Suspense><KitPage /></Suspense> },
   { path: "*", element: <Navigate to="/today" replace /> },
 ]
-
-if (KitPage) {
-  children.push({ path: "kit", element: <Suspense><KitPage /></Suspense> })
-}
 
 // First run until a model is chosen; nothing is preselected.
 function FirstRunGate({ children }: { children: ReactNode }) {

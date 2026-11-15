@@ -84,9 +84,27 @@ function StatusDot({ tone }: { tone: "idle" | "live" | "ok" | "warning" | "error
   return <span className="status-dot" data-tone={tone} aria-hidden />
 }
 
-function Empty({ title, description, children }: { title: ReactNode; description?: ReactNode; children?: ReactNode }) {
+/** An empty state: what's missing, and the next step in one sentence. `fill` centres it in the page. */
+function Empty({
+  title,
+  description,
+  icon,
+  fill,
+  children,
+}: {
+  title: ReactNode
+  description?: ReactNode
+  icon?: ReactNode
+  fill?: boolean
+  children?: ReactNode
+}) {
   return (
-    <div className="empty">
+    <div className="empty" data-fill={fill ? "" : undefined}>
+      {icon && (
+        <span className="empty-icon" aria-hidden>
+          {icon}
+        </span>
+      )}
       <p className="empty-title">{title}</p>
       {description && <p className="empty-description">{description}</p>}
       {children && <div className="empty-actions">{children}</div>}

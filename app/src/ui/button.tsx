@@ -4,7 +4,7 @@ import type { ComponentProps, ReactNode } from "react"
 import { cx } from "./cx"
 import { Kbd } from "./kbd"
 
-type Variant = "default" | "primary" | "ghost" | "soft" | "link" | "destructive"
+type Variant = "default" | "primary" | "accent" | "ghost" | "soft" | "link" | "destructive"
 type Size = "xs" | "sm" | "md" | "lg"
 
 type ButtonProps = Omit<ComponentProps<typeof SdkButton>, "className"> & {
