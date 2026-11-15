@@ -53,7 +53,7 @@ impl Worker {
         let (title_tx, titles) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             // The same page keeps its address; look again when the window
-            // title changes, or after a few seconds while a site is excluded.
+            // title changes or after a few seconds.
             let mut cached: Option<(i32, Option<String>, Option<String>, std::time::Instant)> =
                 None;
             while let Ok(focus) = title_rx.recv() {
@@ -63,8 +63,7 @@ impl Worker {
                         Some((pid, t, url, at))
                             if *pid == focus.pid
                                 && *t == title
-                                && (at.elapsed() < Duration::from_secs(5)
-                                    || !crate::policy::sites_active()) =>
+                                && at.elapsed() < Duration::from_secs(5) =>
                         {
                             url.clone()
                         }
