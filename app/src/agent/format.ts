@@ -57,8 +57,11 @@ function money(usd: number) {
 
 /** Cost in plain words: subscriptions report no dollar cost. */
 function costLabel(run: Pick<AgentRun, "cost_usd" | "provider" | "state">) {
-  if (run.cost_usd === null) return run.state === "running" ? "Counting…" : "Not reported"
-  if (run.cost_usd === 0 && run.provider && isPlan(run.provider)) return "In your plan"
+  if (run.state === "running" && run.cost_usd === null) return "Counting…"
+  if (run.state === "skipped") return "Nothing spent"
+  // Subscriptions bill no single run; fx reports no dollar cost for them.
+  if ((run.cost_usd === null || run.cost_usd === 0) && run.provider && isPlan(run.provider)) return "In your plan"
+  if (run.cost_usd === null) return "Not reported"
   return money(run.cost_usd)
 }
 

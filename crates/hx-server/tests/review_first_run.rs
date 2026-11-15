@@ -222,3 +222,41 @@ async fn s3_spending_limit_blocks_new_paid_check() {
         "no new paid run may start at the monthly limit: {check}"
     );
 }
+
+#[tokio::test]
+async fn unreadable_login_offers_signin_fix() {
+    if isolated("unreadable_login_offers_signin_fix") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    // A saved login fx can no longer read, with fx 0.0.16's own words for it.
+    let credential = std::path::PathBuf::from(std::env::var_os("HX_FX_CREDENTIAL").unwrap());
+    std::fs::write(&credential, "{\"broken\":true}").unwrap();
+    std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let binary = std::path::PathBuf::from(std::env::var_os("HX_FX_BINARY").unwrap());
+    // fx's text form, and the `ask --json` form a pass reads.
+    for script in [
+        "echo 'fx ask: Saved credential storage is unavailable. Check the saved credential, then retry.' >&2",
+        "printf '%s' '{\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"steps\":0,\"tool_calls\":[],\"error\":\"CredentialStorageUnavailable\"}'",
+    ] {
+        std::fs::write(&binary, format!("#!/bin/sh\n{script}\nexit 1\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Store::create(scratch.path()).await.unwrap();
+        let token = owner(&store).await;
+        api(
+            &store,
+            &token,
+            "PUT",
+            "/v1/settings",
+            json!({"model":{"provider":"codex", "model":"synthetic-model", "effort":null}}),
+        )
+        .await;
+        let check = api(&store, &token, "POST", "/v1/model/check", Value::Null).await;
+        assert_eq!(check["ok"], false);
+        assert_eq!(
+            check["problem"], "signin",
+            "a login fx can't read needs Sign in again ({script}): {check}"
+        );
+    }
+}

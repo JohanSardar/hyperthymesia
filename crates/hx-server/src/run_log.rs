@@ -217,6 +217,9 @@ pub fn provider_failure(text: &str, provider: &str) -> Option<&'static str> {
         "authentication",
         "invalid api key",
         "invalid_api_key",
+        // fx 0.0.16 when the saved login file can't be read (text and --json forms).
+        "saved credential",
+        "credentialstorageunavailable",
     ];
     let model = [
         "model_not_found",

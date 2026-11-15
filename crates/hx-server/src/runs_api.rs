@@ -88,7 +88,7 @@ async fn list(
     .await?;
     // What runs next: first passes at the end of each window, next-day catch-ups
     // a day later, and the daily sweep.
-    let upcoming: Vec<Value> = sqlx::query_scalar("SELECT json_object('job_id',id,'window_start',window_start,'available_at',available_at,'catch_up',json_extract(payload,'$.revision24')=1 OR json_type(payload,'$.sweep_day') IS NOT NULL,'held',last_error='spending limit reached','rerun',json_extract(payload,'$.rerun')=1) FROM jobs WHERE kind='interpret' AND state IN ('ready','running') ORDER BY available_at LIMIT 8")
+    let upcoming: Vec<Value> = sqlx::query_scalar("SELECT json_object('job_id',id,'window_start',window_start,'available_at',available_at,'catch_up',json_extract(payload,'$.revision24')=1 OR json_type(payload,'$.sweep_day') IS NOT NULL,'held',last_error='spending limit reached','rerun',json_extract(payload,'$.rerun')=1) FROM jobs WHERE kind='interpret' AND state='ready' ORDER BY available_at LIMIT 8")
         .fetch_all(&store.pool).await?;
     let preferences = crate::preferences::load(&store).await?;
     Ok(Json(json!({

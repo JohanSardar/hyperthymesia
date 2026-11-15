@@ -110,7 +110,10 @@ function RunList({ runs, upcoming, loading, selected }: { runs: AgentRun[]; upco
   const groups = useMemo(() => {
     // A pass belongs to the day of its window: the 6–10 PM pass often starts after midnight.
     const out = new Map<string, AgentRun[]>()
-    for (const run of runs) {
+    for (const [i, run] of runs.entries()) {
+      // Retries of one job that keep failing fold into the newest attempt.
+      const newer = runs[i - 1]
+      if (newer && run.state === "failed" && newer.state === "failed" && run.job_id !== null && run.job_id === newer.job_id) continue
       const day = dayWord(at(run.kind === "pass" && run.window_start ? run.window_start : run.started_at))
       out.set(day, [...(out.get(day) ?? []), run])
     }
@@ -125,7 +128,7 @@ function RunList({ runs, upcoming, loading, selected }: { runs: AgentRun[]; upco
             <div key={u.job_id} className="sidebar-row run-row" data-upcoming="">
               <CalendarClock size={13} aria-hidden />
               <span className="sidebar-row-label">{u.rerun ? "Re-run" : u.catch_up ? "Catch-up" : "Pass"}, {windowHours(u.window_start)}</span>
-              <span className="sidebar-row-meta">{at(u.available_at).getTime() <= Date.now() ? "soon" : clock(at(u.available_at))}</span>
+              <span className="sidebar-row-meta">{at(u.available_at).getTime() <= Date.now() ? "soon" : dueLabel(u.available_at)}</span>
             </div>
           ))}
         </SidebarGroup>
@@ -154,11 +157,13 @@ function RunList({ runs, upcoming, loading, selected }: { runs: AgentRun[]; upco
                   <span className="sidebar-row-meta">
                     {run.state === "running"
                       ? duration(seconds(run.started_at, Date.now() * 1000))
-                      : run.state === "failed" || run.state === "waiting"
-                        ? words.label.toLowerCase()
-                        : run.finished_at
-                          ? duration(seconds(run.started_at, run.finished_at))
-                          : ""}
+                      : run.state === "failed" && tries(runs, run) > 1
+                        ? `failed ×${tries(runs, run)}`
+                        : run.state === "failed" || run.state === "waiting"
+                          ? words.label.toLowerCase()
+                          : run.finished_at
+                            ? duration(seconds(run.started_at, run.finished_at))
+                            : ""}
                   </span>
                 </NavLink>
               )
@@ -382,3 +387,19 @@ function RunDetail({ id, onChanged, onOpen }: { id: number; onChanged: () => voi
 }
 
 export { RunsPage }
+
+/** "08:10 AM" today, "Mon 08:00 AM" on another day. */
+function dueLabel(us: number) {
+  const d = at(us)
+  return dayWord(d) === "Today" ? clock(d) : `${d.toLocaleDateString(undefined, { weekday: "short" })} ${clock(d)}`
+}
+
+/** How many failed attempts in a row the run's job made, counting this one. */
+function tries(runs: AgentRun[], run: AgentRun) {
+  let n = 0
+  for (const r of runs.slice(runs.indexOf(run))) {
+    if (r.state !== "failed" || r.job_id === null || r.job_id !== run.job_id) break
+    n++
+  }
+  return n
+}
