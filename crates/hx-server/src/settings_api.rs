@@ -173,6 +173,15 @@ async fn check(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Json
         .await?
         .model
         .ok_or_else(|| bad("choose a provider and model first"))?;
+    // The spending limit stops every new run, a test included.
+    if let Err(error) = crate::run_log::check_spending(&store).await {
+        if error.downcast_ref::<hx_jobs::Deferred>().is_none() {
+            return Err(error.into());
+        }
+        return Ok(Json(json!({"ok":false,
+            "message":"This month's spending limit is reached, so nothing new runs. Raise or remove the limit to test.",
+            "problem":"spending_limit","seconds":0,"run_id":null})));
+    }
     // An explicit check makes one small provider request. Never expose arbitrary
     // provider output (which can contain credentials or diagnostics).
     let run = crate::run_log::RunLog::start(

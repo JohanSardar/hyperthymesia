@@ -157,6 +157,15 @@ impl RunLog {
 
 /// Short, stable codes for what went wrong. The app maps each to words and a fix.
 pub fn problem(error: &anyhow::Error) -> &'static str {
+    let text = format!("{error:#}").to_lowercase();
+    // A missing or rejected login can arrive as a retry later; it still needs a sign-in.
+    if text.contains("login rejected")
+        || text.contains("credential unavailable")
+        || text.contains("fx login missing")
+        || text.contains("run fx login")
+    {
+        return "signin";
+    }
     if let Some(deferred) = error.downcast_ref::<hx_jobs::Deferred>() {
         return match deferred {
             hx_jobs::Deferred::RateLimited => "usage_limit",
@@ -166,14 +175,7 @@ pub fn problem(error: &anyhow::Error) -> &'static str {
             hx_jobs::Deferred::NormalizationPending | hx_jobs::Deferred::Until(_) => "waiting",
         };
     }
-    let text = format!("{error:#}").to_lowercase();
-    if text.contains("login rejected")
-        || text.contains("credential unavailable")
-        || text.contains("fx login missing")
-        || text.contains("run fx login")
-    {
-        "signin"
-    } else if text.contains("ai_gateway_api_key") || text.contains("key rejected") {
+    if text.contains("ai_gateway_api_key") || text.contains("key rejected") {
         "key"
     } else if text.contains("choose a provider and model") {
         "no_model"

@@ -12,5 +12,3 @@ CREATE TABLE agent_runs (
  revision_id INTEGER,
  log TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(log) AND json_type(log)='array')
 ) STRICT;
-CREATE INDEX agent_runs_started ON agent_runs(started_at);
-CREATE INDEX agent_runs_job ON agent_runs(job_id);

@@ -106,7 +106,7 @@ async fn permissions(State(store): State<Store>, headers: HeaderMap) -> ApiResul
 async fn proof(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     owner(&store, &headers).await?;
     let since = Ts(Ts::now().0 - 120_000_000);
-    let rows: Vec<(Ts, Value)> = sqlx::query_as("SELECT source_start,envelope FROM events INDEXED BY events_time WHERE source_start>=$1 AND kind='text.snapshot' AND connector_instance LIKE 'macos-agent:%' ORDER BY source_start DESC LIMIT 12")
+    let rows: Vec<(Ts, Value)> = sqlx::query_as("SELECT source_start,envelope FROM events INDEXED BY events_time WHERE source_start>=$1 AND kind='text.snapshot' AND connector_instance LIKE 'macos-media:%' ORDER BY source_start DESC LIMIT 12")
         .bind(since).fetch_all(&store.pool).await?;
     let mut items = vec![];
     for (at, envelope) in rows {
