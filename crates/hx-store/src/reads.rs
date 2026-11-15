@@ -208,3 +208,69 @@ impl Store {
         )
     }
 }
+
+/// One line of the app's day list: how much the Mac recorded on a local day.
+#[derive(Debug, sqlx::FromRow, Serialize)]
+pub struct DayCount {
+    pub day: String,
+    pub records: i64,
+    pub screen_text: i64,
+    pub focus: i64,
+}
+/// A compile window and whether the AI has written an account of it.
+#[derive(Debug, sqlx::FromRow, Serialize)]
+pub struct WindowState {
+    #[sqlx(try_from = "Ts")]
+    pub start: DateTime<Utc>,
+    #[sqlx(try_from = "Ts")]
+    pub end: DateTime<Utc>,
+    pub canonical_revision: Option<i64>,
+}
+/// Kind and app of a stored record, for labelling search hits.
+#[derive(Debug, sqlx::FromRow, Serialize)]
+pub struct RecordBrief {
+    pub id: i64,
+    pub kind: String,
+    pub connector_instance: String,
+    pub app: Option<String>,
+    pub title: Option<String>,
+}
+
+impl Store {
+    /// Record counts per local day (`offset_seconds` east of UTC), newest first.
+    pub async fn day_counts(
+        &self,
+        offset_seconds: i64,
+        prefixes: &[String],
+    ) -> Result<Vec<DayCount>> {
+        sqlx::query_as("SELECT date(source_start/1000000 + $1, 'unixepoch') AS day, count(*) AS records, sum(kind='text.snapshot') AS screen_text, sum(kind='focus.span') AS focus FROM events e WHERE EXISTS(SELECT 1 FROM json_each($2) p WHERE substr(e.connector_instance,1,length(p.value))=p.value) GROUP BY day ORDER BY day DESC")
+            .bind(offset_seconds).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await
+    }
+    pub async fn window_states(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<WindowState>> {
+        sqlx::query_as("SELECT start_at AS start,end_at AS end,canonical_revision FROM windows WHERE start_at<$2 AND end_at>$1 ORDER BY start_at")
+            .bind(Ts::from(start)).bind(Ts::from(end)).fetch_all(&self.pool).await
+    }
+    /// Screen text recorded on one device in `[start, end)`: Mac text records,
+    /// then OCR text derived from older stills. Oldest first, at most `limit` each.
+    pub async fn screen_text_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        device: &str,
+        limit: i64,
+    ) -> Result<Vec<SourceRecord>> {
+        let mut rows: Vec<SourceRecord> = sqlx::query_as("SELECT id,envelope FROM events INDEXED BY events_time WHERE source_start>=$1 AND source_start<$2 AND kind='text.snapshot' AND device=$3 ORDER BY source_start,id LIMIT $4")
+            .bind(Ts::from(start)).bind(Ts::from(end)).bind(device).bind(limit).fetch_all(&self.pool).await?;
+        rows.extend(sqlx::query_as::<_, SourceRecord>("SELECT d.id,d.envelope FROM events e INDEXED BY events_time JOIN ocr_derived d ON d.source_event_id=e.id WHERE e.source_start>=$1 AND e.source_start<$2 AND e.kind='media.still' AND e.device=$3 ORDER BY e.source_start,d.id LIMIT $4")
+            .bind(Ts::from(start)).bind(Ts::from(end)).bind(device).bind(limit).fetch_all(&self.pool).await?);
+        Ok(rows)
+    }
+    pub async fn record_briefs(&self, ids: &[i64]) -> Result<Vec<RecordBrief>> {
+        sqlx::query_as("SELECT id,kind,connector_instance,coalesce(json_extract(envelope,'$.payload.app_name'),json_extract(envelope,'$.payload.surface'),json_extract(envelope,'$.payload.app_bundle_id')) AS app,json_extract(envelope,'$.payload.window_title') AS title FROM events WHERE id IN (SELECT value FROM json_each($1))")
+            .bind(sqlx::types::Json(ids)).fetch_all(&self.pool).await
+    }
+}
