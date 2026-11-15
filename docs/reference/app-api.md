@@ -103,8 +103,9 @@ its next execution. Raw errors and provider output are withheld.
 All four need a token with `read_raw` and are never cached. Records and
 accounts outside the token's namespace prefixes are left out.
 
-`GET /v1/days?utc_offset_min=-360` returns `days` (local date, record count,
-screen-text count, focus count) and `windows` (four-hour interpretation
+`GET /v1/days` returns `buckets` (record, screen-text and focus counts per
+15-minute UTC bucket, `at` in Unix seconds; clients group them into local days
+with their own time zone rules) and `windows` (four-hour interpretation
 windows with their canonical revision ID, or null).
 
 `GET /v1/day?from=ISO&to=ISO` (at most 50 hours) returns per-collector

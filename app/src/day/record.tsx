@@ -16,6 +16,7 @@ function kindInfo(kind: string): KindInfo {
     case "ui.click":
       return { icon: MousePointerClick, label: "Click" }
     case "media.still":
+    case "ocr.text":
       return { icon: Camera, label: "Text read from a screenshot" }
     case "presence.span":
       return { icon: Moon, label: "At the Mac or away" }
@@ -236,6 +237,12 @@ function Body({ data, terms }: { data: CiteResponse; terms?: string[] }) {
         </>
       )
     }
+    case "ocr.text":
+      return (
+        <pre className="screen-text-body">
+          <Highlight text={ocrText(e)} terms={terms} />
+        </pre>
+      )
     case "ui.click":
       return (
         <p className="record-line">

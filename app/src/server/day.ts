@@ -8,6 +8,27 @@ type Interval = { start: string; end: string }
 type DayCount = { day: string; records: number; screen_text: number; focus: number }
 type WindowState = { start: string; end: string; canonical_revision: number | null }
 type DaysResponse = { days: DayCount[]; windows: WindowState[] }
+type Bucket = { at: number; records: number; screen_text: number; focus: number }
+
+/**
+ * The server counts records per 15-minute UTC bucket; this groups them into
+ * local days with the browser's own time zone rules, so a summer day stays
+ * itself after the clocks change. Newest day first.
+ */
+async function loadDays(): Promise<DaysResponse> {
+  const raw = await request<{ buckets: Bucket[]; windows: WindowState[] }>("/v1/days")
+  const byDay = new Map<string, DayCount>()
+  for (const b of raw.buckets) {
+    const d = new Date(b.at * 1000)
+    const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+    const row = byDay.get(day) ?? { day, records: 0, screen_text: 0, focus: 0 }
+    row.records += b.records
+    row.screen_text += b.screen_text
+    row.focus += b.focus
+    byDay.set(day, row)
+  }
+  return { days: [...byDay.values()].sort((a, b) => (a.day < b.day ? 1 : -1)), windows: raw.windows }
+}
 
 type CoverageState = "observed" | "unknown" | "suppressed"
 type Coverage = { device: string; connector: string; collector: string; state: CoverageState; start: string; end: string }
@@ -121,7 +142,7 @@ type RecordHit = { id: number; at: string; kind: string | null; connector_instan
 type FindResponse = { entries: EntryHit[]; records: RecordHit[] }
 
 const dayApi = {
-  days: () => request<DaysResponse>(`/v1/days?utc_offset_min=${-new Date().getTimezoneOffset()}`),
+  days: loadDays,
   day: (from: Date, to: Date) => request<DayResponse>(`/v1/day?from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(to.toISOString())}`),
   cite: (id: number, revision?: number) => request<CiteResponse>(`/v1/cite/${id}${revision ? `?revision=${revision}` : ""}`),
   find: (q: string) => request<FindResponse>(`/v1/find?q=${encodeURIComponent(q)}`),

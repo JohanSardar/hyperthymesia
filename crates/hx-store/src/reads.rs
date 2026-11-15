@@ -212,7 +212,8 @@ impl Store {
 /// One line of the app's day list: how much the Mac recorded on a local day.
 #[derive(Debug, sqlx::FromRow, Serialize)]
 pub struct DayCount {
-    pub day: String,
+    /// Start of a 15-minute UTC bucket, in Unix seconds.
+    pub at: i64,
     pub records: i64,
     pub screen_text: i64,
     pub focus: i64,
@@ -237,14 +238,12 @@ pub struct RecordBrief {
 }
 
 impl Store {
-    /// Record counts per local day (`offset_seconds` east of UTC), newest first.
-    pub async fn day_counts(
-        &self,
-        offset_seconds: i64,
-        prefixes: &[String],
-    ) -> Result<Vec<DayCount>> {
-        sqlx::query_as("SELECT date(source_start/1000000 + $1, 'unixepoch') AS day, count(*) AS records, sum(kind='text.snapshot') AS screen_text, sum(kind='focus.span') AS focus FROM events e WHERE EXISTS(SELECT 1 FROM json_each($2) p WHERE substr(e.connector_instance,1,length(p.value))=p.value) GROUP BY day ORDER BY day DESC")
-            .bind(offset_seconds).bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await
+    /// Record counts per 15-minute UTC bucket, oldest first, for connectors the
+    /// prefixes allow (same boundary rule as `Token::allows`). Clients group the
+    /// buckets into local days with their own time zone rules.
+    pub async fn day_counts(&self, prefixes: &[String]) -> Result<Vec<DayCount>> {
+        sqlx::query_as("SELECT source_start/900000000*900 AS at, count(*) AS records, sum(kind='text.snapshot') AS screen_text, sum(kind='focus.span') AS focus FROM events e WHERE EXISTS(SELECT 1 FROM json_each($1) p WHERE substr(e.connector_instance,1,length(p.value))=p.value AND (length(e.connector_instance)=length(p.value) OR substr(p.value,-1)=':' OR substr(e.connector_instance,length(p.value)+1,1)=':')) GROUP BY at ORDER BY at")
+            .bind(sqlx::types::Json(prefixes)).fetch_all(&self.pool).await
     }
     pub async fn window_states(
         &self,

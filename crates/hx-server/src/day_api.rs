@@ -44,28 +44,16 @@ async fn owner(store: &Store, headers: &HeaderMap) -> ApiResult<Token> {
     auth(store, headers, "read_raw").await
 }
 
-#[derive(Deserialize)]
-struct DaysQuery {
-    utc_offset_min: Option<i64>,
-}
-async fn days(
-    State(store): State<Store>,
-    headers: HeaderMap,
-    Query(q): Query<DaysQuery>,
-) -> ApiResult<Json<Value>> {
+async fn days(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let token = owner(&store, &headers).await?;
-    let offset = q.utc_offset_min.unwrap_or(0);
-    if offset.abs() > 18 * 60 {
-        return Err(bad("utc_offset_min out of range"));
-    }
-    let counts = store.day_counts(offset * 60, &token.prefixes).await?;
+    let counts = store.day_counts(&token.prefixes).await?;
     let windows = store
         .window_states(
             DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default(),
             Utc::now() + Duration::days(2),
         )
         .await?;
-    Ok(Json(json!({"days":counts,"windows":windows})))
+    Ok(Json(json!({"buckets":counts,"windows":windows})))
 }
 
 #[derive(Deserialize)]
@@ -517,14 +505,17 @@ async fn find(
         .iter()
         .filter_map(|h| {
             let id = h["id"].as_i64()?;
-            let brief = briefs.get(&id);
+            // The store's prefix match doesn't stop at a namespace boundary.
+            let brief = briefs
+                .get(&id)
+                .filter(|b| token.allows(&b.connector_instance))?;
             Some(json!({
                 "id": id,
                 "at": h["at"],
-                "kind": brief.map(|b| b.kind.as_str()),
-                "connector_instance": brief.map(|b| b.connector_instance.as_str()),
-                "app": brief.and_then(|b| b.app.as_deref()),
-                "title": brief.and_then(|b| b.title.as_deref()),
+                "kind": brief.kind,
+                "connector_instance": brief.connector_instance,
+                "app": brief.app,
+                "title": brief.title,
                 "snippet": snippet(h["text"].as_str().unwrap_or(""), &terms),
             }))
         })
