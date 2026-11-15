@@ -10,6 +10,16 @@ pub struct Model {
     pub model: String,
     pub effort: Option<String>,
 }
+/// How far the person got in the app's first-run setup.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SetupProgress {
+    /// The step to resume at, for example `permissions`.
+    pub step: String,
+    pub finished: bool,
+    /// Whether the guided tour of the app still has to be shown.
+    pub tour_pending: bool,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Preferences {
@@ -17,6 +27,11 @@ pub struct Preferences {
     pub mac_recording: bool,
     pub chunk_retention_days: u32,
     pub appearance: String,
+    /// Null for installations from before in-app setup: they count as set up
+    /// once a model is chosen.
+    pub setup: Option<SetupProgress>,
+    /// Monthly spending limit in US dollars; none by default.
+    pub spend_limit_usd: Option<f64>,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -25,6 +40,8 @@ impl Default for Preferences {
             mac_recording: true,
             chunk_retention_days: 30,
             appearance: "dark".into(),
+            setup: None,
+            spend_limit_usd: None,
         }
     }
 }

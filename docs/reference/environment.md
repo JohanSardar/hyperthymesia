@@ -8,12 +8,12 @@ Production variable names and their implementation references. See [configuratio
 | --- | --- |
 | `AI_GATEWAY_API_KEY` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/preferences.rs](../../crates/hx-server/src/preferences.rs) |
 | `CARGO_TARGET_DIR` | [crates/hx-visual/src/lib.rs](../../crates/hx-visual/src/lib.rs) |
-| `FX_AUTO_UPGRADE` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [scripts/install.sh](../../scripts/install.sh) |
-| `FX_DISABLE_KEYCHAIN` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [scripts/install.sh](../../scripts/install.sh) |
+| `FX_AUTO_UPGRADE` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [crates/hx-server/src/signin.rs](../../crates/hx-server/src/signin.rs), [scripts/install.sh](../../scripts/install.sh) |
+| `FX_DISABLE_KEYCHAIN` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [crates/hx-server/src/signin.rs](../../crates/hx-server/src/signin.rs), [scripts/install.sh](../../scripts/install.sh) |
 | `FX_HERDR` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_MAX_AGENT_STEPS` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_MODEL` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
-| `FX_NO_OPEN_BROWSER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [scripts/install.sh](../../scripts/install.sh) |
+| `FX_NO_OPEN_BROWSER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs), [crates/hx-server/src/guided_setup.rs](../../crates/hx-server/src/guided_setup.rs), [crates/hx-server/src/signin.rs](../../crates/hx-server/src/signin.rs), [scripts/install.sh](../../scripts/install.sh) |
 | `FX_PERMISSION_MODE` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_PROVIDER` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |
 | `FX_SOUND` | [crates/hx-server/src/fx.rs](../../crates/hx-server/src/fx.rs) |

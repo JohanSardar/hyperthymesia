@@ -66,6 +66,8 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
             return Ok(());
         }
     }
+    // The spending limit holds setup like any other run, until next month or a raise.
+    crate::run_log::check_spending(store).await?;
     let mut broker = Broker::new(
         store.clone(),
         crate::disclosure::current(store).await?,
@@ -77,6 +79,27 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
     let mut config = fx::Config::from_env();
     config.max_steps = config.max_steps.min(60);
     config.timeout = config.timeout.min(std::time::Duration::from_secs(600));
+    let chosen = crate::preferences::load(store)
+        .await?
+        .model
+        .unwrap_or_default();
+    let label = store.source(source).await?.map(|s| s.name);
+    let run = crate::run_log::RunLog::start(
+        store,
+        crate::run_log::Start {
+            kind: "setup",
+            job_id: Some(job.id),
+            window_start: None,
+            label: label.as_deref(),
+            provider: &chosen.provider,
+            model: &chosen.model,
+            effort: chosen.effort.as_deref().unwrap_or(""),
+        },
+    )
+    .await?;
+    run.note("Setting up the connection: working out what to read")
+        .await;
+    broker.run_log = Some(run.clone());
     let result = async {
         // Do not put source-controlled prose in the instruction hierarchy.
         // source_info supplies it through the same untrusted tool boundary as responses.
@@ -102,6 +125,13 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
         }
         Ok::<_,anyhow::Error>(())
     }.await;
+    match &result {
+        Ok(()) => {
+            run.note("Saved what to pull and when").await;
+            run.finish("done", None, None).await;
+        }
+        Err(error) => run.fail(error).await,
+    }
     match result {
         Ok(()) => Ok(()),
         Err(_) => {

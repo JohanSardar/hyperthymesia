@@ -1,0 +1,128 @@
+/* The guided tour after setup: one coach mark at a time beside the rail. */
+
+.tour-layer {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-toast);
+  pointer-events: none;
+}
+
+.tour-ring {
+  position: fixed;
+  border: var(--border-width-strong) solid var(--primary);
+  border-radius: var(--radius-card);
+  box-shadow: 0 0 0 4px var(--primary-soft);
+  transition:
+    top var(--duration-slow) var(--ease-out-quint),
+    left var(--duration-slow) var(--ease-out-quint);
+}
+
+.tour-card {
+  position: fixed;
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border: var(--hairline) solid var(--border-2);
+  border-radius: var(--radius-panel);
+  background: var(--popover);
+  box-shadow: var(--sh-overlay);
+  pointer-events: auto;
+  animation: tour-in var(--duration-slow) var(--ease-out-quint) both;
+}
+
+@keyframes tour-in {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+}
+
+.tour-art {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 88px;
+  margin-bottom: var(--space-2);
+  border: var(--hairline) solid var(--border-1);
+  border-radius: var(--radius-card);
+  background-color: var(--card);
+  background-image: radial-gradient(var(--border-2) 1px, transparent 1px);
+  background-size: 10px 10px;
+}
+
+.tour-art-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: var(--hairline) solid var(--border-2);
+  border-radius: var(--radius-card);
+  background: var(--bg);
+  color: var(--primary-ink);
+}
+
+.tour-close {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+}
+
+.tour-step {
+  color: var(--primary-ink);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.tour-title {
+  margin: 0;
+  font-size: var(--text-lg);
+  line-height: var(--leading-lg);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-lg);
+}
+
+.tour-body {
+  margin: 0;
+  color: var(--muted-1);
+  font-size: var(--text-sm);
+  line-height: var(--leading-sm);
+}
+
+.tour-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: var(--space-3);
+}
+
+.tour-dots {
+  display: inline-flex;
+  gap: var(--space-1-5);
+}
+
+.tour-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--border-3);
+  transition: width var(--duration-base) var(--ease-out-quint);
+}
+
+.tour-dots span[data-active] {
+  width: 16px;
+  background: var(--fg);
+}
+
+.tour-actions {
+  display: inline-flex;
+  gap: var(--space-1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tour-card {
+    animation: none;
+  }
+}

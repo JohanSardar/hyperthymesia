@@ -68,6 +68,16 @@ pub async fn run(store: &Store, options: Options) -> Result<i32> {
         report.insert("pairing".into(), json!({"state":state}));
     }
 
+    // A person at the terminal finishes in the app window: it walks through
+    // privacy, permissions, the AI and a proof that recording works, and does
+    // every step it can itself. Agents (--json) keep this guided terminal flow.
+    if let Some(app) = app.as_ref().filter(|_| options.open && !options.json) {
+        let _ = Command::new("/usr/bin/open").arg(app).output();
+        println!("Setup continues in the Hyperthymesia window.");
+        println!("Run hx-server setup again any time to reopen it.");
+        return Ok(0);
+    }
+
     // 3. Provider sign-in: needed only when doctor fails for a missing login.
     let provider = crate::preferences::load(store)
         .await?
@@ -223,10 +233,10 @@ pub fn server_env(state_dir: &Path) -> Vec<(String, String)> {
 fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
 }
-fn support_dir() -> PathBuf {
+pub(crate) fn support_dir() -> PathBuf {
     home().join("Library/Application Support/Hyperthymesia")
 }
-fn app_bundle() -> Option<PathBuf> {
+pub(crate) fn app_bundle() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -283,7 +293,7 @@ fn ensure_app_running(app: &Path) {
     let _ = Command::new("/usr/bin/open").arg("-g").arg(app).output();
 }
 
-fn write_private(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn write_private(path: &Path, value: &Value) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().context("setup folder")?;
     std::fs::create_dir_all(dir)?;
@@ -724,7 +734,7 @@ pub fn claim_login_link(state_dir: &Path, code: &str) -> Option<String> {
     value["token"].as_str().map(str::to_owned)
 }
 
-fn open_url(url: &str) -> bool {
+pub(crate) fn open_url(url: &str) -> bool {
     let opener = if cfg!(target_os = "macos") {
         "/usr/bin/open"
     } else {

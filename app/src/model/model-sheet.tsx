@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react"
 import { api, type Catalog, type CatalogModel, type ModelChoice, type ProviderId } from "../server/api"
 import { useSettings } from "../server/settings"
 import { Badge, Button, Card, CardHeader, DialogClose, Field, IconButton, Input, Radio, RadioGroup, SearchInput, SecretInput, Segmented, Sheet, Skeleton, buttonAttrs, toast } from "../ui"
+import { SigninPanel } from "../agent/signin"
 import { provider, providers, ProviderTile, type Provider } from "./providers"
 import "./model.css"
 
@@ -10,17 +11,19 @@ type Props = {
   open: boolean
   onOpenChange: (open: boolean) => void
   onSaved?: (choice: ModelChoice) => void
+  /** Opens straight on this provider's models. */
+  initialProvider?: ProviderId | null
 }
 
-function ModelSheet({ open, onOpenChange, onSaved }: Props) {
+function ModelSheet({ open, onOpenChange, onSaved, initialProvider }: Props) {
   const { data, save, reload } = useSettings()
   const current = data?.settings.model ?? null
   const [view, setView] = useState<ProviderId | null>(null)
   const [direction, setDirection] = useState<"forward" | "back">("forward")
 
   useEffect(() => {
-    if (open) setView(null)
-  }, [open])
+    if (open) setView(initialProvider ?? null)
+  }, [open, initialProvider])
 
   const go = (next: ProviderId | null) => {
     setDirection(next ? "forward" : "back")
@@ -189,9 +192,8 @@ function ProviderForm({ provider: p, current, keySaved, onCancel, onSave }: Form
           ) : (
             <div className="signin-note">
               <span className="row-label">Sign in with your {p.account} account</span>
-              <span className="row-description">
-                fx keeps the login on this Mac. Hyperthymesia never sees your password. If you're not signed in yet, the Mac setup step opens the sign-in page for you.
-              </span>
+              <span className="row-description">fx keeps the login on this computer. Hyperthymesia never sees your password.</span>
+              {failure && !loading && <SigninPanel id={p.id} compact onDone={check} />}
             </div>
           )}
           <div className="form-card-foot">
@@ -246,7 +248,7 @@ function ProviderForm({ provider: p, current, keySaved, onCancel, onSave }: Form
           ) : (
             <p className="models-empty">
               {failure && p.kind === "signin"
-                ? `Sign in to ${p.name} to see its models, or enter a model ID now. The Mac setup step signs you in.`
+                ? `Sign in to ${p.name} above to see its models, or enter a model ID now.`
                 : "Check access to list the models"}
             </p>
           )}

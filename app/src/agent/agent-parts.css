@@ -1,0 +1,104 @@
+/* Sign-in, Test and run parts shared by setup, the Agent page and Runs. */
+
+.signin-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.signin-line,
+.test-result {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--muted-1);
+  font-size: var(--text-sm);
+  line-height: var(--leading-sm);
+  letter-spacing: var(--tracking-sm);
+}
+
+.signin-line[data-tone="ok"],
+.test-result[data-tone="ok"] {
+  color: var(--fg);
+}
+
+.test-result[data-tone="failed"] {
+  color: var(--fg);
+  font-weight: var(--weight-medium);
+}
+
+.test-result[data-tone="failed"] svg {
+  color: var(--warning);
+  flex: none;
+}
+
+.test-result.muted {
+  color: var(--muted-2);
+}
+
+.signin-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: var(--radius-full);
+  background: var(--success);
+  color: var(--primary-text);
+  animation: pop-in var(--duration-slow) var(--ease-out-quint);
+}
+
+.signin-actions,
+.test-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.signin-help,
+.test-detail {
+  margin: 0;
+  color: var(--muted-2);
+  font-size: var(--text-xs);
+  line-height: var(--leading-xs);
+}
+
+.test-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+  padding: var(--space-3) var(--space-4);
+}
+
+.test-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-height: var(--control-sm);
+}
+
+.test-line .test-result {
+  flex: 1;
+  min-width: 0;
+}
+
+@keyframes pop-in {
+  from {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .signin-mark {
+    animation: none;
+  }
+}

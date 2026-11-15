@@ -1,5 +1,5 @@
 import { lazy, Suspense, type ReactNode } from "react"
-import { createBrowserRouter, Navigate, Outlet, RouterProvider, type RouteObject } from "react-router"
+import { createBrowserRouter, Link, Navigate, Outlet, RouterProvider, useLocation, type RouteObject } from "react-router"
 import { AddConnectionPage } from "./connections/add"
 import { BrowsePage } from "./connections/browse"
 import { ConnectionPage } from "./connections/connection"
@@ -35,17 +35,36 @@ const children: RouteObject[] = [
   { path: "connections/:id", element: <ConnectionPage /> },
   { path: "agent", element: <AgentPage /> },
   { path: "runs", element: <RunsPage /> },
+  { path: "runs/:id", element: <RunsPage /> },
   { path: "devices", element: <DevicesPage /> },
   { path: "settings", element: <SettingsPage /> },
   { path: "kit", element: <Suspense><KitPage /></Suspense> },
   { path: "*", element: <Navigate to="/today" replace /> },
 ]
 
-// First run until a model is chosen; nothing is preselected.
+// First run until setup finishes. Installations from before in-app setup
+// count as set up once a model is chosen; nothing is preselected.
 function FirstRunGate({ children }: { children: ReactNode }) {
   const { data } = useSettings()
-  if (data && data.settings.model === null) return <Navigate to="/setup" replace />
-  return children
+  const location = useLocation()
+  const setup = data?.settings.setup
+  const unfinished = data ? (setup ? !setup.finished : data.settings.model === null) : false
+  if (!unfinished) return children
+  // The optional connections step may open a connection's page and come back.
+  if (setup?.step === "connections" && location.pathname.startsWith("/connections")) {
+    return (
+      <div className="setup-return-frame">
+        <div className="setup-return">
+          <span>Setting up Hyperthymesia</span>
+          <Link to="/setup" className="btn" data-variant="primary" data-size="xs">
+            Back to setup
+          </Link>
+        </div>
+        <div className="setup-return-body">{children}</div>
+      </div>
+    )
+  }
+  return <Navigate to="/setup" replace />
 }
 
 const router = createBrowserRouter(

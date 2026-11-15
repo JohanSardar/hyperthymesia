@@ -100,6 +100,8 @@ pub struct Broker {
     outside_generation: Option<i64>,
     pub(crate) setup_generation: Option<i64>,
     input_changed: watch::Sender<bool>,
+    /// The run record this broker's calls are noted in, by tool name only.
+    pub run_log: Option<crate::run_log::RunLog>,
     #[cfg(test)]
     test_execute: Option<TestExecute>,
 }
@@ -156,6 +158,7 @@ impl Broker {
             outside_generation: None,
             setup_generation: None,
             input_changed: watch::channel(false).0,
+            run_log: None,
             #[cfg(test)]
             test_execute: None,
         }
@@ -590,6 +593,14 @@ impl Broker {
             validated = Err(error);
         }
         let source = validated.as_ref().ok().and_then(|s| s.as_deref());
+        if let Some(log) = &self.run_log {
+            log.note(if validated.is_ok() {
+                step_words(name)
+            } else {
+                "Tried a lookup it isn't allowed to make"
+            })
+            .await;
+        }
         {
             let mut audit = self.audit.lock().await;
             if audit.total_calls >= MAX_CALLS {
@@ -1130,3 +1141,23 @@ fn visible(policy: &DisclosurePolicy, sensitive: SensitiveEgress, e: &Envelope) 
 
 #[cfg(test)]
 mod broker_tests;
+
+/// Plain words for the Runs page log. Never includes arguments or results.
+fn step_words(name: &str) -> &'static str {
+    match name {
+        "live_lookup" | "source_bash" => "Asked a connected source",
+        "agent_sql" => "Read the agent's saved tables",
+        "source_info" => "Read the connection's details",
+        "recipe_test" => "Tested a pull",
+        "recipe_save" => "Saved a pull",
+        "addon_save" => "Saved an add-on",
+        "prior_context" => "Read earlier day-page entries",
+        "read_evidence" => "Read stored records",
+        "screen_at" => "Read screen text from one moment",
+        "list_sources" => "Listed connected sources",
+        "search" => "Searched what was recorded",
+        "timeline" => "Read the timeline",
+        "window_overview" => "Read an overview of the window",
+        _ => "Made a lookup",
+    }
+}

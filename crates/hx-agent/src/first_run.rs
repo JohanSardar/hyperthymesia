@@ -11,10 +11,12 @@ pub(crate) struct Onboarding {
     checked: Instant,
     paired: bool,
     pending: Option<mpsc::Receiver<anyhow::Result<()>>>,
+    remote: Option<mpsc::Receiver<anyhow::Result<()>>>,
     message: Option<String>,
     guide: Option<std::process::Child>,
     guide_checked: Instant,
     started: bool,
+    reopen_after_guide: bool,
 }
 impl Onboarding {
     pub fn new(dir: PathBuf) -> Self {
@@ -23,10 +25,12 @@ impl Onboarding {
             checked: Instant::now() - Duration::from_secs(1),
             paired: false,
             pending: None,
+            remote: None,
             message: None,
             guide: None,
             guide_checked: Instant::now() - Duration::from_secs(5),
             started: false,
+            reopen_after_guide: false,
         }
     }
     /// Starts the setup guide as this app's child, so macOS attributes its privacy
@@ -76,6 +80,13 @@ impl Onboarding {
                 .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < Duration::from_secs(120)))
             {
                 let _ = menu.take_open_app();
+                // Setup in the window asked for this guide: bring the window
+                // back once the guide is done, so setup carries on there.
+                self.reopen_after_guide = std::fs::read(self.dir.join("setup/request.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .and_then(|v| v["run"].as_str().map(|run| run.starts_with("app-")))
+                    .unwrap_or(false);
             }
             let _ = std::fs::remove_file(marker);
         }
@@ -100,6 +111,10 @@ impl Onboarding {
             }
         }
         if self.checked.elapsed() >= Duration::from_secs(1) {
+            if self.reopen_after_guide && !crate::setup::guide_wanted(&self.dir.join("setup")) {
+                self.reopen_after_guide = false;
+                menu.request_page("setup");
+            }
             // A malformed edit must not claim that a configured device is unpaired.
             if let Ok(cfg) = Config::load_at(&self.dir) {
                 self.paired = !cfg.token.is_empty();
@@ -118,6 +133,40 @@ impl Onboarding {
                 }
                 Err(e) => Some(format!("Pairing failed: {e}")),
             };
+        }
+        // The app's setup page asked to send recording to another computer.
+        let request = self.dir.join("pair-request.json");
+        if self.pending.is_none() && self.remote.is_none() && request.is_file() {
+            let link = std::fs::read(&request)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| v["link"].as_str().map(str::to_owned));
+            let _ = std::fs::remove_file(&request);
+            if let Some(link) = link {
+                let (tx, rx) = mpsc::channel();
+                let dir = self.dir.clone();
+                self.remote = Some(rx);
+                self.message = Some("Pairing…".into());
+                std::thread::spawn(move || {
+                    let result = (|| -> anyhow::Result<()> {
+                        tokio::runtime::Runtime::new()?
+                            .block_on(crate::pair::redeem(&link, true, &dir))
+                    })();
+                    let _ = tx.send(result);
+                });
+            }
+        }
+        if let Some(result) = self.remote.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.remote = None;
+            self.message = None;
+            let value = match &result {
+                Ok(()) => serde_json::json!({"state":"done"}),
+                Err(error) => serde_json::json!({"state":"failed","error":format!("{error:#}")}),
+            };
+            let _ = std::fs::write(
+                self.dir.join("pair-result.json"),
+                serde_json::to_vec(&value).unwrap_or_default(),
+            );
         }
         if let Some(link) = menu.take_pair_link()
             && self.pending.is_none()

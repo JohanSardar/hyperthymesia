@@ -183,6 +183,8 @@ pub enum Deferred {
     RateLimited,
     ProviderBusy,
     Until(DateTime<Utc>),
+    /// The owner's monthly spending limit is reached; waits for next month or a raise.
+    SpendingLimit(DateTime<Utc>),
 }
 impl std::fmt::Display for Deferred {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,6 +194,7 @@ impl std::fmt::Display for Deferred {
             Self::RateLimited => "subscription rate limited",
             Self::ProviderBusy => "subscription credential busy",
             Self::Until(_) => "window input settling",
+            Self::SpendingLimit(_) => "spending limit reached",
         })
     }
 }
@@ -203,7 +206,7 @@ async fn defer_attempt(store: &hx_store::Store, job: &Job, reason: &Deferred) ->
     let mut tx = store.begin_write().await?;
     let now = Ts::now();
     let at = match reason {
-        Deferred::Until(at) => Ts::from(*at),
+        Deferred::Until(at) | Deferred::SpendingLimit(at) => Ts::from(*at),
         Deferred::RateLimited => Ts(now.0 + 1_800_000_000),
         Deferred::ProviderBusy => Ts(now.0 + 5_000_000),
         _ => Ts(now.0 + 1_000_000),

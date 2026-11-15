@@ -1,262 +1,330 @@
-import { AlertTriangle, ArrowRight, Play, RotateCw, Sparkles } from "lucide-react"
+import { ArrowRight, CalendarClock, History, KeyRound, LogIn, RotateCw } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
-import { Link, useSearchParams } from "react-router"
-import { useCatalog } from "../connections/catalog"
-import { Logo } from "../connections/logo"
-import { StatusLabel } from "../connections/parts"
-import { ago, until } from "../lib/time"
-import { api, usePolled, type AgentConnection, type Pull } from "../server/connections"
-import { PageHeader } from "../shell"
-import { Button, Card, Confirm, ConfirmTrigger, buttonAttrs, Empty, IconButton, Page, PageIntro, Skeleton, Switch, toast } from "../ui"
-import { useLogoIds } from "./connections"
-import "../connections/connections.css"
+import { Link, NavLink, useLocation } from "react-router"
+import { ConnectionSetups } from "../agent/connection-setups"
+import { ago, at, clock, dayWord, money, runTitle, windowHours } from "../agent/format"
+import { describeProblem, type Fix } from "../agent/problems"
+import { SigninSheet } from "../agent/signin"
+import { TestPanel } from "../agent/test"
+import { effortLabel, ModelSheet } from "../model/model-sheet"
+import { provider, providers, ProviderTile } from "../model/providers"
+import { usePolled } from "../server/connections"
+import { api, type AgentRun, type LastResult, type ProviderId, type ProviderStatus } from "../server/api"
+import { useSettings } from "../server/settings"
+import { PageHeader, PageSidebar, SidebarEmpty, SidebarGroup, useRegisterCommands } from "../shell"
+import { Badge, Button, Card, Input, Page, PageIntro, Row, Section, Skeleton, StatusDot, Switch, toast } from "../ui"
 import "./agent.css"
 
-function humanize(name: string) {
-  const words = name.replace(/[_-]+/g, " ").trim()
-  return words.charAt(0).toUpperCase() + words.slice(1)
+/** Whether a provider account works, from its latest Test or run. */
+type Health = { tone: "idle" | "ok" | "warning" | "error"; text: string; login?: boolean }
+
+function health(p: ProviderStatus | undefined): Health {
+  if (!p) return { tone: "idle", text: "Checking…" }
+  const keyed = p.method === "key"
+  if (!p.signed_in) return { tone: "idle", text: keyed ? "No key saved" : "Not signed in" }
+  const latest = [p.last_check, p.last_run].filter((r): r is NonNullable<LastResult> => Boolean(r)).sort((a, b) => b.at - a.at)[0]
+  const base = keyed ? "Key saved" : "Signed in"
+  if (!latest) return { tone: "ok", text: `${base} · not tested yet` }
+  if (latest.state === "done") return { tone: "ok", text: `${base} · worked ${ago(latest.at)}` }
+  const problem = describeProblem(latest.problem, p.id)
+  const login = latest.problem === "signin" || latest.problem === "key"
+  return { tone: login ? "error" : "warning", text: login ? `${problem?.title} ${ago(latest.at)}` : `${base} · last attempt failed ${ago(latest.at)}`, login }
 }
 
-function describePull(pull: Pull) {
-  const r = pull.recipe?.request ?? {}
-  if (Array.isArray(r.argv)) return r.argv.join(" ")
-  if (typeof r.tool === "string") return `MCP tool ${r.tool}`
-  const method = typeof r.method === "string" ? r.method : "GET"
-  const path = typeof r.path === "string" ? r.path : typeof r.url === "string" ? r.url : ""
-  return path ? `${method} ${path}` : (pull.recipe?.kind ?? "")
-}
+function AgentPage() {
+  const { data, save, reload } = useSettings()
+  const model = data?.settings.model ?? null
+  const accounts = usePolled(api.providers, 5000)
+  const runs = usePolled(() => api.agentRuns(), 15000)
+  const [signin, setSignin] = useState<ProviderId | null>(null)
+  const [sheet, setSheet] = useState<{ open: boolean; provider: ProviderId | null }>({ open: false, provider: null })
+  const location = useLocation()
 
-async function act(run: () => Promise<unknown>, done: string, failed: string, after: () => unknown) {
-  try {
-    await run()
-    toast.success(done)
-  } catch (e) {
-    toast.error(failed, { description: e instanceof Error ? e.message : undefined })
-  } finally {
-    await after()
+  useEffect(() => {
+    if (location.hash && data) document.getElementById(location.hash.slice(1))?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, [location.hash, data])
+
+  const fix = (what: Fix, id: ProviderId | null = model?.provider ?? null) => {
+    if (what === "signin" && id) setSignin(id)
+    else if (what === "key") setSheet({ open: true, provider: "vercel" })
+    else if (what === "model") setSheet({ open: true, provider: model?.provider ?? null })
   }
-}
 
-function PullRow({ pull, sourceOn, refresh }: { pull: Pull; sourceOn: boolean; refresh: () => unknown }) {
-  const on = pull.enabled && !pull.owner_off
-  const failing = Boolean(pull.last_error)
+  useRegisterCommands([
+    { id: "agent.model", label: "Change the model", group: "Agent", run: () => setSheet({ open: true, provider: model?.provider ?? null }) },
+    ...(model?.provider === "codex" || model?.provider === "grok"
+      ? [{ id: "agent.signin", label: `Sign in to ${provider(model.provider).name} again`, group: "Agent", icon: LogIn, run: () => setSignin(model.provider) }]
+      : []),
+  ])
+
+  const list = accounts.data?.providers ?? []
+  const recent = (runs.data?.runs ?? []).slice(0, 6)
   return (
-    <div className="pull-row" data-off={on && sourceOn ? undefined : ""}>
-      <span className="pull-dot" data-state={!on || !sourceOn ? "off" : failing ? "error" : pull.last_ok_at ? "ok" : "waiting"} aria-hidden />
-      <div className="pull-text">
-        <span className="row-label">{humanize(pull.recipe?.name ?? pull.name)}</span>
-        <span className="mono-line pull-request">{describePull(pull)}</span>
-        <span className="pull-meta">
-          {failing ? (
-            <span className="pull-error">
-              <AlertTriangle size={12} aria-hidden /> {pull.last_error}
-            </span>
+    <>
+      <PageHeader title="Agent" />
+      <PageSidebar>
+        <SidebarGroup label="Accounts">
+          {providers.map((p) => {
+            const h = health(list.find((s) => s.id === p.id))
+            return (
+              <a key={p.id} href={`#account-${p.id}`} className="sidebar-row" onClick={(e) => { e.preventDefault(); document.getElementById(`account-${p.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }) }}>
+                <StatusDot tone={h.tone} />
+                <span className="sidebar-row-label">{p.name}</span>
+                {model?.provider === p.id && <span className="sidebar-row-meta">in use</span>}
+              </a>
+            )
+          })}
+        </SidebarGroup>
+        <SidebarGroup label="Recent runs" actions={<Link to="/runs" className="sidebar-group-link">All</Link>}>
+          {!runs.data ? (
+            [0, 1, 2].map((i) => (
+              <div key={i} className="sidebar-row">
+                <Skeleton width="70%" />
+              </div>
+            ))
+          ) : recent.length === 0 ? (
+            <SidebarEmpty>No runs yet</SidebarEmpty>
           ) : (
-            <>
-              <span>{pull.last_ok_at ? `Last pulled ${ago(pull.last_ok_at)}` : "Not pulled yet"}</span>
-              {on && sourceOn && (
-                <>
-                  <span className="sep">·</span>
-                  <span>Next {until(pull.next_run_at)}</span>
-                </>
-              )}
-            </>
+            recent.map((run) => <RunLink key={run.id} run={run} />)
           )}
-        </span>
-      </div>
-      <div className="row-control">
-        <IconButton
-          label="Pull now"
-          disabled={!on || !sourceOn}
-          onClick={() => act(() => api.retryPull(pull.id), "Pull queued", "Couldn't start the pull", refresh)}
-        >
-          <Play size={13} aria-hidden />
-        </IconButton>
-        <Switch
-          checked={on}
-          aria-label={on ? "Switch this pull off" : "Switch this pull on"}
-          onCheckedChange={(checked) => act(() => api.setPullEnabled(pull.id, checked), checked ? "Pull switched on" : "Pull switched off", "Couldn't change the pull", refresh)}
+        </SidebarGroup>
+      </PageSidebar>
+      <Page width="settings">
+        <PageIntro title="Agent" description="Your AI reads what was recorded and writes your day pages. It runs on your own provider login, through fx." />
+
+        <Section title="Provider accounts" description="Each provider keeps its own login. The one in use writes your day pages">
+          <div className="account-list">
+            {providers.map((p) => (
+              <AccountCard
+                key={p.id}
+                status={list.find((s) => s.id === p.id)}
+                inUse={model?.provider === p.id}
+                onSignin={() => setSignin(p.id)}
+                onKey={() => setSheet({ open: true, provider: "vercel" })}
+                onUse={() => setSheet({ open: true, provider: p.id })}
+              />
+            ))}
+          </div>
+        </Section>
+
+        <Section title="Default model" description="Used for every pass and connection setup. Changes apply from the next run">
+          <Card>
+            {model ? (
+              <Row
+                leading={<ProviderTile id={model.provider} />}
+                label={model.model}
+                description={[provider(model.provider).name, model.effort ? `${effortLabel(model.effort)} effort` : "Model's default effort"].join(" · ")}
+                control={<Button onClick={() => setSheet({ open: true, provider: model.provider })}>Change</Button>}
+              />
+            ) : (
+              <Row
+                leading={<span className="tile-empty" aria-hidden />}
+                label="No model chosen"
+                description="Nothing runs until you choose one. Nothing is picked for you"
+                control={
+                  <Button variant="primary" onClick={() => setSheet({ open: true, provider: null })}>
+                    Choose a model
+                  </Button>
+                }
+              />
+            )}
+            {model && <TestPanel model={model} onResult={() => void accounts.refresh()} onFix={(what) => fix(what)} />}
+          </Card>
+        </Section>
+
+        <Schedule upcoming={runs.data?.upcoming ?? []} loaded={Boolean(runs.data)} />
+
+        <SpendingLimit
+          spent={runs.data?.month_spend_usd}
+          limit={data?.settings.spend_limit_usd ?? null}
+          onSave={async (limit) => {
+            await save({ spend_limit_usd: limit })
+            void runs.refresh()
+          }}
         />
-      </div>
-    </div>
+
+        <ConnectionSetups />
+      </Page>
+      <SigninSheet
+        id={signin}
+        open={signin !== null}
+        onOpenChange={(open) => !open && setSignin(null)}
+        onDone={() => {
+          toast.success("Signed in", { description: "Press Test to check it with your model" })
+          void accounts.refresh()
+        }}
+      />
+      <ModelSheet
+        open={sheet.open}
+        initialProvider={sheet.provider}
+        onOpenChange={(open) => setSheet((s) => ({ ...s, open }))}
+        onSaved={() => {
+          void reload()
+          void accounts.refresh()
+        }}
+      />
+    </>
   )
 }
 
-function AgentCard({ item, logoId, focused, refresh }: { item: AgentConnection; logoId?: string; focused: boolean; refresh: () => unknown }) {
-  const { source, setup, pulls, addons } = item
-  const pending = source.status === "setting_up" || setup?.status === "pending"
-  const failed = setup?.status === "failed" || source.status === "failed" || source.status === "needs_attention"
-  const summary = setup?.result?.summary
-  const noPull = setup?.result?.no_pull
-
+function RunLink({ run }: { run: AgentRun }) {
   return (
-    <Card className="agent-card" data-focused={focused ? "" : undefined} data-off={source.enabled ? undefined : ""}>
-      <div className="agent-card-head" id={`c-${source.id}`}>
-        <Logo id={logoId} name={source.name} size={36} />
+    <NavLink to={`/runs/${run.id}`} className="sidebar-row">
+      <StatusDot tone={run.state === "running" ? "live" : run.state === "done" || run.state === "skipped" ? "ok" : run.state === "failed" ? "error" : "warning"} />
+      <span className="sidebar-row-label">{run.kind === "pass" && run.window_start ? windowHours(run.window_start) : runTitle(run)}</span>
+      <span className="sidebar-row-meta">{run.state === "running" ? "running" : dayWord(at(run.kind === "pass" && run.window_start ? run.window_start : run.started_at)).replace("Yesterday", "yest.")}</span>
+    </NavLink>
+  )
+}
+
+function AccountCard({ status, inUse, onSignin, onKey, onUse }: { status: ProviderStatus | undefined; inUse: boolean; onSignin: () => void; onKey: () => void; onUse: () => void }) {
+  if (!status) {
+    return (
+      <Card className="account-card">
+        <Skeleton width={36} height={36} />
         <div className="row-text">
-          <Link to={`/connections/${source.id}`} className="row-label agent-name">
-            {source.name}
-          </Link>
-          <span className="yours-meta">
-            <StatusLabel source={source} setup={setup} />
-            <span className="sep">·</span>
-            <span>{source.last_pull_at ? `Pulled ${ago(source.last_pull_at)}` : "Not pulled yet"}</span>
-          </span>
+          <Skeleton width={120} />
+          <Skeleton width={220} />
         </div>
-        <div className="row-control">
-          <Switch
-            checked={source.enabled}
-            aria-label={source.enabled ? `Switch ${source.name} off` : `Switch ${source.name} on`}
-            onCheckedChange={(checked) =>
-              act(() => api.setEnabled(source.id, checked), checked ? `${source.name} is back on` : `${source.name} is off`, "Couldn't change it", refresh)
-            }
-          />
-        </div>
-      </div>
-
-      <div className="agent-block">
-        <span className="agent-block-label">
-          {failed ? <AlertTriangle size={12} aria-hidden /> : <Sparkles size={12} aria-hidden />} {failed ? "What went wrong" : "What it understood"}
+      </Card>
+    )
+  }
+  const p = provider(status.id)
+  const h = health(status)
+  const keyed = status.method === "key"
+  return (
+    <Card className="account-card" data-in-use={inUse ? "" : undefined}>
+      <span id={`account-${p.id}`} className="account-anchor" />
+      <ProviderTile id={p.id} />
+      <div className="row-text">
+        <span className="account-name">
+          <span className="row-label">{p.name}</span>
+          {inUse && <Badge tone="primary">In use</Badge>}
         </span>
-        {pending ? (
-          <div className="thinking">
-            <span className="thinking-text">Working out what to read and testing a pull…</span>
-            <div className="thinking-lines" aria-hidden>
-              <span />
-              <span />
-            </div>
-          </div>
-        ) : failed ? (
-          <div className="agent-failed">
-            <p>{setup?.last_error ?? source.last_error ?? "Setup didn't finish."}</p>
-          </div>
-        ) : source.status === "needs_reconnect" ? (
-          <p className="agent-summary muted">It couldn't reach {source.name} with the saved sign-in. Reconnect it to let the agent finish.</p>
-        ) : summary ? (
-          <p className="agent-summary">{summary}</p>
-        ) : (
-          <p className="agent-summary muted">Nothing to show yet.</p>
-        )}
-        {noPull && !pending && <p className="agent-nopull">No automatic pull: {noPull}</p>}
-      </div>
-
-      {(pulls.length > 0 || addons.length > 0) && (
-        <div className="agent-block">
-          <span className="agent-block-label">
-            {pulls.length} {pulls.length === 1 ? "pull" : "pulls"} scheduled · every {Math.round(item.cadence_seconds / 3600)} hours
-          </span>
-          <div className="pull-list">
-            {pulls.map((pull) => (
-              <PullRow key={pull.id} pull={pull} sourceOn={source.enabled} refresh={refresh} />
-            ))}
-            {addons.map((addon) => (
-              <div className="pull-row" key={addon.id} data-off={addon.enabled && !addon.owner_off ? undefined : ""}>
-                <span className="pull-dot" data-state={addon.enabled && !addon.owner_off ? "ok" : "off"} aria-hidden />
-                <div className="pull-text">
-                  <span className="row-label">{addon.name}</span>
-                  <span className="pull-meta">{addon.text}</span>
-                </div>
-                <div className="row-control">
-                  <Switch
-                    checked={addon.enabled && !addon.owner_off}
-                    aria-label="Switch this add-on"
-                    onCheckedChange={(checked) => act(() => api.setAddonEnabled(addon.id, checked), checked ? "Add-on on" : "Add-on off", "Couldn't change it", refresh)}
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <div className="agent-foot">
-        <span>
-          {setup ? `Setup ${setup.generation > 1 ? `attempt ${setup.generation} ` : ""}${pending ? "started" : "ran"} ${ago(setup.finished_at ?? setup.created_at)}` : "No setup yet"}
+        <span className="account-status">
+          <StatusDot tone={h.tone} /> {h.text}
         </span>
-        {source.status === "needs_reconnect" ? (
-          <Button size="xs" variant="ghost" render={<Link to={`/connections/${source.id}`} />}>
-            Reconnect <ArrowRight size={12} aria-hidden />
+        <span className="row-description">{keyed ? "One key for models from almost every lab. Billed per request by Vercel." : `Your ${p.account} plan. Included in it; no charge per run.`}</span>
+      </div>
+      <div className="row-control">
+        {keyed ? (
+          <Button variant={status.signed_in ? "ghost" : "default"} onClick={onKey}>
+            <KeyRound size={13} aria-hidden /> {status.signed_in ? "Replace key" : "Add key"}
           </Button>
         ) : (
-          <Confirm
-            title={`Set up ${source.name} again?`}
-            description="Starts a new agent run with your model. Pulls you switched off stay off."
-            confirmLabel="Retry setup"
-            onConfirm={() => act(() => api.retrySetup(source.id), "Setup started again", "Couldn't retry setup", refresh)}
-            trigger={
-              <ConfirmTrigger {...buttonAttrs(failed ? "default" : "ghost", "xs")} disabled={pending || !source.enabled}>
-                <RotateCw size={12} aria-hidden /> Retry setup
-              </ConfirmTrigger>
-            }
-          />
+          <Button variant={h.login ? "primary" : status.signed_in ? "ghost" : "default"} onClick={onSignin}>
+            {h.login ? <RotateCw size={13} aria-hidden /> : <LogIn size={13} aria-hidden />} {status.signed_in ? "Sign in again" : "Sign in"}
+          </Button>
+        )}
+        {!inUse && status.signed_in && (
+          <Button variant="ghost" onClick={onUse}>
+            Use
+          </Button>
         )}
       </div>
     </Card>
   )
 }
 
-function AgentPage() {
-  const [params] = useSearchParams()
-  const focus = params.get("focus")
-  const [fast, setFast] = useState(true)
-  const agent = usePolled(api.agent, fast ? 3000 : 15000)
-  const { catalog } = useCatalog()
-  const logoIds = useLogoIds(catalog)
-  const items = agent.data?.connections ?? []
+function Schedule({ upcoming, loaded }: { upcoming: { available_at: number; catch_up: boolean; held: boolean; window_start: number }[]; loaded: boolean }) {
+  const next = upcoming.find((u) => !u.catch_up && !u.held)
+  const nextCatchUp = upcoming.find((u) => u.catch_up && !u.held)
+  const held = upcoming.some((u) => u.held)
+  const when = (us: number) => {
+    const d = at(us)
+    return d.getTime() < Date.now() ? "now" : `${dayWord(d).toLowerCase() === "today" ? "today" : dayWord(d)} at ${clock(d)}`
+  }
+  return (
+    <Section title="Schedule" description="It runs by itself. You never need to start a run" actions={<Button variant="ghost" size="xs" render={<Link to="/runs" />}><History size={12} aria-hidden /> Runs <ArrowRight size={12} aria-hidden /></Button>}>
+      <Card>
+        <Row
+          leading={<CalendarClock size={16} strokeWidth={1.75} className="row-icon" aria-hidden />}
+          label="Every 4 hours"
+          description="When a 4-hour window ends and its last minutes are in, the AI reads what was recorded in it and writes that part of your day page."
+          control={<span className="schedule-next">{!loaded ? <Skeleton width={90} /> : next ? `Next ${when(next.available_at)}` : "Waiting for recording"}</span>}
+        />
+        <Row
+          leading={<RotateCw size={16} strokeWidth={1.75} className="row-icon" aria-hidden />}
+          label="Next-day catch-up"
+          description="A day later it reads each window again with anything that arrived late, such as synced calendar events, and updates the page only if something changed."
+          control={<span className="schedule-next">{!loaded ? <Skeleton width={90} /> : nextCatchUp ? `Next ${when(nextCatchUp.available_at)}` : "None due"}</span>}
+        />
+        {held && <Row label="Held by the spending limit" description="Some runs wait for next month, or for a higher limit below." />}
+      </Card>
+    </Section>
+  )
+}
 
+function SpendingLimit({ spent, limit, onSave }: { spent: number | undefined; limit: number | null; onSave: (limit: number | null) => Promise<void> }) {
+  const [on, setOn] = useState(limit !== null)
+  const [value, setValue] = useState(limit !== null ? String(limit) : "")
   useEffect(() => {
-    if (agent.data) setFast(items.some((c) => c.source.status === "setting_up" || c.setup?.status === "pending"))
-  }, [agent.data, items])
+    setOn(limit !== null)
+    setValue(limit !== null ? String(limit) : "")
+  }, [limit])
+  const parsed = Number(value)
+  const valid = value.trim() !== "" && Number.isFinite(parsed) && parsed >= 0 && parsed <= 100000
+  const changed = valid && parsed !== limit
+  const used = useMemo(() => (limit && spent !== undefined ? Math.min(1, spent / limit) : null), [limit, spent])
 
-  useEffect(() => {
-    if (focus && agent.data) document.getElementById(`c-${focus}`)?.scrollIntoView({ behavior: "smooth", block: "center" })
-  }, [focus, agent.data])
-
-  const totals = useMemo(() => {
-    const pulls = items.flatMap((c) => (c.source.enabled ? c.pulls.filter((p) => p.enabled && !p.owner_off) : []))
-    const next = pulls.map((p) => p.next_run_at).filter((t): t is string => Boolean(t)).sort()[0]
-    return { pulls: pulls.length, next, working: items.filter((c) => c.setup?.status === "pending").length }
-  }, [items])
+  const apply = async (next: number | null) => {
+    try {
+      await onSave(next)
+      toast.success(next === null ? "No spending limit" : `Limit set to ${money(next)} a month`)
+    } catch (cause) {
+      toast.error("Couldn't save the limit", { description: cause instanceof Error ? cause.message : undefined })
+    }
+  }
 
   return (
-    <>
-      <PageHeader title="Agent" />
-      <Page width="settings">
-        <PageIntro
-          title="Agent"
-          description={
-            agent.data && items.length
-              ? `${totals.pulls} ${totals.pulls === 1 ? "pull" : "pulls"} scheduled${totals.next ? `, next ${until(totals.next)}` : ""}${totals.working ? ` · setting up ${totals.working}` : ""}`
-              : "What the agent set up for each connection"
+    <Section title="Spending limit" description="Optional. There's no limit unless you set one">
+      <Card className="limit-card">
+        <span id="limit" className="account-anchor" />
+        <Row
+          label="Monthly limit"
+          description="When this month's spending reaches it, no new runs start until next month or until you raise it. A run already going finishes."
+          control={
+            <Switch
+              checked={on}
+              aria-label={on ? "Remove the spending limit" : "Set a spending limit"}
+              onCheckedChange={(checked) => {
+                setOn(checked)
+                if (!checked && limit !== null) void apply(null)
+              }}
+            />
           }
         />
-        {!agent.data && !agent.error ? (
-          <Card>
-            <div className="agent-card-head">
-              <Skeleton width={36} height={36} />
-              <div className="row-text">
-                <Skeleton width={120} />
-                <Skeleton width={200} />
-              </div>
-            </div>
-          </Card>
-        ) : agent.error && !agent.data ? (
-          <Empty title="Couldn't reach the server" description={agent.error.message} />
-        ) : items.length === 0 ? (
-          <Card>
-            <Empty title="Nothing set up yet" description="When you connect something, the agent works out what to read, tests it and schedules its pulls here">
-              <Button render={<Link to="/connections" />}>Connect something</Button>
-            </Empty>
-          </Card>
-        ) : (
-          <div className="agent-list">
-            {items.map((item) => (
-              <AgentCard key={item.source.id} item={item} logoId={logoIds.get(item.source.name.toLowerCase())} focused={item.source.id === focus} refresh={agent.refresh} />
-            ))}
+        {on && (
+          <div className="limit-edit">
+            <span className="limit-input">
+              <span className="limit-currency" aria-hidden>
+                $
+              </span>
+              <Input inputMode="decimal" placeholder="10" value={value} onChange={(e) => setValue(e.currentTarget.value)} aria-label="Monthly limit in US dollars" />
+              <span className="row-description">a month</span>
+            </span>
+            <Button variant="primary" disabled={!changed} onClick={() => void apply(parsed)}>
+              Save
+            </Button>
           </div>
         )}
-      </Page>
-    </>
+        <Row
+          label="This month"
+          description="Codex and Grok runs are part of your plan and count as $0. Vercel AI Gateway reports each run's cost."
+          control={
+            <span className="limit-spent">
+              {spent === undefined ? <Skeleton width={60} /> : money(spent)}
+              {limit !== null && spent !== undefined && <span className="row-description"> of {money(limit)}</span>}
+            </span>
+          }
+        />
+        {used !== null && (
+          <div className="limit-meter" aria-hidden>
+            <span style={{ width: `${used * 100}%` }} data-full={used >= 1 ? "" : undefined} />
+          </div>
+        )}
+      </Card>
+    </Section>
   )
 }
 
