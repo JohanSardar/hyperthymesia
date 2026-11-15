@@ -8,20 +8,20 @@ const listeners = new Set<() => void>()
 function read(): Theme {
   try {
     const value = localStorage.getItem(key)
-    return value === "dark" || value === "light" ? value : "system"
+    return value === "light" || value === "system" ? value : "dark"
   } catch {
-    return "system"
+    return "dark"
   }
 }
 
+// Dark is the default; the attribute is always set so tokens never guess.
 function apply(theme: Theme) {
-  if (theme === "system") delete document.documentElement.dataset.theme
-  else document.documentElement.dataset.theme = theme
+  document.documentElement.dataset.theme = theme
 }
 
 function setTheme(theme: Theme) {
   try {
-    if (theme === "system") localStorage.removeItem(key)
+    if (theme === "dark") localStorage.removeItem(key)
     else localStorage.setItem(key, theme)
   } catch {
     // Storage can be blocked; the choice still applies for this visit.

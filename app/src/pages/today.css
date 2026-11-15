@@ -1,13 +1,13 @@
 .live-pill {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   height: 24px;
-  padding: 0 10px 0 9px;
+  padding: 0 var(--space-2-5) 0 var(--space-2);
   border: var(--hairline) solid var(--border-2);
   border-radius: var(--radius-full);
   color: var(--muted-1);
-  font-size: 12px;
+  font-size: var(--text-xs);
   font-weight: var(--weight-medium);
   transition: color var(--duration-fast) var(--ease-standard);
 }
@@ -32,15 +32,15 @@
   position: relative;
   display: grid;
   grid-template-rows: auto auto 1fr auto;
-  gap: 6px;
+  gap: var(--space-1-5);
   min-height: 132px;
-  padding: 16px 20px;
+  padding: var(--space-4) var(--space-5);
 }
 
 .stat-value-text {
-  font-size: 18px;
-  line-height: 26.4px;
-  letter-spacing: -0.3px;
+  font-size: var(--text-lg);
+  line-height: var(--leading-lg);
+  letter-spacing: var(--tracking-lg);
 }
 
 .stat-of {
@@ -50,7 +50,7 @@
 .spark {
   display: flex;
   align-items: flex-end;
-  gap: 2px;
+  gap: var(--space-0-5);
   height: 24px;
   align-self: end;
 }
@@ -58,7 +58,7 @@
 .spark > span {
   flex: 1;
   min-height: 2px;
-  border-radius: 1px;
+  border-radius: var(--radius-inner);
   background: var(--secondary);
   transition: height var(--duration-slow) var(--ease-out-quint), background-color var(--duration-slow) var(--ease-standard);
 }
@@ -72,20 +72,20 @@
 .log-groups {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 .log-group {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .log-hour {
-  padding-left: 2px;
+  padding-left: var(--space-0-5);
   color: var(--muted-2);
-  font-size: 12px;
-  line-height: 15.6px;
+  font-size: var(--text-xs);
+  line-height: var(--leading-xs);
   font-variant-numeric: tabular-nums;
 }
 
@@ -105,9 +105,9 @@
   display: grid;
   grid-template-columns: 64px 128px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   height: 40px;
-  padding: 0 16px;
+  padding: 0 var(--space-4);
   overflow: hidden;
   transition: background-color var(--duration-hover) var(--ease-standard);
 }
@@ -120,14 +120,14 @@
   display: grid;
   grid-template-columns: 64px 128px 1fr;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   height: 40px;
-  padding: 0 16px;
+  padding: 0 var(--space-4);
 }
 
 .log-time {
   color: var(--muted-2);
-  font-size: 12px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -135,10 +135,10 @@
 .log-source {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   min-width: 0;
   color: var(--muted-1);
-  font-size: 12px;
+  font-size: var(--text-xs);
   font-weight: var(--weight-medium);
 }
 
@@ -156,14 +156,14 @@
 .log-logo.logo[data-size="24"] {
   width: 18px;
   height: 18px;
-  border-radius: 5px;
-  font-size: 10px;
+  border-radius: var(--radius-md);
+  font-size: var(--text-2xs);
 }
 
 .log-text {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   min-width: 0;
 }
 
@@ -174,9 +174,9 @@
 
 .log-line {
   overflow: hidden;
-  font-size: 13px;
-  line-height: 16.25px;
-  letter-spacing: -0.13px;
+  font-size: var(--text-sm);
+  line-height: var(--leading-sm);
+  letter-spacing: var(--tracking-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -185,24 +185,24 @@
   max-width: 220px;
   overflow: hidden;
   color: var(--muted-3);
-  font-size: 12px;
+  font-size: var(--text-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 /* A new entry opens its own space, slides down into it and glows once. */
 .log-row[data-fresh] {
-  animation: log-open 360ms var(--ease-out-quint);
+  animation: log-open var(--duration-slow) var(--ease-out-quint);
 }
 
 .log-row[data-fresh] .log-row-inner {
   animation:
-    log-slide 420ms var(--ease-out-quint),
-    log-glow 1600ms var(--ease-out);
+    log-slide var(--duration-slower) var(--ease-out-quint),
+    log-glow var(--duration-pulse) var(--ease-out);
 }
 
 .log-group:has(.log-row[data-fresh]) .log-hour {
-  animation: fade-in 200ms var(--ease-out);
+  animation: fade-in var(--duration-base) var(--ease-out);
 }
 
 @keyframes log-open {
@@ -264,7 +264,7 @@
 @media (max-width: 560px) {
   .log-row-inner {
     grid-template-columns: 52px 18px minmax(0, 1fr);
-    gap: 10px;
+    gap: var(--space-2-5);
   }
 
   .log-source > span:last-child {

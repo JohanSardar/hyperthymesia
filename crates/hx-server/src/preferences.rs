@@ -24,7 +24,7 @@ impl Default for Preferences {
             model: None,
             mac_recording: true,
             chunk_retention_days: 30,
-            appearance: "system".into(),
+            appearance: "dark".into(),
         }
     }
 }
