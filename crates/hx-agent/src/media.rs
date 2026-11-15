@@ -98,9 +98,9 @@ fn run_inner(
             && !control.is_paused()
             && !hx_macos_sys::secure_input()
             && screen
-            && focus.as_ref().is_some_and(|f| {
-                policy.allows(&f.bundle_id, f.title.as_deref()) && f.title.is_some()
-            });
+            && focus
+                .as_ref()
+                .is_some_and(|f| policy.allows_focus(f) && f.title.is_some());
         if health_due(last_health.elapsed(), last_screen, screen) {
             last_health = Instant::now();
             last_screen = Some(screen);
@@ -195,6 +195,8 @@ fn run_inner(
                 let mut now = hx_macos_sys::frontmost();
                 if let Some(f) = now.as_mut() {
                     f.title = hx_macos_sys::window_title(f);
+                    // The page address comes from the main loop; compare the rest.
+                    f.url.clone_from(&s.focus.url);
                 }
                 if now.as_ref() != Some(&s.focus)
                     || control.is_paused()
@@ -205,7 +207,7 @@ fn run_inner(
                         hx_macos_sys::session_locked().unwrap_or(true),
                         hx_macos_sys::display_asleep(),
                     )
-                    || !policy.allows(&s.focus.bundle_id, s.focus.title.as_deref())
+                    || !policy.allows_focus(&s.focus)
                     || !hx_macos_sys::permissions().screen
                 {
                     continue;
@@ -220,6 +222,8 @@ fn run_inner(
             let mut now = hx_macos_sys::frontmost();
             if let Some(f) = now.as_mut() {
                 f.title = hx_macos_sys::window_title(f);
+                // The page address comes from the main loop; compare the rest.
+                f.url.clone_from(&s.focus.url);
             }
             if now.as_ref() != Some(&s.focus)
                 || control.is_paused()
@@ -231,7 +235,7 @@ fn run_inner(
                     hx_macos_sys::session_locked().unwrap_or(true),
                     hx_macos_sys::display_asleep(),
                 )
-                || !policy.allows(&s.focus.bundle_id, s.focus.title.as_deref())
+                || !policy.allows_focus(&s.focus)
             {
                 s.stills.latest = None;
                 std::thread::sleep(Duration::from_millis(100));
@@ -259,6 +263,8 @@ fn run_inner(
                 let mut now = hx_macos_sys::frontmost();
                 if let Some(f) = now.as_mut() {
                     f.title = hx_macos_sys::window_title(f);
+                    // The page address comes from the main loop; compare the rest.
+                    f.url.clone_from(&s.focus.url);
                 }
                 if now.as_ref() != Some(&s.focus)
                     || control.is_paused()
@@ -270,7 +276,7 @@ fn run_inner(
                         hx_macos_sys::session_locked().unwrap_or(true),
                         hx_macos_sys::display_asleep(),
                     )
-                    || !policy.allows(&s.focus.bundle_id, s.focus.title.as_deref())
+                    || !policy.allows_focus(&s.focus)
                 {
                     continue;
                 }

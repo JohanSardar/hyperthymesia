@@ -18,7 +18,9 @@ pub struct Worker {
     pub request: mpsc::SyncSender<Request>,
     pub samples: mpsc::Receiver<Sample>,
     title_request: mpsc::SyncSender<Focus>,
-    titles: mpsc::Receiver<(i32, Option<String>)>,
+    titles: mpsc::Receiver<(i32, Option<String>, Option<String>)>,
+    /// The page address from the last answer, for that process.
+    url: std::cell::RefCell<(i32, Option<String>)>,
     pub dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl Worker {
@@ -30,8 +32,16 @@ impl Worker {
         }
         while self.titles.try_recv().is_ok() {}
         self.title_request.try_send(focus.clone()).ok()?;
-        let (sample_pid, title) = self.titles.recv_timeout(wait).ok()?;
+        let (sample_pid, title, url) = self.titles.recv_timeout(wait).ok()?;
+        if sample_pid == focus.pid {
+            *self.url.borrow_mut() = (sample_pid, url);
+        }
         (sample_pid == focus.pid).then_some(title)
+    }
+    /// The last page address read for this process; read only for browsers.
+    pub fn url(&self, pid: i32) -> Option<String> {
+        let url = self.url.borrow();
+        (url.0 == pid).then(|| url.1.clone()).flatten()
     }
 
     pub fn start() -> Self {
@@ -42,11 +52,36 @@ impl Worker {
         let (title_request, title_rx) = mpsc::sync_channel::<Focus>(1);
         let (title_tx, titles) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
+            // The same page keeps its address; look again when the window
+            // title changes or after a few seconds.
+            let mut cached: Option<(i32, Option<String>, Option<String>, std::time::Instant)> =
+                None;
             while let Ok(focus) = title_rx.recv() {
-                if title_tx
-                    .send((focus.pid, hx_macos_sys::window_title(&focus)))
-                    .is_err()
-                {
+                let title = hx_macos_sys::window_title(&focus);
+                let url = if hx_macos_sys::is_browser(&focus.bundle_id) {
+                    match &cached {
+                        Some((pid, t, url, at))
+                            if *pid == focus.pid
+                                && *t == title
+                                && at.elapsed() < Duration::from_secs(5) =>
+                        {
+                            url.clone()
+                        }
+                        _ => {
+                            let url = hx_macos_sys::browser_url(&focus);
+                            cached = Some((
+                                focus.pid,
+                                title.clone(),
+                                url.clone(),
+                                std::time::Instant::now(),
+                            ));
+                            url
+                        }
+                    }
+                } else {
+                    None
+                };
+                if title_tx.send((focus.pid, title, url)).is_err() {
                     break;
                 }
             }
@@ -94,6 +129,7 @@ impl Worker {
             samples,
             title_request,
             titles,
+            url: Default::default(),
             dropped,
         }
     }

@@ -15,6 +15,7 @@ pub mod ocr;
 mod preferences;
 pub mod processing;
 pub mod pull;
+mod recording;
 mod settings_api;
 mod setup;
 pub mod sources;
@@ -111,6 +112,7 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         )
         .merge(sources::router())
         .merge(settings_api::router())
+        .merge(recording::router())
         .merge(day_api::router())
         .merge(connection_api::router())
         .route(

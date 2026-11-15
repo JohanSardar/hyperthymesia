@@ -171,15 +171,15 @@ let signinTitle = request.signin_title ?? "your model provider"
 func stepCopy(_ id: String) -> Copy {
     switch id {
     case "accessibility":
-        return Copy(title: "Accessibility", action: "Switch on Hyperthymesia.",
+        return Copy(title: "Accessibility", action: "Switch on \(appName). Not in the list? Drag it in:",
                     why: "So it can see which app and window you’re working in.",
                     done: "Accessibility is on", symbol: "accessibility")
     case "input":
-        return Copy(title: "Input Monitoring", action: "Switch on Hyperthymesia.",
+        return Copy(title: "Input Monitoring", action: "Switch on \(appName). Not in the list? Drag it in:",
                     why: "So it can tell when you’re active. It counts keys, never which ones.",
                     done: "Input Monitoring is on", symbol: "keyboard")
     case "screen":
-        return Copy(title: "Screen Recording", action: "Switch on Hyperthymesia.",
+        return Copy(title: "Screen Recording", action: "Switch on \(appName). Not in the list? Drag it in:",
                     why: "So it can read text from the window you’re in. Screen images are never saved.",
                     done: "Screen Recording is on", symbol: "record.circle")
     default:
@@ -193,6 +193,111 @@ let pane: [String: String] = [
     "input": "Privacy_ListenEvent",
     "screen": "Privacy_ScreenCapture",
 ]
+
+// MARK: The app itself, for dragging into the list
+
+/// Hyperthymesia.app: this guide runs from its Contents/MacOS folder.
+let appURL: URL? = {
+    var url = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    for _ in 0..<3 { url.deleteLastPathComponent() }
+    return url.pathExtension == "app" ? url : nil
+}()
+let appName = appURL.flatMap { Bundle(url: $0)?.object(forInfoDictionaryKey: "CFBundleName") as? String } ?? "Hyperthymesia"
+
+/// The app's real icon and name. Dragging it drops the app bundle itself, which
+/// is what a System Settings privacy list accepts. Adapted from Synara's
+/// GrantCoach (MIT); dragging the chip never moves the panel.
+final class AppDragView: NSView, NSDraggingSource {
+    let url: URL
+    private let iconView = NSImageView()
+    private let grip = NSImageView()
+    private let name = NSTextField(labelWithString: "")
+    private let hint = NSTextField(labelWithString: "Drag into the list")
+    init(url: URL) {
+        self.url = url
+        super.init(frame: NSRect(x: 0, y: 0, width: 252, height: 52))
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.cornerCurve = .continuous
+        layer?.borderWidth = 1
+        iconView.image = NSWorkspace.shared.icon(forFile: url.path)
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        grip.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: nil)
+        grip.contentTintColor = .tertiaryLabelColor
+        name.stringValue = appName
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        name.textColor = .labelColor
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        for v in [iconView, grip, name, hint] { addSubview(v) }
+        toolTip = "Drag \(appName) into the list in System Settings"
+        setAccessibilityLabel("\(appName). Drag into the list in System Settings.")
+        updateColors()
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 252), heightAnchor.constraint(equalToConstant: 52),
+        ])
+    }
+    @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
+    func updateColors() {
+        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer?.borderColor = NSColor.separatorColor.cgColor
+    }
+    override func viewDidChangeEffectiveAppearance() { updateColors() }
+    override func layout() {
+        super.layout()
+        iconView.frame = NSRect(x: 10, y: 8, width: 36, height: 36)
+        name.frame = NSRect(x: 54, y: 26, width: bounds.width - 90, height: 18)
+        hint.frame = NSRect(x: 54, y: 9, width: bounds.width - 90, height: 15)
+        grip.frame = NSRect(x: bounds.width - 28, y: 18, width: 16, height: 16)
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(convert(point, from: superview)) ? self : nil
+    }
+    override func mouseDown(with event: NSEvent) {
+        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        icon.size = NSSize(width: 48, height: 48)
+        let at = convert(event.locationInWindow, from: nil)
+        item.setDraggingFrame(NSRect(x: at.x - 24, y: at.y - 24, width: 48, height: 48), contents: icon)
+        let session = beginDraggingSession(with: [item], event: event, source: self)
+        session.animatesToStartingPositionsOnCancelOrFail = true
+    }
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .outsideApplication ? [.copy, .link, .generic] : []
+    }
+    func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) { alphaValue = 0.45 }
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) { alphaValue = 1 }
+}
+
+/// macOS's "quit and reopen" sheet, told apart from the password sheet by its
+/// button when the guide can read it (it can once Accessibility is on).
+func quitSheetVisible() -> Bool? {
+    guard AXIsProcessTrusted(),
+          let settings = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.systempreferences" })
+    else { return nil }
+    let app = AXUIElementCreateApplication(settings.processIdentifier)
+    AXUIElementSetMessagingTimeout(app, 0.1)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+          let windows = value as? [AXUIElement] else { return nil }
+    var queue = windows
+    var seen = 0
+    while !queue.isEmpty && seen < 300 {
+        let node = queue.removeFirst()
+        seen += 1
+        var title: CFTypeRef?
+        if AXUIElementCopyAttributeValue(node, kAXTitleAttribute as CFString, &title) == .success,
+           let t = title as? String, t.localizedCaseInsensitiveContains("Reopen") { return true }
+        var children: CFTypeRef?
+        if AXUIElementCopyAttributeValue(node, kAXChildrenAttribute as CFString, &children) == .success,
+           let list = children as? [AXUIElement] { queue.append(contentsOf: list) }
+    }
+    return false
+}
 
 // MARK: Panel
 
@@ -212,6 +317,8 @@ final class Guide: NSObject {
     let action = NSTextField(wrappingLabelWithString: "")
     let why = NSTextField(wrappingLabelWithString: "")
     let notNow = NSButton(title: "Not now", target: nil, action: nil)
+    let reopen = NSButton(title: "Reopen \(appName)", target: nil, action: nil)
+    let chip: AppDragView? = appURL.map { AppDragView(url: $0) }
     var index = 0
     var promptSeen = false
     var cancelled = false
@@ -261,14 +368,24 @@ final class Guide: NSObject {
         notNow.bezelStyle = .rounded
         notNow.target = self
         notNow.action = #selector(skip)
+        reopen.bezelStyle = .rounded
+        reopen.keyEquivalent = ""
+        reopen.target = self
+        reopen.action = #selector(reopenApp)
+        reopen.isHidden = true
+        for b in [notNow, reopen] { b.refusesFirstResponder = true }
+        let buttons = NSStackView(views: [notNow, reopen])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
 
-        let stack = NSStackView(views: [icon, counter, title, action, why, notNow])
+        let stack = NSStackView(views: [icon, counter, title, action] + (chip.map { [$0] } ?? []) + [why, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
         stack.setCustomSpacing(12, after: icon)
         stack.setCustomSpacing(2, after: counter)
         stack.setCustomSpacing(14, after: why)
+        if let chip { stack.setCustomSpacing(10, after: action); stack.setCustomSpacing(12, after: chip) }
         stack.edgeInsets = NSEdgeInsets(top: 30, left: 24, bottom: 20, right: 24)
         stack.translatesAutoresizingMaskIntoConstraints = false
         let content = NSView()
@@ -302,7 +419,7 @@ final class Guide: NSObject {
         grantedThisRun = state.steps.contains { $0.state == "done" && pane[$0.id] != nil }
         save()
         next()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in self?.tick() }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.tick() }
     }
 
     let open: Set<String> = ["pending", "waiting_user", "waiting_system"]
@@ -365,6 +482,8 @@ final class Guide: NSObject {
                         self.phase = "alert"
                         self.set(i, "waiting_user", detail: "macos alert")
                         self.action.stringValue = "Click Open System Settings."
+                        self.chip?.isHidden = true
+                        self.fit()
                     }
                     else { self.openPane(anchor) }
                 }
@@ -396,6 +515,9 @@ final class Guide: NSObject {
     func restartIfNeeded() {
         guard grantedThisRun, restartedAt == nil else { return }
         restartedAt = Date()
+        // Tells the restarted app not to open its window over System Settings.
+        FileManager.default.createFile(atPath: support.appendingPathComponent("restarting").path, contents: nil,
+                                       attributes: [.posixPermissions: 0o600])
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         task.arguments = ["kickstart", "-k", "gui/\(getuid())/com.hyperthymesia.agent"]
@@ -403,6 +525,10 @@ final class Guide: NSObject {
         task.standardError = FileHandle.nullDevice
         try? task.run()
         task.waitUntilExit()
+        // Keep macOS's own box in view if the restarted app came forward.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systempreferences").first?.activate()
+        }
     }
 
     func tick() {
@@ -415,6 +541,8 @@ final class Guide: NSObject {
                 phase = "act"
                 set(index, "waiting_user")
                 action.stringValue = stepCopy(id).action
+                chip?.isHidden = false
+                fit()
                 openPane(pane[id]!)
             }
             dock()
@@ -433,33 +561,43 @@ final class Guide: NSObject {
             }
             return
         }
-        if authPromptVisible() {
+        if quitSheetVisible() == true {
+            showQuitSheet()
+        } else if authPromptVisible() {
             if !promptSeen { promptSeen = true; set(index, "waiting_system") }
-            action.stringValue = "Confirm with Touch ID or your password."
+            action.stringValue = "macOS is asking for your password."
+            why.stringValue = "Type it into macOS’s box, or use Touch ID. This panel never sees it."
+            chip?.isHidden = true
         } else if promptSeen {
             // The prompt closed and the switch is still off: it was cancelled.
             promptSeen = false
             cancelled = true
             set(index, "waiting_user", detail: "password prompt cancelled")
-            action.stringValue = "Nothing changed. Switch on Hyperthymesia to try again."
+            action.stringValue = "Nothing changed. Switch on \(appName) to try again, or drag it in:"
+            why.stringValue = stepCopy(id).why
+            chip?.isHidden = false
+        } else if !reopen.isHidden {
+            reopen.isHidden = true
+            action.stringValue = stepCopy(id).action
+            why.stringValue = stepCopy(id).why
         }
-        dock()
+        fit()
     }
 
     /// Done when the restarted app has read screen text.
     func tickConfirm() {
         if capturePromptVisible() {
             set(index, "waiting_system", detail: "macos asks")
+            reopen.isHidden = true
             action.stringValue = "Click Allow."
             why.stringValue = "macOS checks once before the first screenshot."
             return
         }
-        if settingsSheetVisible() {
-            // "Quit & Reopen / Later": the guide already restarted the app.
-            action.stringValue = "Click Later."
-            why.stringValue = "Hyperthymesia has already restarted itself."
+        if quitSheetVisible() ?? settingsSheetVisible() {
+            showQuitSheet()
             return
         }
+        reopen.isHidden = true
         why.stringValue = "macOS may ask once more before the first screenshot."
         if state.steps[index].detail == "macos asks" { set(index, "waiting_system", detail: "confirming") }
         action.stringValue = "Waiting for the first screen text…"
@@ -486,6 +624,7 @@ final class Guide: NSObject {
     func showConfirm() {
         show("screen")
         title.stringValue = "Screen Recording"
+        chip?.isHidden = true
         action.stringValue = "Waiting for the first screen text…"
         why.stringValue = "macOS may ask once more before the first screenshot."
     }
@@ -518,12 +657,45 @@ final class Guide: NSObject {
         action.isHidden = true
         why.isHidden = true
         notNow.isHidden = true
+        chip?.isHidden = true
+        reopen.isHidden = true
+        fit()
         advance()
     }
 
     func advance() {
         advancing = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { self.next() }
+    }
+
+    /// macOS wants the app to quit and reopen before a new grant counts.
+    func showQuitSheet() {
+        action.stringValue = "macOS wants to quit and reopen \(appName)."
+        why.stringValue = "Click Later in macOS’s box, then Reopen here. Nothing you recorded is lost."
+        chip?.isHidden = true
+        reopen.isHidden = false
+        fit()
+    }
+
+    @objc func reopenApp() {
+        restartedAt = nil
+        grantedThisRun = true
+        restartIfNeeded()
+        reopen.title = "Reopening…"
+        reopen.isEnabled = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            self.reopen.title = "Reopen \(appName)"
+            self.reopen.isEnabled = true
+        }
+    }
+
+    /// Resize to the content, then stay beside System Settings.
+    func fit() {
+        let before = panel.frame.size
+        panel.contentView?.layoutSubtreeIfNeeded()
+        let size = panel.contentView!.fittingSize
+        if size != before { panel.setContentSize(size) }
+        dock()
     }
 
     @objc func skip() {
@@ -572,6 +744,8 @@ final class Guide: NSObject {
         action.isHidden = false
         why.isHidden = false
         notNow.isHidden = false
+        reopen.isHidden = true
+        chip?.isHidden = pane[id] == nil
         icon.contentTintColor = .labelColor
         if id == "signin", let browser = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!) {
             icon.image = NSWorkspace.shared.icon(forFile: browser.path)

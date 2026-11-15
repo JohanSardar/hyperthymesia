@@ -36,7 +36,6 @@ pub fn main() -> Result<()> {
     let options = Options::parse();
     let cfg = Config::load_at(&options.support_dir)?;
     let stop = Arc::new(AtomicBool::new(false));
-    let paused = Arc::new(AtomicBool::new(false));
     let quit = Arc::new(AtomicBool::new(false));
     let main_loop = if options.headless {
         None
@@ -46,7 +45,7 @@ pub fn main() -> Result<()> {
     let mut menu = if options.headless {
         None
     } else {
-        hx_macos_sys::MenuBar::new(paused, stop.clone(), quit)
+        hx_macos_sys::MenuBar::new(stop.clone(), quit)
     };
     if let Some(menu) = &mut menu {
         menu.disable_permissions();
@@ -81,6 +80,7 @@ pub fn main() -> Result<()> {
                     pid: 0,
                     title: Some("Synthetic fixture".into()),
                     electron: false,
+                    url: None,
                 }),
                 secure: false,
                 blobs: vec![],

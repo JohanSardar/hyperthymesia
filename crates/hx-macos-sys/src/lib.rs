@@ -34,6 +34,27 @@ pub fn permissions() -> Permissions {
         input: CGPreflightListenEventAccess(),
     }
 }
+/// macOS caches AXIsProcessTrusted inside a running process, so it keeps
+/// answering yes after the person switches Accessibility off. One real query
+/// tells: it fails with "API disabled" once access is gone.
+pub fn accessibility_live() -> bool {
+    if !unsafe { AXIsProcessTrusted() } {
+        return false;
+    }
+    unsafe {
+        let system = AXUIElement::new_system_wide();
+        system.set_messaging_timeout(0.05);
+        let mut value = std::ptr::null();
+        let error = system.copy_attribute_value(
+            &CFString::from_str("AXFocusedApplication"),
+            NonNull::from(&mut value),
+        );
+        if let Some(value) = NonNull::new(value.cast_mut()) {
+            drop(CFRetained::<CFType>::from_raw(value));
+        }
+        error != objc2_application_services::AXError::APIDisabled
+    }
+}
 /// Explicit user initiated onboarding only.
 pub fn onboard() -> Permissions {
     // AX's prompt option is the sole request path for accessibility.
@@ -105,6 +126,9 @@ pub struct Focus {
     pub pid: i32,
     pub title: Option<String>,
     pub electron: bool,
+    /// The page address; kept only for browsers while a never-record site exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 pub fn frontmost() -> Option<Focus> {
     let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
@@ -131,7 +155,58 @@ fn focus_from_app(app: &objc2_app_kit::NSRunningApplication) -> Focus {
                 .join("Contents/Frameworks/Electron Framework.framework")
                 .exists()
         }),
+        url: None,
     }
+}
+/// Browsers whose page address can be read through Accessibility.
+pub fn is_browser(bundle_id: &str) -> bool {
+    [
+        "com.apple.Safari",
+        "com.apple.SafariTechnologyPreview",
+        "org.mozilla.firefox",
+        "com.google.Chrome",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "org.chromium.Chromium",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "com.vivaldi.Vivaldi",
+    ]
+    .iter()
+    .any(|b| bundle_id.starts_with(b))
+}
+/// The focused browser window's page address. Reads the window's AXDocument,
+/// then the first web area's AXURL within a small, time-boxed search.
+pub fn browser_url(focus: &Focus) -> Option<String> {
+    if !is_browser(&focus.bundle_id) || secure_input() {
+        return None;
+    }
+    enable_accessibility(focus);
+    let window = focused_window(focus.pid)?;
+    if let Some(doc) = string_attr(&window, "AXDocument").filter(|d| d.contains("://")) {
+        return Some(doc);
+    }
+    let start = std::time::Instant::now();
+    let mut queue = std::collections::VecDeque::from([window]);
+    let mut seen = 0;
+    while let Some(node) = queue.pop_front() {
+        seen += 1;
+        if seen > 400 || start.elapsed() > Duration::from_millis(40) {
+            return None;
+        }
+        if string_attr(&node, "AXRole").as_deref() == Some("AXWebArea") {
+            let url = attribute(&node, "AXURL")?;
+            if let Ok(url) = url.clone().downcast::<objc2_core_foundation::CFURL>() {
+                // CFURL is toll-free bridged to NSURL.
+                let ns: &objc2_foundation::NSURL = unsafe { &*((&*url) as *const _ as *const _) };
+                return ns.absoluteString().map(|s| s.to_string());
+            }
+            return url.downcast::<CFString>().ok().map(|s| s.to_string());
+        }
+        let (children, _) = text_walk::Node::children(&node, 64);
+        queue.extend(children);
+    }
+    None
 }
 fn chromium(focus: &Focus) -> bool {
     [
@@ -618,7 +693,9 @@ pub fn power() -> Power {
 }
 
 mod menu;
-pub use menu::MenuBar;
+mod notify;
+pub use menu::{MenuBar, MenuRequest, Recording};
+pub use notify::{notifications_init, notify, take_notification_click};
 
 pub struct AxObserver {
     observer: CFRetained<objc2_application_services::AXObserver>,
@@ -758,6 +835,7 @@ mod tests {
             pid: 0,
             title: None,
             electron: false,
+            url: None,
         };
         assert!(chromium(&f));
         f.bundle_id = "com.apple.Safari".into();

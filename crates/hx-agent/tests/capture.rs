@@ -139,6 +139,7 @@ fn excluded_app_produces_no_text_still_or_blob_rows() {
         pid: 1,
         title: Some("private".into()),
         electron: false,
+        url: None,
     };
     let (still, blob) = media(b"secret");
     assert!(!persist(&mut out, &policy, Some(&focus), false, &still, &[blob]).unwrap());
@@ -166,6 +167,7 @@ fn title_unknown_and_secure_input_fail_closed() {
         pid: 1,
         title: Some("work".into()),
         electron: false,
+        url: None,
     };
     assert!(!persist(&mut out, &policy, Some(&focus), true, &e, &[b]).unwrap());
     assert_eq!(out.stats().unwrap().0, 0);
@@ -484,6 +486,7 @@ fn browser_companion_content_does_not_require_public_window_signal() {
             pid: 1,
             title: None,
             electron: false,
+            url: None,
         };
         let mut c = companion();
         c.payload = payload;

@@ -1,5 +1,6 @@
 //! Thin native capture: policy, durable delivery, and source observations only.
 pub mod config;
+pub mod controls;
 pub mod envelope;
 pub mod native_messaging;
 pub mod outbox;
