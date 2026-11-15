@@ -16,8 +16,12 @@ mod preferences;
 pub mod processing;
 pub mod pull;
 mod recording;
+pub mod run_log;
+mod runs_api;
 mod settings_api;
 mod setup;
+mod setup_api;
+mod signin;
 pub mod sources;
 use axum::{
     Extension, Json, Router,
@@ -112,6 +116,8 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         )
         .merge(sources::router())
         .merge(settings_api::router())
+        .merge(runs_api::router())
+        .merge(setup_api::router())
         .merge(recording::router())
         .merge(day_api::router())
         .merge(connection_api::router())

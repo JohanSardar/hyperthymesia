@@ -67,6 +67,15 @@ fn login_file(provider: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+/// Whether fx holds a login for this subscription provider (a regular,
+/// owner-only file). Says nothing about whether the provider still accepts it.
+pub(crate) fn login_present(provider: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    login_file(provider).is_some_and(|_| {
+        std::fs::symlink_metadata(credential_path(&Config::from_env(), provider))
+            .is_ok_and(|m| m.is_file() && m.len() > 0 && m.permissions().mode() & 0o077 == 0)
+    })
+}
 /// HX_FX_PROVIDER / HX_FX_MODEL / HX_FX_EFFORT, captured once per run.
 struct Selection {
     provider: String,
@@ -252,6 +261,16 @@ pub(crate) async fn inspect(
     provider: &str,
     model: Option<&crate::preferences::Model>,
 ) -> Result<Value> {
+    inspect_with(store, provider, model, None).await
+}
+/// Like `inspect`, noting tokens and cost in `run`. Failures name what to fix
+/// (a sign-in, a key or the model) without keeping the provider's text.
+pub(crate) async fn inspect_with(
+    store: &Store,
+    provider: &str,
+    model: Option<&crate::preferences::Model>,
+    run: Option<&crate::run_log::RunLog>,
+) -> Result<Value> {
     let provider = if provider == "vercel" {
         "gateway"
     } else {
@@ -270,8 +289,14 @@ pub(crate) async fn inspect(
     let _credential = login_file(provider)
         .map(|name| {
             CredentialLease::acquire(&credential_path(&config, provider), profile.join(name))
+                .with_context(|| {
+                    format!("fx {provider} credential unavailable; run fx login {provider}")
+                })
         })
         .transpose()?;
+    if provider == "gateway" && crate::preferences::gateway_key(store)?.is_none() {
+        anyhow::bail!("fx gateway login requires a nonempty AI_GATEWAY_API_KEY");
+    }
     let mut command = tokio::process::Command::new(&config.binary);
     command
         .env_clear()
@@ -313,9 +338,32 @@ pub(crate) async fn inspect(
         command.args(["models", "--json"]);
         ""
     };
-    let response = output(command, input, Duration::from_secs(45)).await?;
-    ensure!(response.status.success(), "provider request failed");
-    let value: Value = serde_json::from_slice(&response.stdout)?;
+    let response = output(command, input, Duration::from_secs(45)).await;
+    if let Some(run) = run {
+        run.add_usage(crate::run_log::read_usage(&profile));
+    }
+    let response = response?;
+    let failure = |response: &std::process::Output| {
+        let text = format!(
+            "{} {}",
+            String::from_utf8_lossy(&response.stdout),
+            String::from_utf8_lossy(&response.stderr)
+        );
+        match crate::run_log::provider_failure(&text, provider) {
+            Some(kind) => anyhow::anyhow!("fx {provider} {kind}"),
+            None if text.to_lowercase().contains("usage limit") || text.contains("429") => {
+                hx_jobs::Deferred::RateLimited.into()
+            }
+            None => anyhow::anyhow!("provider request failed"),
+        }
+    };
+    if !response.status.success() {
+        return Err(failure(&response));
+    }
+    let value: Value = serde_json::from_slice(&response.stdout).map_err(|_| failure(&response))?;
+    if model.is_some() && value["exit_code"] != 0 {
+        return Err(failure(&response));
+    }
     if model.is_some() {
         ensure!(
             value["exit_code"] == 0
@@ -702,16 +750,30 @@ async fn run_limited(
     // Dropping output kills the child (kill_on_drop), including an fx process
     // waiting on a broker response or retrying after a denied tool call.
     let response = tokio::select! {
-        response = output(cmd, &instruction, config.timeout) => response?,
-        _ = broker.cancelled() => return Err(hx_jobs::Deferred::InputChanged.into()),
+        response = output(cmd, &instruction, config.timeout) => response,
+        _ = broker.cancelled() => Err(hx_jobs::Deferred::InputChanged.into()),
     };
+    // fx records each generation's tokens and dollar cost in its profile.
+    if let Some(log) = &broker.run_log {
+        log.add_usage(crate::run_log::read_usage(&profile));
+    }
+    let response = response?;
     broker.check_generation().await?;
-    let value: Value = serde_json::from_slice(&response.stdout).with_context(|| {
-        format!(
-            "invalid fx response; check the {} login and selected model",
-            selection.provider
-        )
-    })?;
+    let value: Value = match serde_json::from_slice(&response.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(kind) = crate::run_log::provider_failure(
+                &String::from_utf8_lossy(&response.stderr),
+                &selection.provider,
+            ) {
+                anyhow::bail!("fx {} {kind}", selection.provider);
+            }
+            return Err(anyhow::Error::new(error).context(format!(
+                "invalid fx response; check the {} login and selected model",
+                selection.provider
+            )));
+        }
+    };
     let value = broker
         .secret_filter()
         .await?
@@ -752,6 +814,18 @@ async fn run_limited(
         || rate_limited.contains("usage limit")
     {
         return Err(hx_jobs::Deferred::RateLimited.into());
+    }
+    if let Some(kind) = crate::run_log::provider_failure(
+        &format!(
+            "{rate_limited} {}",
+            String::from_utf8_lossy(&response.stderr)
+        ),
+        &selection.provider,
+    ) {
+        anyhow::bail!(
+            "fx {} {kind}; sign in again or check the model",
+            selection.provider
+        );
     }
     anyhow::bail!(
         "fx {} provider failed; check the selected model and {} login",
@@ -803,11 +877,34 @@ pub(crate) async fn interpret_window_with_settle(
         let expected = serde_json::to_value(crate::setup::active_addons(store, &namespaces).await?)?;
         let stored = manifest.get("source_addons").cloned().unwrap_or(json!([]));
         if stored == expected && identity.as_object().unwrap().iter().all(|(k,v)| manifest.get(k).is_some_and(|s| if k == "disclosure_policy" { s["digest"] == v["digest"] } else { s == v })) {
+            // An owner's re-run says plainly that nothing new was sent or spent.
+            if output_key.starts_with("rerun:") {
+                let run = crate::run_log::RunLog::start(store, crate::run_log::Start {
+                    kind: "pass", job_id: crate::run_log::job_id(output_key), window_start: Some(window.start), label: None,
+                    provider: &selection.provider, model: &selection.model, effort: &selection.effort,
+                }).await?;
+                run.note("Nothing changed since the last run with this model, so nothing was sent to the AI").await;
+                run.finish("skipped", None, None).await;
+            }
             return Ok(false);
         }
     }
     let digest_namespaces: Vec<String> = broker.audit.lock().await.input_namespaces.iter().cloned().collect();
     let addons = broker.addon_context(&digest_namespaces).await?;
+    let job_id = crate::run_log::job_id(output_key);
+    if let Err(error) = crate::run_log::check_spending(store).await {
+        if matches!(error.downcast_ref::<hx_jobs::Deferred>(), Some(hx_jobs::Deferred::SpendingLimit(_))) {
+            crate::run_log::note_spending_hold(store, job_id, window, &selection.provider, &selection.model).await?;
+        }
+        return Err(error);
+    }
+    let run = crate::run_log::RunLog::start(store, crate::run_log::Start {
+        kind: "pass", job_id, window_start: Some(window.start), label: None,
+        provider: &selection.provider, model: &selection.model, effort: &selection.effort,
+    }).await?;
+    broker.run_log = Some(run.clone());
+    run.note(format!("Read what was recorded in this window: {} lines", digest.lines().count())).await;
+    let outcome: Result<(i64, bool)> = async {
     let goal = format!(
         "Reconstruct {} to {}. The digest below covers the whole window; every id in it is citable evidence. \
          Use at most {DIGEST_LOOKUPS} stored Hyperthymesia MCP lookups, including list_sources to discover connected sources even when they have no stored records. \
@@ -825,7 +922,8 @@ pub(crate) async fn interpret_window_with_settle(
     let mut first: Option<(Interpretation, BTreeSet<String>)> = None;
     let mut responses = vec![];
     let started = tokio::time::Instant::now();
-    for _ in 0..REPAIR_ATTEMPTS + 1 {
+    for attempt in 0..REPAIR_ATTEMPTS + 1 {
+        run.note(if attempt == 0 { format!("Asked {} to write the day page", selection.model) } else { "Asked it to fix the entries that failed the checks".to_owned() }).await;
         let mut remaining = config.clone();
         remaining.timeout = config
             .timeout
@@ -943,6 +1041,7 @@ pub(crate) async fn interpret_window_with_settle(
         packet.input_digest = hx_store::hash(&serde_json::to_vec(
             &json!({"window":window,"generation":generation,"calls":broker.audit.lock().await.calls,"policy":policy.digest()}),
         )?);
+        run.note("Checking every claim against the records it cites").await;
         match hx_interpret::parse_output(&packet, &text, &selection.model, PROMPT_VERSION) {
             Ok(mut value) => {
                 if let Some((original, rejected)) = &first {
@@ -1038,10 +1137,23 @@ pub(crate) async fn interpret_window_with_settle(
     value["input_manifest"]["source_addons"] = source_addons;
     value["agent_run"] = json!({"digest":digest,"fx_version":FX_VERSION,"model":selection.model,"effort":selection.effort,"fast":false,"prompt_version":PROMPT_VERSION,"calls":audit.calls,"evidence":audit.evidence,"responses":responses});
     let value = broker.secret_filter().await?.scrub_json(&value);
-    Ok(store
+    store
         .publish_disclosed_revision_manifest(window, generation, value, output_key, &namespaces)
-        .await.map_err(crate::disclosure::publish_error)?
-        .1)
+        .await.map_err(crate::disclosure::publish_error)
+    }
+    .await;
+    match &outcome {
+        Ok((revision, true)) => {
+            run.note("Wrote the day page").await;
+            run.finish("done", None, Some(*revision)).await;
+        }
+        Ok((revision, false)) => {
+            run.note("The same account was already written").await;
+            run.finish("done", None, Some(*revision)).await;
+        }
+        Err(error) => run.fail(error).await,
+    }
+    outcome.map(|(_, published)| published)
     }
     .await;
     drop(guard);

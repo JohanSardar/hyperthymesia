@@ -31,7 +31,9 @@ programmatic clients can use a bearer token without an Origin header.
      "model": {"provider":"vercel","model":"anthropic/claude-sonnet-4.5","effort":null},
      "mac_recording":true,
      "chunk_retention_days":30,
-     "appearance":"dark"
+     "appearance":"dark",
+     "spend_limit_usd":null,
+     "setup":{"step":"done","finished":true,"tour_pending":false}
    }
    ```
 
@@ -41,15 +43,29 @@ programmatic clients can use a bearer token without an Origin header.
    saved. Changes apply to the next agent run; in-flight work keeps its choice.
    The server does not change fx's own provider, model, or settings.
 5. `POST /v1/model/check` makes one small request with the saved model/effort.
-   This can cost money. It returns `{"ok":true,"message":"The selected model
-   responded."}` or `ok:false` with a generic failure message. Missing selection
-   is 400. No captured data, source tools, or personal project context is sent.
+   This can cost money. It returns `ok`, a plain `message`, `problem` (null or
+   a code such as `signin`, `key`, `model`, `usage_limit`, `timeout`, `other`),
+   `seconds`, and the `run_id` of the check, which is recorded as a `check` run.
+   Missing selection is 400. No captured data, source tools, or personal project context is sent.
    Provider output and credentials are never returned. Checks use a disposable
    profile. Subscription checks share the agent runner's credential lock and
    save token refreshes to the existing login so it remains usable.
 
-Subscription authentication uses the existing guided setup, which names the
-chosen provider. This API never launches login or opens a system prompt.
+## Provider accounts and sign-in
+
+`GET /v1/providers` returns one entry per provider (`codex`, `grok`, `vercel`)
+with `method` (`subscription` or `key`), `signed_in` (an fx login file or a
+saved key is present), `in_use`, the latest `last_check` and `last_run`
+(state, problem, time), and the current `signin` state.
+
+`POST /v1/providers/ID/signin` starts the provider's own login through
+`fx login ID` on the server's computer (subscriptions only; a key provider is
+400). The provider's page opens once in that computer's browser. `GET` returns
+`{provider, state, url, signed_in}`, where `state` is `idle`, `waiting`, `done`
+or `failed`; `done` means fx exited successfully and its login file exists. An
+unfinished sign-in gives up after ten minutes. `DELETE` cancels it. If fx cannot
+start, the response is 503 with a plain message. Passwords go only to the
+provider; the server never reads or returns the login.
 
 ## Settings
 
@@ -111,7 +127,31 @@ namespace prefixes, scopes and revocation status. `POST` accepts:
 
 Creation returns 201 with `token` **once** and its `id`. Save it privately.
 `DELETE /v1/settings/tokens/ID` revokes it, returning 204 (404 if absent).
+`spend_limit_usd` is an optional monthly limit (0–100000, null for none, the
+default). Once the month's recorded run cost reaches it, new passes wait until
+the next month; a run already going finishes. Raising or removing the limit, or
+changing the model, releases held passes. Subscription runs report $0.
+
+`setup` records first-run progress for the app: `step` (lowercase letters and
+`-`, at most 32), `finished`, and `tour_pending` (show the guided tour on the
+next Today visit). It is null on installations set up before this release.
+
 Revoking the current owner token signs that client out immediately.
+
+## First-run setup
+
+`GET /v1/setup` returns `app` (Mac app `installed`, `paired`, `paired_here`,
+`server`, `running`), `permissions` (Accessibility, Screen Recording and input
+monitoring as the Mac app last reported them, or null if older than 90 seconds),
+`guide` (the live state of an in-app permission request), `pairing` (the
+result of pairing this Mac with another computer) and `last_record_at`.
+
+`POST /v1/setup/permissions` asks the Mac app to show its permission guide.
+`POST /v1/setup/pair-elsewhere` with `{"link":"hyperthymesia://pair?..."}` asks
+the Mac app to redeem a one-time link from another computer.
+`GET /v1/setup/proof` returns up to three screen-text snapshots from the last
+two minutes (app, window title, a few readable lines), so setup can show that
+capture works. Nothing else is returned and no image is ever stored.
 
 ## Runs
 
@@ -129,6 +169,21 @@ duplicate and rejected counts. Pull history starts with this release; old
 recipe state contains only its latest result and cannot reconstruct past runs.
 Interrupted pulls remain `running` without a finish time; a recovered job adds
 its next execution. Raw errors and provider output are withheld.
+
+### AI runs
+
+`GET /v1/agent-runs?limit=50&before=ID` returns `runs`, newest first: each
+four-hour pass, connection setup and (with `kind=check`) model check, with
+`state` (`running`, `done`, `failed`, `waiting`, `stopped`, `skipped`), start and
+finish, provider, model, effort, `cost_usd` and token counts as fx reports them,
+a plain `problem` code, and the `revision_id` it wrote. `upcoming` lists queued
+passes with `available_at`, `catch_up` (the next-day re-read) and `held` (by the
+spending limit). `month_spend_usd` and `spend_limit_usd` are included.
+
+`GET /v1/agent-runs/ID` adds the step `log` (plain step names and record kinds,
+never screen text or model output) and the underlying job. `POST
+/v1/agent-runs/ID/rerun` queues the same window again with the current model;
+an unchanged window and model is recorded as `skipped`.
 
 ## Day, timeline and search
 

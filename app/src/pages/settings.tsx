@@ -7,6 +7,7 @@ import { provider, ProviderTile } from "../model/providers"
 import { api, type ApiKey, type Appearance, type Source } from "../server/api"
 import { useSettings } from "../server/settings"
 import { PageHeader } from "../shell"
+import { useReplayTour } from "../tour/tour"
 import {
   Badge,
   Button,
@@ -64,10 +65,22 @@ function SettingsPage() {
             <StorageSection />
             <ApiKeysSection />
             <AppearanceSection />
+            <GettingStartedSection />
           </>
         )}
       </Page>
     </>
+  )
+}
+
+function GettingStartedSection() {
+  const replay = useReplayTour()
+  return (
+    <Section title="Getting started">
+      <Card>
+        <Row label="Tour" description="A short walk through Today, Connections, Agent and Settings" control={<Button onClick={() => void replay()}>Replay the tour</Button>} />
+      </Card>
+    </Section>
   )
 }
 

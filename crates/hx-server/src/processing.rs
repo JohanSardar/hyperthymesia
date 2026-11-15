@@ -457,6 +457,21 @@ impl<P: Provider> Handler for Runner<P> {
             "interpret" => {
                 let w: Interval = serde_json::from_value(job.payload["window"].clone())?;
                 let revision24 = job.payload["revision24"].as_bool().unwrap_or(false);
+                // The owner asked for this window again from the Runs page.
+                if job.payload["rerun"].as_bool().unwrap_or(false) {
+                    if !admit_visible_window(&self.store, w).await? {
+                        return Ok(());
+                    }
+                    interpret_window_key(
+                        &self.store,
+                        w,
+                        &self.provider,
+                        true,
+                        &format!("rerun:{}:{}", job.id, ulid::Ulid::generate()),
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 let ready_at: chrono::DateTime<Utc> = self
                     .store
                     .interpretation_ready_at(w.start, revision24, interpret_settle_s() as f64)
@@ -517,6 +532,7 @@ impl<P: Provider> Handler for Runner<P> {
                         Some(
                             Deferred::ProviderBusy
                                 | Deferred::Until(_)
+                                | Deferred::SpendingLimit(_)
                                 | Deferred::NormalizationPending
                         )
                     )

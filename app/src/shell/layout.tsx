@@ -1,6 +1,7 @@
 import { ArrowLeft, ArrowRight, Component, Monitor, Moon, PanelLeft, RotateCw, Sun } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react"
 import { Outlet, useLocation, useNavigate } from "react-router"
+import { Tour } from "../tour/tour"
 import { Toaster } from "../ui"
 import { useAppearance } from "./appearance"
 import { CommandsProvider, useCommands, useRegisterCommands, type AppCommand } from "./commands"
@@ -169,6 +170,7 @@ function Shell() {
         </main>
       </div>
       <Palette />
+      <Tour />
       <Toaster />
     </SidebarContext>
   )

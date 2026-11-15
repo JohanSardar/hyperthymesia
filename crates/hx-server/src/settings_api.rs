@@ -91,7 +91,29 @@ async fn update(
     {
         return Err(bad("invalid storage or appearance preference"));
     }
+    if value
+        .spend_limit_usd
+        .is_some_and(|limit| !limit.is_finite() || !(0.0..=100_000.0).contains(&limit))
+        || value.setup.as_ref().is_some_and(|s| {
+            s.step.len() > 32 || !s.step.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        })
+    {
+        return Err(bad("invalid spending limit or setup step"));
+    }
+    let before = preferences::load(&store).await?;
     preferences::save(&store, &value).await?;
+    // A raised or removed limit, or a new model, lets held runs go now.
+    let raised = match (before.spend_limit_usd, value.spend_limit_usd) {
+        (Some(old), Some(new)) => new > old,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if raised
+        || before.model.as_ref().map(|m| (&m.provider, &m.model))
+            != value.model.as_ref().map(|m| (&m.provider, &m.model))
+    {
+        crate::runs_api::release_held(&store, raised).await?;
+    }
     Ok(Json(json!({"settings":value})))
 }
 fn validate_model(model: &Model) -> ApiResult<()> {
@@ -153,11 +175,51 @@ async fn check(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Json
         .ok_or_else(|| bad("choose a provider and model first"))?;
     // An explicit check makes one small provider request. Never expose arbitrary
     // provider output (which can contain credentials or diagnostics).
-    let ok = crate::fx::inspect(&store, &model.provider, Some(&model))
-        .await
-        .is_ok();
+    let run = crate::run_log::RunLog::start(
+        &store,
+        crate::run_log::Start {
+            kind: "check",
+            job_id: None,
+            window_start: None,
+            label: None,
+            provider: &model.provider,
+            model: &model.model,
+            effort: model.effort.as_deref().unwrap_or(""),
+        },
+    )
+    .await?;
+    run.note(format!("Asked {} to reply with OK", model.model))
+        .await;
+    let started = std::time::Instant::now();
+    let result = crate::fx::inspect_with(&store, &model.provider, Some(&model), Some(&run)).await;
+    let seconds = started.elapsed().as_secs_f64();
+    let problem = match &result {
+        Ok(_) => {
+            run.note("It answered").await;
+            run.finish("done", None, None).await;
+            None
+        }
+        Err(error) => {
+            let problem = crate::run_log::problem(error);
+            run.note("It did not answer").await;
+            run.finish("failed", Some(problem), None).await;
+            Some(problem)
+        }
+    };
+    let message = match problem {
+        None => "The selected model responded.",
+        Some("signin") => "The sign-in didn't work. Sign in again, then test.",
+        Some("key") => "The API key didn't work. Add a new key, then test.",
+        Some("model") => {
+            "The provider doesn't offer this model to your account. Pick another model."
+        }
+        Some("usage_limit") => "Your plan's usage limit is reached. Try again after it resets.",
+        Some(_) => {
+            "The model check failed. Check authentication, model ID and effort, then try again."
+        }
+    };
     Ok(Json(
-        json!({"ok":ok,"message":if ok {"The selected model responded."} else {"The model check failed. Check authentication, model ID and effort, then try again."}}),
+        json!({"ok":problem.is_none(),"message":message,"problem":problem,"seconds":seconds,"run_id":run.id()}),
     ))
 }
 #[derive(Deserialize)]

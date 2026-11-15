@@ -255,3 +255,131 @@
     animation: none;
   }
 }
+
+/* Provider accounts, schedule and spending limit. */
+
+.account-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-inline: calc(-1 * var(--space-4));
+}
+
+@media (max-width: 720px) {
+  .account-list {
+    margin-inline: 0;
+  }
+}
+
+.account-card {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-3-5);
+  padding: var(--space-3-5) var(--space-4);
+}
+
+.account-card[data-in-use] {
+  border-color: var(--border-2);
+}
+
+.account-anchor {
+  position: absolute;
+  top: calc(-1 * var(--space-16));
+}
+
+.account-name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.account-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  color: var(--muted-1);
+  font-size: var(--text-xs);
+  line-height: var(--leading-xs);
+}
+
+.account-card .row-control {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.sidebar-group-link {
+  color: var(--muted-3);
+  font-size: var(--text-xs);
+  text-decoration: none;
+}
+
+.sidebar-group-link:hover {
+  color: var(--fg);
+}
+
+.row-icon {
+  color: var(--icon-muted);
+}
+
+.schedule-next,
+.limit-spent {
+  color: var(--fg);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.limit-card {
+  position: relative;
+}
+
+.limit-edit {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 0 var(--space-4) var(--space-3);
+}
+
+.limit-input {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.limit-input .input {
+  width: 96px;
+  font-variant-numeric: tabular-nums;
+}
+
+.limit-currency {
+  color: var(--muted-2);
+}
+
+.limit-meter {
+  height: 3px;
+  margin: 0 var(--space-4) var(--space-3-5);
+  border-radius: var(--radius-full);
+  background: var(--secondary);
+  overflow: hidden;
+}
+
+.limit-meter span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+  transition: width var(--duration-slow) var(--ease-out-quint);
+}
+
+.limit-meter span[data-full] {
+  background: var(--warning);
+}
+
+.account-card > :not(:first-child),
+.limit-card > .limit-edit,
+.limit-card > .limit-meter {
+  border-top: 0;
+}

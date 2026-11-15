@@ -3,6 +3,13 @@
 `hx-server setup` replaces the old by-hand first run. This file records the
 reference we studied, what is automated, the state map and the visual direction.
 
+Since the in-app setup (T3), an interactive `hx-server setup` on a Mac with the
+app installed stops after pairing and opens the app; the window's first-run
+steps then request permissions (the same guide, started through
+`setup/request.json` with an `app-` run ID), run the provider sign-in and the
+model test, and show the proof. `hx-server setup --json` keeps the terminal flow
+below for agents.
+
 ## Reference: `agent-desktop permissions --guide` (1.2.0)
 
 Tried on 2026-11-12 in a fresh Cirrus Labs macOS 26.6.2 VM (tart), launched from

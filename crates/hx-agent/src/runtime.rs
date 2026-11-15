@@ -358,6 +358,24 @@ fn pause_label(until: chrono::DateTime<chrono::Utc>) -> String {
         local.format("%a %H:%M").to_string()
     }
 }
+/// Current grants for the app's setup page; never holds content.
+fn write_permissions(granted: crate::controls::Granted) {
+    let dir = support_dir();
+    let value = serde_json::json!({
+        "accessibility": granted.accessibility,
+        "screen": granted.screen,
+        "input": granted.input,
+        "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    let tmp = dir.join(".permissions.json.tmp");
+    let written = serde_json::to_vec(&value)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&tmp, bytes))
+        .and_then(|()| std::fs::rename(&tmp, dir.join("permissions.json")));
+    if let Err(error) = written {
+        eprintln!("permission state not written: {error}");
+    }
+}
 /// Opens the setup guide for the permissions that are off.
 fn fix_permissions(granted: crate::controls::Granted) {
     let steps: Vec<&str> = [
@@ -521,6 +539,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     let mut paused_now = false;
     let mut pause_checked = Instant::now() - Duration::from_secs(1);
     let mut granted_now = crate::controls::Granted::default();
+    let mut permissions_written: Option<(crate::controls::Granted, Instant)> = None;
     let mut ax_checked = Instant::now() - Duration::from_secs(5);
     let mut ax_live = true;
     let mut front_app: Option<(String, String)> = None;
@@ -613,6 +632,15 @@ pub fn run(options: RunOptions) -> Result<()> {
                     screen: p.screen && !screen_denied,
                     input: p.input,
                 };
+                // The app's setup page reads this to update its permission cards live.
+                if !options.dry_run
+                    && permissions_written.is_none_or(|(written, at)| {
+                        written != granted_now || at.elapsed() >= Duration::from_secs(30)
+                    })
+                {
+                    permissions_written = Some((granted_now, Instant::now()));
+                    write_permissions(granted_now);
+                }
                 if !options.dry_run {
                     for name in controls.permissions_seen(granted_now) {
                         hx_macos_sys::notify(
