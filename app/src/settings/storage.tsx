@@ -3,7 +3,7 @@ import { useEffect, useState, type ReactNode } from "react"
 import { admin, waitForServer, type Backup, type ErasePlan, type LogEntry, type Removed } from "../server/admin"
 import { usePolled } from "../server/connections"
 import { useSettings } from "../server/settings"
-import { Badge, Button, Callout, Card, Checkbox, Confirm, ConfirmTrigger, Dialog, Empty, IconButton, Input, Select, Skeleton, Spinner, buttonAttrs, toast } from "../ui"
+import { Badge, Button, Callout, Card, Confirm, ConfirmTrigger, Dialog, Empty, IconButton, Input, Select, Skeleton, Spinner, buttonAttrs, toast } from "../ui"
 import { keepTypes } from "./catalog"
 import { bytes, count, dateTime, errorText, RestoreDefaults, Setting, useSave } from "./parts"
 
@@ -405,7 +405,6 @@ function DeleteRange({ onDone }: { onDone: () => void }) {
   const [plan, setPlan] = useState<ErasePlan | null>(null)
   const [checking, setChecking] = useState(false)
   const [running, setRunning] = useState(false)
-  const [agentTables, setAgentTables] = useState(false)
   const [result, setResult] = useState<LogEntry | null>(null)
   const from = iso(start)
   const to = iso(end)
@@ -417,7 +416,6 @@ function DeleteRange({ onDone }: { onDone: () => void }) {
     try {
       const p = await admin.erasePlan(from!, to!)
       setPlan(p)
-      setAgentTables(p.agent_tables.some((t) => t.rows > 0))
     } catch (cause) {
       toast.error("Couldn't check the range", { description: errorText(cause) })
     } finally {
@@ -427,13 +425,14 @@ function DeleteRange({ onDone }: { onDone: () => void }) {
   const run = async () => {
     setRunning(true)
     try {
-      const done = await admin.erase(from!, to!, agentTables)
+      const done = await admin.erase(from!, to!)
       setResult(done)
       setPlan(null)
       toast.success("Deleted", { description: `Backup ${done.backup} was taken first` })
       onDone()
     } catch (cause) {
-      toast.error("Nothing was deleted", { description: errorText(cause) })
+      // The server says whether anything went before the failure.
+      toast.error("The delete didn't finish", { description: errorText(cause) })
     } finally {
       setRunning(false)
     }
@@ -508,10 +507,9 @@ function DeleteRange({ onDone }: { onDone: () => void }) {
                   {plan.disk_free != null && ` (${bytes(plan.disk_free)} free)`}; if it can't be, nothing is deleted. The deletion log records what went, never the content.
                 </p>
                 {tables.length > 0 && (
-                  <label className="reach-option">
-                    <Checkbox checked={agentTables} onCheckedChange={(c) => setAgentTables(Boolean(c))} />
-                    Also empty the agent's own tables ({tables.map((t) => `${t.name}: ${t.rows} rows`).join(", ")}). They have no times, so they may hold something from this range. The agent fills them again at its next setup.
-                  </label>
+                  <p className="row-description">
+                    The agent's own tables are emptied too ({tables.map((t) => `${t.name}: ${t.rows} rows`).join(", ")}). They have no times, so they may hold something from this range. The agent fills them again at its next setup.
+                  </p>
                 )}
               </>
             )}
@@ -545,6 +543,12 @@ function DeletionLog({ version }: { version: number }) {
             . Backup {e.backup}
           </>
         )
+      case "deleting":
+        return (
+          <>
+            {e.start ? `Started deleting ${dateTime(e.start)} – ${dateTime(e.end)}` : "Started a clean-up"} after backup {e.backup}. Nothing logged that it finished, so check the timeline; restoring that backup puts everything back
+          </>
+        )
       case "clean_up_skipped":
         return <>Clean-up skipped: {e.error}</>
       case "restored":
@@ -569,7 +573,7 @@ function DeletionLog({ version }: { version: number }) {
             <div className="log-entry" key={i}>
               <time className="log-entry-time">{dateTime(e.at)}</time>
               <span className="log-entry-text">
-                {(e.action === "restore_failed" || e.action === "clean_up_skipped") && <Badge tone="warning">Problem</Badge>} {words(e)}
+                {(e.action === "restore_failed" || e.action === "clean_up_skipped" || e.action === "deleting") && <Badge tone="warning">Problem</Badge>} {words(e)}
               </span>
             </div>
           ))}

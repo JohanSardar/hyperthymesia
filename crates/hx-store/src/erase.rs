@@ -52,10 +52,6 @@ pub struct Summary {
     pub last: Option<DateTime<Utc>>,
 }
 
-/// Spans longer than this are not searched for: a record must start at most
-/// this long before a range to count as touching it.
-const LONGEST_SPAN_HOURS: i64 = 48;
-
 const LOCKS: [&str; 3] = [
     "immutable_events_delete",
     "immutable_revisions_delete",
@@ -104,8 +100,8 @@ async fn select(conn: &mut sqlx::SqliteConnection, scope: &Scope) -> Result<()> 
     }
     match scope {
         Scope::Range { start, end } => {
-            sqlx::query("INSERT INTO temp.erase_ids SELECT id FROM events INDEXED BY events_time WHERE source_start >= $1 AND source_start < $3 AND ((source_end IS NULL AND source_start >= $2) OR source_end > $2)")
-                .bind(Ts::from(*start - Duration::hours(LONGEST_SPAN_HOURS)))
+            // Every record overlapping the range, however long ago it began.
+            sqlx::query("INSERT INTO temp.erase_ids SELECT id FROM events INDEXED BY events_time WHERE source_start < $2 AND ((source_end IS NULL AND source_start >= $1) OR source_end > $1)")
                 .bind(Ts::from(*start))
                 .bind(Ts::from(*end))
                 .execute(&mut *conn)

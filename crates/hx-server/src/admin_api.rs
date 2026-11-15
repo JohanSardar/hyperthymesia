@@ -812,9 +812,6 @@ struct Range {
     /// Must be `delete` to delete; the plan route ignores it.
     #[serde(default)]
     confirm: Option<String>,
-    /// Also empty the agent's own tables (rebuilt at the next setup).
-    #[serde(default)]
-    agent_tables: bool,
 }
 fn range_scope(r: &Range) -> ApiResult<Scope> {
     if r.end <= r.start {
@@ -889,14 +886,30 @@ async fn erase_range(
     })?;
     // No backup, no delete.
     let (backup, _) = take_backup(&store, "before-delete").await.map_err(failed)?;
+    // No log, no delete: the entry is written before anything goes.
+    append_log(&store, json!({"at": Utc::now(), "action": "deleting", "start": range.start, "end": range.end, "backup": backup}))
+        .map_err(failed)?;
     let summary = store.erase(&scope).await.map_err(failed)?;
-    let mut cleared = vec![];
-    if range.agent_tables {
-        cleared = clear_agent_tables(&store).await.map_err(failed)?;
-    }
     *STORAGE.lock().expect("storage cache") = None;
+    // The agent's own tables have no times, so they may hold copies of what
+    // went; they're always emptied, and the agent fills them at its next setup.
+    let cleared = clear_agent_tables(&store).await.map_err(|error| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "The time was deleted, but the agent's own tables couldn't be emptied: {}",
+                plain(&error)
+            ),
+        )
+    })?;
     let entry = json!({"at": Utc::now(), "action": "deleted_range", "start": range.start, "end": range.end, "backup": backup, "removed": summary, "agent_tables_cleared": cleared});
-    append_log(&store, entry.clone()).map_err(failed)?;
+    if let Err(error) = append_log(&store, entry.clone()) {
+        tracing::error!(
+            "deleted {} to {} but couldn't log the counts: {error}",
+            range.start,
+            range.end
+        );
+    }
     Ok(Json(entry))
 }
 async fn clear_agent_tables(store: &Store) -> anyhow::Result<Vec<String>> {
@@ -923,6 +936,15 @@ async fn erase_log(State(store): State<Store>, headers: HeaderMap) -> ApiResult<
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
+    // A "deleting" line is only news when nothing logged its outcome.
+    let finished: std::collections::HashSet<String> = entries
+        .iter()
+        .filter(|e| e["action"] != "deleting")
+        .filter_map(|e| e["backup"].as_str().map(String::from))
+        .collect();
+    entries.retain(|e| {
+        e["action"] != "deleting" || !e["backup"].as_str().is_some_and(|b| finished.contains(b))
+    });
     entries.reverse();
     entries.truncate(200);
     Ok(Json(json!({"entries": entries, "path": log_path(&store)})))
@@ -977,6 +999,10 @@ pub async fn clean_up(store: &Store, force: bool) -> anyhow::Result<Option<Value
             return Ok(Some(entry));
         }
     };
+    append_log(
+        store,
+        json!({"at": now, "action": "deleting", "clean_up": true, "backup": backup}),
+    )?;
     let mut removed = serde_json::Map::new();
     for (kind, days, scope) in &scopes {
         let summary = store.erase(scope).await?;

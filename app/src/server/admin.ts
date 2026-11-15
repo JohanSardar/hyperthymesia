@@ -62,7 +62,7 @@ type Removed = {
 type ErasePlan = { plan: Removed; agent_tables: { name: string; rows: number }[]; disk_free: number | null }
 type LogEntry = {
   at: string
-  action: "deleted_range" | "cleaned_up" | "clean_up_skipped" | "restored" | "restore_failed" | "backup_deleted" | (string & {})
+  action: "deleting" | "deleted_range" | "cleaned_up" | "clean_up_skipped" | "restored" | "restore_failed" | "backup_deleted" | (string & {})
   start?: string
   end?: string
   backup?: string
@@ -106,8 +106,7 @@ const admin = {
   deleteBackup: (name: string) => request<void>(`/v1/backups/${encodeURIComponent(name)}`, { method: "DELETE" }),
   restore: (name: string) => request<{ restarting: boolean }>(`/v1/backups/${encodeURIComponent(name)}/restore`, { method: "POST" }),
   erasePlan: (start: string, end: string) => request<ErasePlan>("/v1/erase/plan", { method: "POST", body: { start, end } }),
-  erase: (start: string, end: string, agentTables: boolean) =>
-    request<LogEntry>("/v1/erase", { method: "POST", body: { start, end, confirm: "delete", agent_tables: agentTables } }),
+  erase: (start: string, end: string) => request<LogEntry>("/v1/erase", { method: "POST", body: { start, end, confirm: "delete" } }),
   eraseLog: () => request<{ entries: LogEntry[]; path: string }>("/v1/erase/log"),
   exportUrl: (from: string, to: string) => `/v1/export?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
   server: () => request<ServerInfo>("/v1/server"),
