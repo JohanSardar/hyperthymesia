@@ -145,6 +145,56 @@ async fn s2_missing_login_offers_signin_fix() {
 }
 
 #[tokio::test]
+async fn s4_spending_limit_blocks_connection_setup() {
+    if isolated("s4_spending_limit_blocks_connection_setup") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = tempfile::tempdir().unwrap();
+    let binary = std::path::PathBuf::from(std::env::var_os("HX_FX_BINARY").unwrap());
+    let marker = binary.with_extension("called");
+    let response = json!({"exit_code":0,"model":"synthetic-model","steps":1,
+        "tool_calls":[],"final_output":"{\"summary\":\"No pull needed\",\"no_pull\":\"Synthetic source\"}"});
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '%s' '{}'\n",
+            marker.display(),
+            response
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = Store::create(scratch.path()).await.unwrap();
+    let token = owner(&store).await;
+    api(
+        &store,
+        &token,
+        "PUT",
+        "/v1/settings/gateway-key",
+        json!({"key":"synthetic-gateway-key"}),
+    )
+    .await;
+    api(&store, &token, "PUT", "/v1/settings", json!({"model":{"provider":"vercel","model":"synthetic-model","effort":null},"spend_limit_usd":0})).await;
+    // Same durable job created by Connect and dispatched by processing::Runner.
+    store
+        .connect_source("Review source", "Synthetic only", 1)
+        .await
+        .unwrap();
+    let job = hx_jobs::claim(&store, 60).await.unwrap().unwrap();
+    assert_eq!(job.kind, "setup");
+    let runner = hx_server::processing::Runner {
+        store: store.clone(),
+        provider: hx_server::processing::AnyProvider::Fx,
+    };
+    let outcome = hx_jobs::Handler::handle(&runner, &job).await;
+    assert!(
+        !marker.exists(),
+        "no paid connection setup may start at the monthly limit; outcome={outcome:?}"
+    );
+}
+
+#[tokio::test]
 async fn s3_spending_limit_blocks_new_paid_check() {
     if isolated("s3_spending_limit_blocks_new_paid_check") {
         return;

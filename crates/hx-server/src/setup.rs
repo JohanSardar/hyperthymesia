@@ -66,6 +66,8 @@ pub async fn run(store: &Store, job: &hx_jobs::Job) -> Result<()> {
             return Ok(());
         }
     }
+    // The spending limit holds setup like any other run, until next month or a raise.
+    crate::run_log::check_spending(store).await?;
     let mut broker = Broker::new(
         store.clone(),
         crate::disclosure::current(store).await?,

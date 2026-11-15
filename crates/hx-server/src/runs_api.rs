@@ -167,7 +167,7 @@ async fn rerun(
 /// model (which also retries passes waiting on errors).
 pub(crate) async fn release_held(store: &Store, raised: bool) -> anyhow::Result<()> {
     let mut tx = store.begin_write().await?;
-    sqlx::query("UPDATE jobs SET available_at=$1 WHERE kind='interpret' AND state='ready' AND available_at>$1 AND (last_error='spending limit reached' OR ($2=0 AND last_error IS NOT NULL))")
+    sqlx::query("UPDATE jobs SET available_at=$1 WHERE kind IN ('interpret','setup') AND state='ready' AND available_at>$1 AND (last_error='spending limit reached' OR ($2=0 AND last_error IS NOT NULL))")
         .bind(Ts::now()).bind(raised).execute(&mut *tx).await?;
     tx.commit().await
 }
