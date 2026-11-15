@@ -137,6 +137,7 @@ pub fn replay(record: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         title: record["window_title"].as_str().map(str::to_owned),
         pid: 0,
         electron: false,
+        url: None,
     };
     let ax = record["accessibility"]["text"].as_str().map(|text| Text {
         text: text.into(),

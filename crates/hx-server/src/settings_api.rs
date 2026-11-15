@@ -26,7 +26,6 @@ pub fn router() -> Router<Store> {
             axum::routing::delete(revoke_token),
         )
         .route("/v1/runs", get(runs))
-        .route("/v1/recording", get(recording))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
@@ -272,11 +271,5 @@ async fn runs(
         .bind(page.pull_before.unwrap_or(before)).bind(limit).fetch_all(&store.pool).await?;
     Ok(Json(
         json!({"passes":passes,"pulls":pulls,"limit":limit,"timestamps":"UTC microseconds","next_pass_before":passes.last().map(|v| &v["id"]),"next_pull_before":pulls.last().map(|v| &v["id"])}),
-    ))
-}
-async fn recording(State(store): State<Store>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    auth(&store, &headers, "ingest").await?;
-    Ok(Json(
-        json!({"enabled":preferences::load(&store).await?.mac_recording}),
     ))
 }

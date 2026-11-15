@@ -58,12 +58,44 @@ chosen provider. This API never launches login or opens a system prompt.
 `automatic_gc:false`), and `api_keys` containing safe token metadata.
 
 Mac recording is a server-wide control for paired Macs running this version.
-The Mac polls `GET /v1/recording` with its ingest token every five seconds,
+The Mac reads `GET /v1/recording` with its ingest token every five seconds,
 pauses content capture and drops new content submissions while disabled.
 Health reporting and upload of previously queued records continue. Network
 failures retain the last received setting. On app launch capture waits for the
 first successful settings response. It does not revoke macOS permissions.
-The local menu-bar pause remains independent.
+
+## Pause and never-record
+
+`GET /v1/recording` accepts the Mac's ingest token or an owner session/token
+and returns:
+
+```json
+{
+  "enabled": true,
+  "paused_until": "2026-11-14T15:00:00Z",
+  "never_record": {
+    "apps": [{"bundle_id": "com.apple.TextEdit", "name": "TextEdit"}],
+    "sites": ["bank.example"]
+  },
+  "changed_at": "2026-11-14T14:00:00Z",
+  "notices": {"account_ready": {"start": "…", "end": "…"}, "failed_pass": 12, "failed_pull": {"id": 3, "recipe_id": "weather"}}
+}
+```
+
+`paused_until` is `null` unless a pause is still running. `PUT
+/v1/recording/pause` takes `{"until": time}` (at most eight days ahead) or
+`{"until": null}` to resume. `PUT /v1/recording/never-record` replaces the
+whole list with `{"apps": [...], "sites": [...]}`; sites may be pasted URLs and
+are stored as lowercase hosts without `www.`, each also covering its
+subdomains. Cookie-session writes need a same-origin request. Both answer with
+the `GET` shape.
+
+The Mac keeps its own copy, so a pause holds across restarts and while the
+server is unreachable; a change made on the Mac is sent within about a second
+and wins over the server's copy until the server confirms it. While paused,
+the Mac records only content-free gaps. A never-record app or site gets an
+excluded focus span with no app name, title, text, clicks or page address.
+`notices` are content-free markers the Mac turns into desktop notifications.
 
 `chunk_retention_days` accepts 1–3650 and sets the policy for chunk collection.
 Automatic GC and the destructive GC CLI remain disabled; changing this policy

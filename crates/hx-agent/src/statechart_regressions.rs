@@ -46,6 +46,7 @@ fn capture_rejects_screen_images_and_video() {
         pid: 1,
         title: Some("Synthetic window".into()),
         electron: false,
+        url: None,
     };
     let mut p = producer();
     for (kind, mime) in [
@@ -95,6 +96,7 @@ fn browser_and_electron_content_is_allowed_but_privacy_gates_remain() {
             pid: 1,
             title: Some("Synthetic window".into()),
             electron,
+            url: None,
         };
         assert!(!policy.excludes_native(&focus));
         let mut p = producer();

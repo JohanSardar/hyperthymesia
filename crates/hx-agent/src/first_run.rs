@@ -14,6 +14,7 @@ pub(crate) struct Onboarding {
     message: Option<String>,
     guide: Option<std::process::Child>,
     guide_checked: Instant,
+    started: bool,
 }
 impl Onboarding {
     pub fn new(dir: PathBuf) -> Self {
@@ -25,6 +26,7 @@ impl Onboarding {
             message: None,
             guide: None,
             guide_checked: Instant::now() - Duration::from_secs(5),
+            started: false,
         }
     }
     /// Starts the setup guide as this app's child, so macOS attributes its privacy
@@ -63,11 +65,30 @@ impl Onboarding {
         }
     }
     pub fn update(&mut self, menu: &mut MenuBar, warning: Option<&str>) {
+        if !self.started {
+            self.started = true;
+            // The setup guide restarted the app so a new grant counts. Opening
+            // the window now would cover the System Settings box the person
+            // still has to answer.
+            let marker = self.dir.join("setup/restarting");
+            if std::fs::metadata(&marker)
+                .and_then(|m| m.modified())
+                .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < Duration::from_secs(120)))
+            {
+                let _ = menu.take_open_app();
+            }
+            let _ = std::fs::remove_file(marker);
+        }
         self.setup_guide();
-        if menu.take_open_app() {
+        if let Some(page) = menu.take_open_app() {
             match Config::load_at(&self.dir) {
                 Ok(config) => {
-                    let url = format!("{}/app", config.server_url.trim_end_matches('/'));
+                    let base = format!("{}/app", config.server_url.trim_end_matches('/'));
+                    let url = if page.is_empty() {
+                        base
+                    } else {
+                        format!("{base}/{page}")
+                    };
                     let session = desktop_session(&self.dir, &config);
                     if let Err(error) = menu.open_app(&url, session.as_deref()) {
                         self.message = Some(format!("App could not open: {error}"));

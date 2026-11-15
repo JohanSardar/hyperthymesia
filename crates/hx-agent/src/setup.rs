@@ -15,3 +15,18 @@ pub fn guide_wanted(dir: &Path) -> bool {
 fn read(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
+
+/// Starts the setup guide again for the permissions that are off; the running
+/// app picks the request up within a second.
+pub fn request_guide(dir: &Path, steps: &[&str]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let request = serde_json::json!({
+        "run": format!("menu-{}", ulid::Ulid::generate()),
+        "steps": steps,
+        "signin_title": null,
+    });
+    let tmp = dir.join(".request.json.menu");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&request)?)?;
+    std::fs::rename(tmp, dir.join("request.json"))?;
+    Ok(())
+}

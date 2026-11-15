@@ -102,8 +102,16 @@ fn io_worker(
     rx: tokio::sync::mpsc::Receiver<Submission>,
     stop: Arc<AtomicBool>,
     recording: Arc<AtomicBool>,
+    controls: crate::controls::Controls,
 ) -> Result<()> {
-    let result = io_worker_recording(config, rx, stop.clone(), support_dir(), recording);
+    let result = io_worker_recording(
+        config,
+        rx,
+        stop.clone(),
+        support_dir(),
+        recording,
+        Some(controls),
+    );
     if result.is_err() {
         stop.store(true, Ordering::Relaxed);
     }
@@ -116,7 +124,7 @@ pub(crate) fn io_worker_at(
     stop: Arc<AtomicBool>,
     dir: std::path::PathBuf,
 ) -> Result<()> {
-    io_worker_recording(config, rx, stop, dir, Arc::new(AtomicBool::new(true)))
+    io_worker_recording(config, rx, stop, dir, Arc::new(AtomicBool::new(true)), None)
 }
 fn io_worker_recording(
     config: Config,
@@ -124,6 +132,7 @@ fn io_worker_recording(
     stop: Arc<AtomicBool>,
     dir: std::path::PathBuf,
     recording: Arc<AtomicBool>,
+    controls: Option<crate::controls::Controls>,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -138,24 +147,9 @@ fn io_worker_recording(
         let mut reload = tokio::time::interval(Duration::from_secs(1));
         reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut background_workers=tokio::task::JoinSet::new();
-        let recording_state = recording.clone();
-        let recording_dir = dir.clone();
-        let recording_config = config.clone();
-        background_workers.spawn(async move {
-            let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() else { return; };
-            let mut tick = tokio::time::interval(Duration::from_secs(5));
-            loop {
-                tick.tick().await;
-                let config = Config::load_at(&recording_dir).unwrap_or_else(|_| recording_config.clone());
-                if config.token.is_empty() { continue; }
-                if let Ok(response) = client.get(format!("{}/v1/recording", config.server_url.trim_end_matches('/'))).bearer_auth(&config.token).send().await
-                    && response.status().is_success()
-                    && let Ok(value) = response.json::<serde_json::Value>().await
-                    && let Some(enabled) = value["enabled"].as_bool() {
-                    recording_state.store(enabled, Ordering::Relaxed);
-                }
-            }
-        });
+        if let Some(controls) = controls {
+            background_workers.spawn(crate::controls::sync(controls, dir.clone(), config.clone(), recording.clone()));
+        }
         loop {tokio::select! {
             _=reload.tick()=>match uploader.reload(&dir) {
                 Ok(true) => next=tokio::time::Instant::now(),
@@ -339,6 +333,47 @@ fn close_span_at(span: &Envelope, p: &mut Producer, end: ObservationTime) -> Env
     closed.time.observed_at = end.observed_at;
     closed
 }
+/// "Until tomorrow" ends at the next local midnight.
+fn next_midnight(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    let tomorrow = now.with_timezone(&chrono::Local).date_naive() + chrono::Duration::days(1);
+    chrono::Local
+        .from_local_datetime(&tomorrow.and_hms_opt(0, 0, 0).expect("midnight"))
+        .earliest()
+        .map_or(now + chrono::Duration::hours(24), |t| {
+            t.with_timezone(&chrono::Utc)
+        })
+}
+/// "14:30", "tomorrow" or "tomorrow 09:00", in local time.
+fn pause_label(until: chrono::DateTime<chrono::Utc>) -> String {
+    let local = until.with_timezone(&chrono::Local);
+    let today = chrono::Local::now().date_naive();
+    if local.date_naive() == today {
+        local.format("%H:%M").to_string()
+    } else if until == next_midnight(chrono::Utc::now()) {
+        "tomorrow".into()
+    } else if local.date_naive() == today + chrono::Duration::days(1) {
+        local.format("tomorrow %H:%M").to_string()
+    } else {
+        local.format("%a %H:%M").to_string()
+    }
+}
+/// Opens the setup guide for the permissions that are off.
+fn fix_permissions(granted: crate::controls::Granted) {
+    let steps: Vec<&str> = [
+        ("accessibility", granted.accessibility),
+        ("input", granted.input),
+        ("screen", granted.screen),
+    ]
+    .into_iter()
+    .filter_map(|(id, on)| (!on).then_some(id))
+    .collect();
+    if !steps.is_empty()
+        && let Err(error) = crate::setup::request_guide(&support_dir().join("setup"), &steps)
+    {
+        eprintln!("cannot start the setup guide: {error}");
+    }
+}
 pub fn run(options: RunOptions) -> Result<()> {
     anyhow::ensure!(
         !cfg!(feature = "e2e-harness"),
@@ -355,8 +390,10 @@ pub fn run(options: RunOptions) -> Result<()> {
         .paused
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let quit_requested = Arc::new(AtomicBool::new(false));
+    let controls = crate::controls::Controls::load(&support_dir());
     let mut menu = if options.menu_bar {
-        hx_macos_sys::MenuBar::new(paused.clone(), stop.clone(), quit_requested.clone())
+        hx_macos_sys::notifications_init();
+        hx_macos_sys::MenuBar::new(stop.clone(), quit_requested.clone())
     } else {
         None
     };
@@ -382,8 +419,9 @@ pub fn run(options: RunOptions) -> Result<()> {
         let stop = stop.clone();
         {
             let recording = recording.clone();
+            let controls = controls.clone();
             Some(std::thread::spawn(move || {
-                io_worker(cfg, rx, stop, recording)
+                io_worker(cfg, rx, stop, recording, controls)
             }))
         }
     };
@@ -478,6 +516,15 @@ pub fn run(options: RunOptions) -> Result<()> {
     let mut onboarding = crate::first_run::Onboarding::new(support_dir());
     let mut menu_health = None;
     let mut menu_upload = None;
+    // A pause is treated like an excluded app: no app, title, text, clicks,
+    // input counts or presence are kept, only the content-free gap marker.
+    let mut paused_now = false;
+    let mut pause_checked = Instant::now() - Duration::from_secs(1);
+    let mut granted_now = crate::controls::Granted::default();
+    let mut ax_checked = Instant::now() - Duration::from_secs(5);
+    let mut ax_live = true;
+    let mut front_app: Option<(String, String)> = None;
+    let own_bundle = "com.hyperthymesia.agent";
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed)
             && options
@@ -491,7 +538,31 @@ pub fn run(options: RunOptions) -> Result<()> {
             {
                 anyhow::bail!("screen capture worker stopped unexpectedly");
             }
+            let mut pause_changed = false;
             if let Some(menu) = &mut menu {
+                while let Some(request) = menu.take_request() {
+                    use hx_macos_sys::MenuRequest::*;
+                    let now = chrono::Utc::now();
+                    match request {
+                        Pause15Minutes => controls.pause(Some(now + chrono::Duration::minutes(15))),
+                        PauseHour => controls.pause(Some(now + chrono::Duration::hours(1))),
+                        PauseUntilTomorrow => controls.pause(Some(next_midnight(now))),
+                        Resume => controls.pause(None),
+                        ToggleNeverRecord => {
+                            if let Some((bundle, name)) = &front_app {
+                                controls.toggle_never_record(bundle, name);
+                                pause_changed = true;
+                            }
+                        }
+                        FixPermissions => fix_permissions(granted_now),
+                    }
+                    pause_checked = Instant::now() - Duration::from_secs(1);
+                }
+                match hx_macos_sys::take_notification_click().as_deref() {
+                    Some("permissions") => fix_permissions(granted_now),
+                    Some(page) => menu.request_page(page),
+                    None => {}
+                }
                 if menu_health_check.elapsed() >= Duration::from_secs(1) {
                     menu_health = live_media_health.lock().expect("screen health").clone();
                     menu_upload = std::fs::read(support_dir().join("health.json"))
@@ -502,8 +573,75 @@ pub fn run(options: RunOptions) -> Result<()> {
                     menu_health_check = Instant::now();
                 }
                 let warning = screen_warning(menu_health.as_ref(), paused.load(Ordering::Relaxed))
+                    .filter(|_| granted_now.screen)
                     .or_else(|| menu_upload.clone());
                 onboarding.update(menu, warning.as_deref());
+            }
+            if pause_checked.elapsed() >= Duration::from_secs(1) {
+                pause_checked = Instant::now();
+                let until = controls.paused_until();
+                if until.is_some() != paused_now {
+                    paused_now = until.is_some();
+                    paused.store(paused_now, Ordering::Relaxed);
+                    pause_changed = true;
+                    if paused_now && let Some(span) = presence_span.take() {
+                        emit(close_span(&span, &mut producer), None)?;
+                    }
+                    last_state = None;
+                }
+                let mut p = hx_macos_sys::permissions();
+                // A real query every 5 s catches a revoked Accessibility grant.
+                if p.accessibility && ax_checked.elapsed() >= Duration::from_secs(5) {
+                    ax_checked = Instant::now();
+                    ax_live = hx_macos_sys::accessibility_live();
+                }
+                p.accessibility &= ax_live;
+                let screen_denied = live_media_health
+                    .lock()
+                    .expect("screen health")
+                    .as_ref()
+                    .is_some_and(|h| h["status"] == "permission_denied");
+                granted_now = crate::controls::Granted {
+                    accessibility: p.accessibility,
+                    screen: p.screen && !screen_denied,
+                    input: p.input,
+                };
+                if !options.dry_run {
+                    for name in controls.permissions_seen(granted_now) {
+                        hx_macos_sys::notify(
+                            &format!("lost-{name}-{}", ulid::Ulid::generate()),
+                            &format!("{name} was turned off"),
+                            "Hyperthymesia can’t record your day fully until it’s back on. Click to turn it on.",
+                            "permissions",
+                        );
+                    }
+                }
+                if let Some(menu) = &mut menu {
+                    menu.set_recording(match until {
+                        Some(until) => hx_macos_sys::Recording::Paused(pause_label(until)),
+                        None if controls.switched_off() => hx_macos_sys::Recording::Off,
+                        None => hx_macos_sys::Recording::On,
+                    });
+                    menu.set_missing(
+                        [
+                            ("Accessibility", granted_now.accessibility),
+                            ("Screen Recording", granted_now.screen),
+                            ("Input Monitoring", granted_now.input),
+                        ]
+                        .into_iter()
+                        .filter_map(|(name, on)| (!on).then_some(name))
+                        .collect(),
+                    );
+                    menu.set_app(
+                        front_app
+                            .as_ref()
+                            .map(|(bundle, name)| (name.clone(), controls.never_records(bundle))),
+                    );
+                }
+            }
+            if pause_changed {
+                // Reopen the focus span under the new rules.
+                focus = None;
             }
             let mut changed = ax_observer.as_ref().is_some_and(|o| o.take_changed());
             while let Some(signal) = main_loop.pop() {
@@ -522,13 +660,14 @@ pub fn run(options: RunOptions) -> Result<()> {
                         changed = true;
                         if let Some(mut activated) = signal.focus {
                             activated.title = ax.title(&activated, TITLE_WAIT_ON_SWITCH).flatten();
+                            activated.url = ax.url(activated.pid);
                             if let Some(span) = focus_span.take() {
                                 emit(
                                     close_span_at(&span, &mut producer, event_time.clone()),
                                     None,
                                 )?;
                             }
-                            let allowed = !policy.excludes_native(&activated);
+                            let allowed = !paused_now && !policy.excludes_native(&activated);
                             if let Some(gap) =
                                 policy_gap.observe(!allowed, event_time.clone(), &mut producer)
                             {
@@ -590,7 +729,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                     } else {
                         DeviceState::Active
                     };
-                    if last_state != Some(state) {
+                    if !paused_now && last_state != Some(state) {
                         if let Some(span) = presence_span.take() {
                             emit(
                                 close_span_at(&span, &mut producer, event_time.clone()),
@@ -618,6 +757,10 @@ pub fn run(options: RunOptions) -> Result<()> {
                 let mut current = hx_macos_sys::frontmost();
                 if let Some(f) = current.as_mut() {
                     f.title = resolve_title(ax.title(f, TITLE_WAIT), f, focus.as_ref());
+                    f.url = ax.url(f.pid);
+                    if f.bundle_id != own_bundle && !f.bundle_id.is_empty() {
+                        front_app = Some((f.bundle_id.clone(), f.name.clone()));
+                    }
                 }
                 if current != focus {
                     if current.is_none()
@@ -629,7 +772,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                         emit(close_span(&span, &mut producer), None)?;
                     }
                     if let Some(f) = &current {
-                        let allowed = !policy.excludes_native(f);
+                        let allowed = !paused_now && !policy.excludes_native(f);
                         if let Some(gap) =
                             policy_gap.observe(!allowed, producer.time(), &mut producer)
                         {
@@ -677,7 +820,7 @@ pub fn run(options: RunOptions) -> Result<()> {
             if tick
                 && last_gap_update.elapsed() >= Duration::from_secs(10)
                 && let Some(gap) = policy_gap.observe(
-                    focus.as_ref().is_some_and(|f| policy.excludes_native(f)),
+                    paused_now || focus.as_ref().is_some_and(|f| policy.excludes_native(f)),
                     producer.time(),
                     &mut producer,
                 )
@@ -691,9 +834,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                 && !sleeping
                 && !display_off
                 && !hx_macos_sys::secure_input()
-                && focus
-                    .as_ref()
-                    .is_some_and(|f| policy.allows(&f.bundle_id, f.title.as_deref()));
+                && focus.as_ref().is_some_and(|f| policy.allows_focus(f));
             *capture_context.lock().expect("capture context") =
                 if content_allowed { focus.clone() } else { None };
             while let Ok(c) = companion_rx.try_recv() {
@@ -794,7 +935,7 @@ pub fn run(options: RunOptions) -> Result<()> {
                 } else {
                     DeviceState::Active
                 };
-                if last_state != Some(state) {
+                if !paused_now && last_state != Some(state) {
                     if let Some(span) = presence_span.take() {
                         emit(close_span(&span, &mut producer), None)?;
                     }
@@ -815,6 +956,9 @@ pub fn run(options: RunOptions) -> Result<()> {
                     let now = producer.time();
                     let now_nanos = now.mono_start.as_ref().expect("native clock").nanos;
                     for (start, bucket) in buckets.complete(now_nanos) {
+                        if paused_now {
+                            continue;
+                        }
                         let mut e = producer.core(
                             format!(
                                 "input:{}:{start}",
@@ -971,6 +1115,7 @@ mod tests {
             pid,
             title: title.map(Into::into),
             electron: false,
+            url: None,
         };
         let open = window(7, Some("Synthetic page"));
         assert_eq!(
@@ -1176,6 +1321,7 @@ mod delivery_regressions {
             pid: 1,
             title: Some("Public".into()),
             electron: false,
+            url: None,
         };
         let capture_tx = tx.clone();
         let capture_focus = focus.clone();
@@ -1286,6 +1432,7 @@ mod delivery_regressions {
             pid: 1,
             title: Some("Public".into()),
             electron: false,
+            url: None,
         };
         let (reply, ack) = mpsc::sync_channel(1);
         tx.blocking_send(Submission {

@@ -1,16 +1,49 @@
 use super::*;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSStatusBar,
+    NSApplicationDelegate, NSApplicationTerminateReply, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSStatusItem,
 };
 use objc2_foundation::NSObject;
+
+/// What the person chose in the menu; the recorder applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuRequest {
+    Pause15Minutes,
+    PauseHour,
+    PauseUntilTomorrow,
+    Resume,
+    /// Add or remove the app shown in the menu from never-record.
+    ToggleNeverRecord,
+    /// Start the setup guide for the permissions that are off.
+    FixPermissions,
+}
+
+/// The recording line at the top of the menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recording {
+    On,
+    /// Shown as "Paused until {label}".
+    Paused(String),
+    /// Switched off in the app's Settings.
+    Off,
+}
+
 struct Actions {
-    paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     quit_requested: Arc<AtomicBool>,
     pair_requested: AtomicBool,
-    app_requested: AtomicBool,
+    /// A page of the web app to open; empty is its home page.
+    open: Mutex<Option<String>>,
+    request: Mutex<Option<MenuRequest>>,
+}
+impl Actions {
+    fn ask(&self, request: MenuRequest) {
+        *self.request.lock().expect("menu request") = Some(request);
+    }
+    fn open(&self, page: &str) {
+        *self.open.lock().expect("menu open") = Some(page.into());
+    }
 }
 define_class!(
     #[unsafe(super = NSObject)]
@@ -21,7 +54,7 @@ define_class!(
     unsafe impl NSApplicationDelegate for MenuActions {
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
         fn reopen(&self, _app: &NSApplication, _visible: bool) -> bool {
-            self.ivars().app_requested.store(true, Ordering::Relaxed);
+            self.ivars().open("");
             false
         }
         #[unsafe(method(applicationShouldTerminate:))]
@@ -32,43 +65,99 @@ define_class!(
         }
     }
     impl MenuActions {
-        #[unsafe(method(grantPermissions:))]
-        fn grant_permissions(&self, _sender: &objc2::runtime::AnyObject) { onboard(); }
+        #[unsafe(method(fixPermissions:))]
+        fn fix_permissions(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::FixPermissions); }
         #[unsafe(method(openApp:))]
-        fn open_app(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().app_requested.store(true, Ordering::Relaxed); }
+        fn open_app(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().open(""); }
+        #[unsafe(method(openToday:))]
+        fn open_today(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().open("today"); }
         #[unsafe(method(pair:))]
         fn pair(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().pair_requested.store(true, Ordering::Relaxed); }
-        #[unsafe(method(toggle:))]
-        fn toggle(&self,_sender:&objc2::runtime::AnyObject) {self.ivars().paused.fetch_xor(true,Ordering::Relaxed);}
+        #[unsafe(method(pause15:))]
+        fn pause15(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::Pause15Minutes); }
+        #[unsafe(method(pauseHour:))]
+        fn pause_hour(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::PauseHour); }
+        #[unsafe(method(pauseTomorrow:))]
+        fn pause_tomorrow(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::PauseUntilTomorrow); }
+        #[unsafe(method(resume:))]
+        fn resume(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::Resume); }
+        #[unsafe(method(neverRecord:))]
+        fn never_record(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::ToggleNeverRecord); }
         #[unsafe(method(quit:))]
         fn quit(&self,_sender:&objc2::runtime::AnyObject) {self.ivars().quit_requested.store(true,Ordering::Relaxed);self.ivars().stop.store(true,Ordering::Relaxed);}
     }
 );
+
+#[derive(Clone, PartialEq)]
+struct Shown {
+    recording: Recording,
+    warning: Option<String>,
+    missing: Vec<&'static str>,
+    app: Option<(String, bool)>,
+    paired: bool,
+    fixable: bool,
+}
+
 pub struct MenuBar {
     status: Retained<NSStatusItem>,
-    toggle: Retained<NSMenuItem>,
-    health: Retained<NSMenuItem>,
     actions: Retained<MenuActions>,
-    pairing: Retained<NSMenuItem>,
+    state_line: Retained<NSMenuItem>,
+    warning: Retained<NSMenuItem>,
     permissions: Retained<NSMenuItem>,
+    pause_items: Vec<Retained<NSMenuItem>>,
+    resume: Retained<NSMenuItem>,
+    never: Retained<NSMenuItem>,
+    pairing: Retained<NSMenuItem>,
     pair: Retained<NSMenuItem>,
+    recording: Recording,
+    missing: Vec<&'static str>,
+    app: Option<(String, bool)>,
     paired: bool,
+    fixable: bool,
+    shown: Option<Shown>,
     window: Option<super::app_window::AppWindow>,
 }
+
+fn item(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: Option<objc2::runtime::Sel>,
+    target: &MenuActions,
+) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            action,
+            &NSString::from_str(""),
+        )
+    };
+    if action.is_some() {
+        unsafe { item.setTarget(Some(target)) };
+    } else {
+        item.setEnabled(false);
+    }
+    item
+}
+fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
+    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(name),
+        Some(&NSString::from_str(description)),
+    )?;
+    image.setTemplate(true);
+    Some(image)
+}
+
 impl MenuBar {
-    pub fn new(
-        paused: Arc<AtomicBool>,
-        stop: Arc<AtomicBool>,
-        quit_requested: Arc<AtomicBool>,
-    ) -> Option<Self> {
+    pub fn new(stop: Arc<AtomicBool>, quit_requested: Arc<AtomicBool>) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let actions: Retained<MenuActions> = unsafe {
             let obj = MenuActions::alloc(mtm).set_ivars(Actions {
-                paused,
                 stop,
                 quit_requested,
                 pair_requested: AtomicBool::new(false),
-                app_requested: AtomicBool::new(true),
+                open: Mutex::new(Some(String::new())),
+                request: Mutex::new(None),
             });
             msg_send![super(obj), init]
         };
@@ -87,81 +176,50 @@ impl MenuBar {
         let status = NSStatusBar::systemStatusBar().statusItemWithLength(-1.0);
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
-        let toggle = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Pause capture"),
-                Some(sel!(toggle:)),
-                &NSString::from_str(""),
-            )
-        };
-        let quit = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Quit"),
-                Some(sel!(quit:)),
-                &NSString::from_str(""),
-            )
-        };
-        unsafe {
-            toggle.setTarget(Some(&actions));
-            quit.setTarget(Some(&actions));
+        let state_line = item(mtm, "Recording", None, &actions);
+        let warning = item(mtm, "", None, &actions);
+        let permissions = item(
+            mtm,
+            "Turn permissions back on…",
+            Some(sel!(fixPermissions:)),
+            &actions,
+        );
+        let pause_items = vec![
+            item(mtm, "Pause for 15 minutes", Some(sel!(pause15:)), &actions),
+            item(mtm, "Pause for 1 hour", Some(sel!(pauseHour:)), &actions),
+            item(
+                mtm,
+                "Pause until tomorrow",
+                Some(sel!(pauseTomorrow:)),
+                &actions,
+            ),
+        ];
+        let resume = item(mtm, "Resume recording", Some(sel!(resume:)), &actions);
+        let never = item(
+            mtm,
+            "Never record this app",
+            Some(sel!(neverRecord:)),
+            &actions,
+        );
+        let today = item(mtm, "Open Today", Some(sel!(openToday:)), &actions);
+        let app = item(mtm, "Open Hyperthymesia", Some(sel!(openApp:)), &actions);
+        let pairing = item(mtm, "Not paired", None, &actions);
+        let pair = item(mtm, "Pair from clipboard", Some(sel!(pair:)), &actions);
+        let quit = item(mtm, "Quit Hyperthymesia", Some(sel!(quit:)), &actions);
+        for entry in [&state_line, &warning, &permissions] {
+            menu.addItem(entry);
         }
-        let permissions = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Grant permissions"),
-                Some(sel!(grantPermissions:)),
-                &NSString::from_str(""),
-            )
-        };
-        let pair = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Pair from clipboard"),
-                Some(sel!(pair:)),
-                &NSString::from_str(""),
-            )
-        };
-        unsafe {
-            permissions.setTarget(Some(&actions));
-            pair.setTarget(Some(&actions));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        for entry in pause_items.iter().chain([&resume, &never]) {
+            menu.addItem(entry);
         }
-        let pairing = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Not paired"),
-                None,
-                &NSString::from_str(""),
-            )
-        };
-        pairing.setEnabled(false);
-        let health = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Screenshots are starting"),
-                None,
-                &NSString::from_str(""),
-            )
-        };
-        health.setEnabled(false);
-        let app = unsafe {
-            let item = NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Open Hyperthymesia"),
-                Some(sel!(openApp:)),
-                &NSString::from_str(""),
-            );
-            item.setTarget(Some(&actions));
-            item
-        };
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&today);
         menu.addItem(&app);
-        menu.addItem(&pairing);
-        menu.addItem(&health);
-        menu.addItem(&toggle);
-        menu.addItem(&permissions);
-        menu.addItem(&pair);
-        menu.addItem(&quit);
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        for entry in [&pairing, &pair, &quit] {
+            menu.addItem(entry);
+        }
         status.setMenu(Some(&menu));
         let main = NSMenu::new(mtm);
         for (title, entries) in [
@@ -225,39 +283,66 @@ impl MenuBar {
         application.setMainMenu(Some(&main));
         let mut this = Self {
             status,
-            toggle,
-            health,
             actions,
-            pairing,
+            state_line,
+            warning,
             permissions,
+            pause_items,
+            resume,
+            never,
+            pairing,
             pair,
+            recording: Recording::On,
+            missing: vec![],
+            app: None,
             paired: false,
+            fixable: true,
+            shown: None,
             window: None,
         };
         this.update(None);
         Some(this)
     }
+    /// Opens a page of the web app; `page` is a path under `/app`, or empty.
     pub fn open_app(&mut self, url: &str, token: Option<&str>) -> Result<(), String> {
         let mtm = self.actions.mtm();
         self.window
             .get_or_insert_with(|| super::app_window::AppWindow::new(mtm))
             .show(url, token, mtm)
     }
-    pub fn take_open_app(&self) -> bool {
+    /// The web app page the person asked for, if any (empty: its home page).
+    pub fn take_open_app(&self) -> Option<String> {
+        self.actions.ivars().open.lock().expect("menu open").take()
+    }
+    /// Asks to open a page, for example after a notification was clicked.
+    pub fn request_page(&self, page: &str) {
+        self.actions.ivars().open(page);
+    }
+    pub fn take_request(&self) -> Option<MenuRequest> {
         self.actions
             .ivars()
-            .app_requested
-            .swap(false, Ordering::Relaxed)
+            .request
+            .lock()
+            .expect("menu request")
+            .take()
     }
     pub fn set_paired(&mut self, paired: bool) {
         self.paired = paired;
-        self.pairing.setHidden(paired);
-        // Replacing a pairing redirects the outbox, so it stays a deliberate CLI step.
-        self.pair.setHidden(paired);
+    }
+    pub fn set_recording(&mut self, recording: Recording) {
+        self.recording = recording;
+    }
+    /// Permissions that are off, by their System Settings names.
+    pub fn set_missing(&mut self, missing: Vec<&'static str>) {
+        self.missing = missing;
+    }
+    /// The app in front, and whether it is already never recorded.
+    pub fn set_app(&mut self, app: Option<(String, bool)>) {
+        self.app = app;
     }
     /// Harnesses can display onboarding without ever requesting privacy access.
     pub fn disable_permissions(&mut self) {
-        self.permissions.setEnabled(false);
+        self.fixable = false;
     }
     pub fn take_pair_link(&mut self) -> Option<Result<String, String>> {
         if !self
@@ -278,27 +363,71 @@ impl MenuBar {
                 .ok_or_else(|| "Copy a pairing link, then choose Pair from clipboard.".into()),
         )
     }
+    /// Redraws only when something changed; called on every loop turn.
     pub fn update(&mut self, warning: Option<&str>) {
-        let paused = self.actions.ivars().paused.load(Ordering::Relaxed);
-        if let Some(button) = self.status.button(self.actions.mtm()) {
-            button.setTitle(&NSString::from_str(if paused {
-                "Hx ◌"
-            } else if !self.paired || warning.is_some() {
-                "Hx !"
-            } else {
-                "Hx ●"
-            }));
+        let next = Shown {
+            recording: self.recording.clone(),
+            warning: warning.map(str::to_owned),
+            missing: self.missing.clone(),
+            app: self.app.clone(),
+            paired: self.paired,
+            fixable: self.fixable,
+        };
+        if self.shown.as_ref() == Some(&next) {
+            return;
         }
-        self.health.setTitle(&NSString::from_str(if paused {
-            "Screenshots are paused"
-        } else {
-            warning.unwrap_or("Screenshots are ready")
-        }));
-        self.toggle.setTitle(&NSString::from_str(if paused {
-            "Resume capture"
-        } else {
-            "Pause capture"
-        }));
+        let attention = !next.missing.is_empty() || next.warning.is_some() || !next.paired;
+        let (icon, line) = match &next.recording {
+            Recording::Paused(until) => ("pause.circle", format!("Paused until {until}")),
+            Recording::Off => ("circle.slash", "Recording is off in Settings".to_owned()),
+            Recording::On if attention => (
+                "exclamationmark.triangle",
+                "Recording, with a problem".to_owned(),
+            ),
+            Recording::On => ("record.circle", "Recording".to_owned()),
+        };
+        if let Some(button) = self.status.button(self.actions.mtm()) {
+            match symbol(icon, &line) {
+                Some(image) => {
+                    button.setImage(Some(&image));
+                    button.setTitle(&NSString::from_str(""));
+                }
+                None => button.setTitle(&NSString::from_str("Hx")),
+            }
+            button.setToolTip(Some(&NSString::from_str(&format!("Hyperthymesia: {line}"))));
+        }
+        self.state_line.setTitle(&NSString::from_str(&line));
+        self.warning.setHidden(next.warning.is_none());
+        self.warning
+            .setTitle(&NSString::from_str(next.warning.as_deref().unwrap_or("")));
+        self.permissions.setHidden(next.missing.is_empty());
+        self.permissions.setEnabled(next.fixable);
+        self.permissions
+            .setTitle(&NSString::from_str(&match next.missing.as_slice() {
+                [one] => format!("{one} is off. Turn it back on…"),
+                many => format!("{} are off. Turn them back on…", many.join(" and ")),
+            }));
+        let paused = matches!(next.recording, Recording::Paused(_));
+        let off = next.recording == Recording::Off;
+        for entry in &self.pause_items {
+            entry.setHidden(paused || off);
+        }
+        self.resume.setHidden(!paused);
+        match &next.app {
+            Some((name, never)) => {
+                self.never.setHidden(false);
+                self.never.setTitle(&NSString::from_str(&if *never {
+                    format!("Record {name} again")
+                } else {
+                    format!("Never record {name}")
+                }));
+            }
+            None => self.never.setHidden(true),
+        }
+        self.pairing.setHidden(next.paired);
+        // Replacing a pairing redirects the outbox, so it stays a deliberate CLI step.
+        self.pair.setHidden(next.paired);
+        self.shown = Some(next);
     }
 }
 impl Drop for MenuBar {
