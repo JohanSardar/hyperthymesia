@@ -28,21 +28,28 @@ fn host_of(url: &str) -> Option<String> {
     url.host_str()
         .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
 }
-/// A page on a never-record site, or its subdomains. Without an address, a
-/// browser window titled with the site's name also counts.
-fn never_site(url: Option<&str>, title: Option<&str>) -> bool {
+/// The site of a web page, as never-record rules store it.
+pub fn site_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    ["http", "https"].contains(&parsed.scheme()).then_some(())?;
+    host_of(url).map(|h| h.trim_start_matches("www.").to_owned())
+}
+/// Whether a never-record rule covers this site.
+pub fn site_excluded(site: &str, rules: &[String]) -> bool {
+    rules
+        .iter()
+        .any(|s| site == s || site.ends_with(&format!(".{s}")))
+}
+/// A page on a never-record site, or its subdomains. While any site is
+/// excluded, a browser page whose address could not be read counts as
+/// excluded too: a missing address must never let a private page through.
+fn never_site(url: Option<&str>) -> bool {
     let rules = NEVER.read().expect("never-record rules");
     if rules.1.is_empty() {
         return false;
     }
-    if let Some(host) = url.and_then(host_of) {
-        return rules
-            .1
-            .iter()
-            .any(|s| host == *s || host.ends_with(&format!(".{s}")));
-    }
-    let title = title.map(str::to_lowercase).unwrap_or_default();
-    !title.is_empty() && rules.1.iter().any(|s| title.contains(s.as_str()))
+    let Some(url) = url else { return true };
+    host_of(url).is_some_and(|host| site_excluded(&host, &rules.1))
 }
 #[derive(Clone)]
 pub struct Policy {
@@ -72,8 +79,7 @@ impl Policy {
     /// The app, its window title and, for browsers, the page's site.
     pub fn allows_focus(&self, focus: &hx_macos_sys::Focus) -> bool {
         self.allows(&focus.bundle_id, focus.title.as_deref())
-            && !(hx_macos_sys::is_browser(&focus.bundle_id)
-                && never_site(focus.url.as_deref(), focus.title.as_deref()))
+            && !(hx_macos_sys::is_browser(&focus.bundle_id) && never_site(focus.url.as_deref()))
     }
     pub fn allows_payload(&self, value: &serde_json::Value) -> bool {
         match value {
@@ -85,9 +91,10 @@ impl Policy {
                 }) {
                     return false;
                 }
-                if map.iter().any(|(k, v)| {
-                    k == "url" && v.as_str().is_some_and(|u| never_site(Some(u), None))
-                }) {
+                if map
+                    .iter()
+                    .any(|(k, v)| k == "url" && v.as_str().is_some_and(|u| never_site(Some(u))))
+                {
                     return false;
                 }
                 if map.iter().any(|(k, v)| {

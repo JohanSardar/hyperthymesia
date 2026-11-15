@@ -38,8 +38,7 @@ impl Worker {
         }
         (sample_pid == focus.pid).then_some(title)
     }
-    /// The last page address read for this process; read only for browsers
-    /// while a never-record site exists.
+    /// The last page address read for this process; read only for browsers.
     pub fn url(&self, pid: i32) -> Option<String> {
         let url = self.url.borrow();
         (url.0 == pid).then(|| url.1.clone()).flatten()
@@ -53,20 +52,19 @@ impl Worker {
         let (title_request, title_rx) = mpsc::sync_channel::<Focus>(1);
         let (title_tx, titles) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            // The same page keeps its address; look again only when the
-            // window title changes or after a few seconds.
+            // The same page keeps its address; look again when the window
+            // title changes, or after a few seconds while a site is excluded.
             let mut cached: Option<(i32, Option<String>, Option<String>, std::time::Instant)> =
                 None;
             while let Ok(focus) = title_rx.recv() {
                 let title = hx_macos_sys::window_title(&focus);
-                let url = if crate::policy::sites_active()
-                    && hx_macos_sys::is_browser(&focus.bundle_id)
-                {
+                let url = if hx_macos_sys::is_browser(&focus.bundle_id) {
                     match &cached {
                         Some((pid, t, url, at))
                             if *pid == focus.pid
                                 && *t == title
-                                && at.elapsed() < Duration::from_secs(5) =>
+                                && (at.elapsed() < Duration::from_secs(5)
+                                    || !crate::policy::sites_active()) =>
                         {
                             url.clone()
                         }

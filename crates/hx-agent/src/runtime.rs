@@ -524,6 +524,7 @@ pub fn run(options: RunOptions) -> Result<()> {
     let mut ax_checked = Instant::now() - Duration::from_secs(5);
     let mut ax_live = true;
     let mut front_app: Option<(String, String)> = None;
+    let mut front_site: Option<String> = None;
     let own_bundle = "com.hyperthymesia.agent";
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed)
@@ -551,6 +552,12 @@ pub fn run(options: RunOptions) -> Result<()> {
                         ToggleNeverRecord => {
                             if let Some((bundle, name)) = &front_app {
                                 controls.toggle_never_record(bundle, name);
+                                pause_changed = true;
+                            }
+                        }
+                        ToggleNeverRecordSite => {
+                            if let Some(site) = &front_site {
+                                controls.toggle_never_record_site(site);
                                 pause_changed = true;
                             }
                         }
@@ -637,6 +644,11 @@ pub fn run(options: RunOptions) -> Result<()> {
                             .as_ref()
                             .map(|(bundle, name)| (name.clone(), controls.never_records(bundle))),
                     );
+                    menu.set_site(
+                        front_site
+                            .as_ref()
+                            .map(|site| (site.clone(), controls.never_records_site(site))),
+                    );
                 }
             }
             if pause_changed {
@@ -660,7 +672,9 @@ pub fn run(options: RunOptions) -> Result<()> {
                         changed = true;
                         if let Some(mut activated) = signal.focus {
                             activated.title = ax.title(&activated, TITLE_WAIT_ON_SWITCH).flatten();
-                            activated.url = ax.url(activated.pid);
+                            activated.url = ax
+                                .url(activated.pid)
+                                .filter(|_| crate::policy::sites_active());
                             if let Some(span) = focus_span.take() {
                                 emit(
                                     close_span_at(&span, &mut producer, event_time.clone()),
@@ -757,10 +771,16 @@ pub fn run(options: RunOptions) -> Result<()> {
                 let mut current = hx_macos_sys::frontmost();
                 if let Some(f) = current.as_mut() {
                     f.title = resolve_title(ax.title(f, TITLE_WAIT), f, focus.as_ref());
-                    f.url = ax.url(f.pid);
+                    let page = ax.url(f.pid);
                     if f.bundle_id != own_bundle && !f.bundle_id.is_empty() {
                         front_app = Some((f.bundle_id.clone(), f.name.clone()));
+                        front_site = page
+                            .as_deref()
+                            .filter(|_| hx_macos_sys::is_browser(&f.bundle_id))
+                            .and_then(crate::policy::site_of);
                     }
+                    // Kept with the focus only while a site rule needs it.
+                    f.url = page.filter(|_| crate::policy::sites_active());
                 }
                 if current != focus {
                     if current.is_none()

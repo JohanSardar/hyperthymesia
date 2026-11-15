@@ -15,6 +15,8 @@ pub enum MenuRequest {
     Resume,
     /// Add or remove the app shown in the menu from never-record.
     ToggleNeverRecord,
+    /// Add or remove the browser's current site from never-record.
+    ToggleNeverRecordSite,
     /// Start the setup guide for the permissions that are off.
     FixPermissions,
 }
@@ -83,6 +85,8 @@ define_class!(
         fn resume(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::Resume); }
         #[unsafe(method(neverRecord:))]
         fn never_record(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::ToggleNeverRecord); }
+        #[unsafe(method(neverRecordSite:))]
+        fn never_record_site(&self, _sender: &objc2::runtime::AnyObject) { self.ivars().ask(MenuRequest::ToggleNeverRecordSite); }
         #[unsafe(method(quit:))]
         fn quit(&self,_sender:&objc2::runtime::AnyObject) {self.ivars().quit_requested.store(true,Ordering::Relaxed);self.ivars().stop.store(true,Ordering::Relaxed);}
     }
@@ -94,6 +98,7 @@ struct Shown {
     warning: Option<String>,
     missing: Vec<&'static str>,
     app: Option<(String, bool)>,
+    site: Option<(String, bool)>,
     paired: bool,
     fixable: bool,
 }
@@ -107,11 +112,13 @@ pub struct MenuBar {
     pause_items: Vec<Retained<NSMenuItem>>,
     resume: Retained<NSMenuItem>,
     never: Retained<NSMenuItem>,
+    never_site: Retained<NSMenuItem>,
     pairing: Retained<NSMenuItem>,
     pair: Retained<NSMenuItem>,
     recording: Recording,
     missing: Vec<&'static str>,
     app: Option<(String, bool)>,
+    site: Option<(String, bool)>,
     paired: bool,
     fixable: bool,
     shown: Option<Shown>,
@@ -201,6 +208,12 @@ impl MenuBar {
             Some(sel!(neverRecord:)),
             &actions,
         );
+        let never_site = item(
+            mtm,
+            "Never record this site",
+            Some(sel!(neverRecordSite:)),
+            &actions,
+        );
         let today = item(mtm, "Open Today", Some(sel!(openToday:)), &actions);
         let app = item(mtm, "Open Hyperthymesia", Some(sel!(openApp:)), &actions);
         let pairing = item(mtm, "Not paired", None, &actions);
@@ -210,7 +223,7 @@ impl MenuBar {
             menu.addItem(entry);
         }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        for entry in pause_items.iter().chain([&resume, &never]) {
+        for entry in pause_items.iter().chain([&resume, &never, &never_site]) {
             menu.addItem(entry);
         }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -290,11 +303,13 @@ impl MenuBar {
             pause_items,
             resume,
             never,
+            never_site,
             pairing,
             pair,
             recording: Recording::On,
             missing: vec![],
             app: None,
+            site: None,
             paired: false,
             fixable: true,
             shown: None,
@@ -340,6 +355,10 @@ impl MenuBar {
     pub fn set_app(&mut self, app: Option<(String, bool)>) {
         self.app = app;
     }
+    /// The site open in the browser in front, and whether it is never recorded.
+    pub fn set_site(&mut self, site: Option<(String, bool)>) {
+        self.site = site;
+    }
     /// Harnesses can display onboarding without ever requesting privacy access.
     pub fn disable_permissions(&mut self) {
         self.fixable = false;
@@ -370,6 +389,7 @@ impl MenuBar {
             warning: warning.map(str::to_owned),
             missing: self.missing.clone(),
             app: self.app.clone(),
+            site: self.site.clone(),
             paired: self.paired,
             fixable: self.fixable,
         };
@@ -405,7 +425,10 @@ impl MenuBar {
         self.permissions
             .setTitle(&NSString::from_str(&match next.missing.as_slice() {
                 [one] => format!("{one} is off. Turn it back on…"),
-                many => format!("{} are off. Turn them back on…", many.join(" and ")),
+                [rest @ .., last] => {
+                    format!("{} and {last} are off. Turn them back on…", rest.join(", "))
+                }
+                [] => String::new(),
             }));
         let paused = matches!(next.recording, Recording::Paused(_));
         let off = next.recording == Recording::Off;
@@ -423,6 +446,17 @@ impl MenuBar {
                 }));
             }
             None => self.never.setHidden(true),
+        }
+        match &next.site {
+            Some((site, never)) => {
+                self.never_site.setHidden(false);
+                self.never_site.setTitle(&NSString::from_str(&if *never {
+                    format!("Record {site} again")
+                } else {
+                    format!("Never record {site}")
+                }));
+            }
+            None => self.never_site.setHidden(true),
         }
         self.pairing.setHidden(next.paired);
         // Replacing a pairing redirects the outbox, so it stays a deliberate CLI step.

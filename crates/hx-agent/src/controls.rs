@@ -136,6 +136,30 @@ impl Controls {
             s.never_unsent = true;
         });
     }
+    pub fn never_records_site(&self, site: &str) -> bool {
+        crate::policy::site_excluded(
+            site,
+            &self
+                .state
+                .lock()
+                .expect("recording controls")
+                .never_record
+                .sites,
+        )
+    }
+    /// Removes every rule covering `site`, or adds `site` when none does.
+    pub fn toggle_never_record_site(&self, site: &str) {
+        self.with(|s| {
+            let sites = &mut s.never_record.sites;
+            if crate::policy::site_excluded(site, sites) {
+                sites
+                    .retain(|rule| !crate::policy::site_excluded(site, std::slice::from_ref(rule)));
+            } else {
+                sites.push(site.to_owned());
+            }
+            s.never_unsent = true;
+        });
+    }
     /// Returns the permissions that were on last time and are off now.
     pub fn permissions_seen(&self, now: Granted) -> Vec<&'static str> {
         let before = self.state.lock().expect("recording controls").granted;

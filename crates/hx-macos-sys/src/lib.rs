@@ -126,7 +126,7 @@ pub struct Focus {
     pub pid: i32,
     pub title: Option<String>,
     pub electron: bool,
-    /// The page address, read only for browsers while a never-record site exists.
+    /// The page address; kept only for browsers while a never-record site exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
