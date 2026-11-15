@@ -11,7 +11,7 @@ import { useCatalog } from "./catalog"
 import { Logo } from "./logo"
 import { StatusLabel } from "./parts"
 import "./connections.css"
-import "../pages/today.css"
+import "../pages/live.css"
 
 type Item = { id: number; envelope: Envelope }
 

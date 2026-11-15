@@ -129,3 +129,29 @@ duplicate and rejected counts. Pull history starts with this release; old
 recipe state contains only its latest result and cannot reconstruct past runs.
 Interrupted pulls remain `running` without a finish time; a recovered job adds
 its next execution. Raw errors and provider output are withheld.
+
+## Day, timeline and search
+
+All four need a token with `read_raw` and are never cached. Records and
+accounts outside the token's namespace prefixes are left out.
+
+`GET /v1/days` returns `buckets` (record, screen-text and focus counts per
+15-minute UTC bucket, `at` in Unix seconds; clients group them into local days
+with their own time zone rules) and `windows` (four-hour interpretation
+windows with their canonical revision ID, or null).
+
+`GET /v1/day?from=ISO&to=ISO` (at most 50 hours) returns per-collector
+`coverage` (observed, unknown or suppressed), `lanes` (focus, presence and
+attention spans), `points` (text points carry a 160-character preview),
+per-minute input `activity` as counts only, `aggregates`, the canonical
+`revisions` in range without their input manifest, and `windows`.
+
+`GET /v1/cite/ID?revision=R` returns the stored `record`, `seen` (the exact
+digest lines and snapshot the AI read in that revision's run, or
+`unavailable`), and for spans up to 60 `screen_text` records captured during
+it with `screen_text_total`.
+
+`GET /v1/find?q=TEXT` returns `entries` (tasks, episodes and summaries from
+canonical accounts where every term matches) and `records` (full-text matches
+in recorded screen text and other records, with a snippet), each newest first
+and capped at 100.

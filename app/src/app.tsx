@@ -8,6 +8,7 @@ import { FirstRunPage } from "./first-run/first-run"
 import { AgentPage } from "./pages/agent"
 import { ConnectionsPage } from "./pages/connections"
 import { DevicesPage } from "./pages/devices"
+import { LivePage } from "./pages/live"
 import { RunsPage } from "./pages/runs"
 import { SearchPage } from "./pages/search"
 import { SettingsPage } from "./pages/settings"
@@ -22,7 +23,10 @@ const KitPage = lazy(() => import("./pages/kit").then((m) => ({ default: m.KitPa
 const children: RouteObject[] = [
   { index: true, element: <Navigate to="/today" replace /> },
   { path: "today", element: <TodayPage /> },
+  { path: "today/live", element: <LivePage /> },
+  { path: "today/:day", element: <TodayPage /> },
   { path: "timeline", element: <TimelinePage /> },
+  { path: "timeline/:day", element: <TimelinePage /> },
   { path: "search", element: <SearchPage /> },
   { path: "connections", element: <ConnectionsPage /> },
   { path: "connections/browse", element: <BrowsePage /> },

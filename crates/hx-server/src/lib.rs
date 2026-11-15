@@ -4,6 +4,7 @@ mod app;
 mod connection_api;
 mod connections;
 pub mod dashboard;
+mod day_api;
 pub mod disclosure;
 pub mod fx;
 pub mod guided_setup;
@@ -112,6 +113,7 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         .merge(sources::router())
         .merge(settings_api::router())
         .merge(recording::router())
+        .merge(day_api::router())
         .merge(connection_api::router())
         .route(
             "/connect/oauth",
