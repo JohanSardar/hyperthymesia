@@ -1,25 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from "react"
-import { Link } from "react-router"
-import { Logo } from "../connections/logo"
-import { describe, happenedAt, sourceLabel } from "../lib/entries"
-import { ago, clock } from "../lib/time"
-import { api, useEntryStream, usePolled, type LogEntry } from "../server/connections"
-import { PageHeader } from "../shell"
-import { Button, Card, Empty, Page, PageIntro, Segmented, Skeleton, StatusDot } from "../ui"
-import "../connections/connections.css"
-import "./today.css"
+import { CalendarDays, ChartNoAxesGantt, ChevronLeft, ChevronRight, ChevronDown, Quote, Radio, Search } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { Link, useNavigate, useParams } from "react-router"
+import { useCitations, type Source } from "../day/citations"
+import { CoverageBar } from "../day/coverage"
+import { DayPicker, DaysSidebar } from "../day/days"
+import {
+  account,
+  clock,
+  dayName,
+  dayRange,
+  duration,
+  fullDayName,
+  isDayKey,
+  macRow,
+  shiftDay,
+  timeRange,
+  todayKey,
+  total,
+  totals,
+  type Cite,
+  type DayEpisode,
+  type DayGoal,
+  type DayTask,
+  type Ms,
+  type WindowNote,
+} from "../lib/day"
+import { dayApi, dayCache, useLoad, type DayResponse } from "../server/day"
+import { PageHeader, useRegisterCommands } from "../shell"
+import { Badge, Button, Callout, Card, Disclosure, Empty, Page, Skeleton } from "../ui"
+import "../day/day.css"
 
-const KEEP = 400
-const WINDOW_MIN = 30
-
-type Row = LogEntry & { fresh: boolean }
-type Filter = "all" | "mac" | "connections"
-
-function isMac(instance: string) {
-  return instance.startsWith("macos-") || instance.startsWith("companion:")
-}
-
-/** Ticks every `ms`, so relative times and the arrival bars stay current. */
 function useNow(ms: number) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
@@ -29,243 +39,372 @@ function useNow(ms: number) {
   return now
 }
 
-/** A number that rolls to its new value instead of jumping. */
-function Count({ value }: { value: number }) {
-  const [shown, setShown] = useState(value)
-  const from = useRef(value)
-  useEffect(() => {
-    const start = performance.now()
-    const begin = from.current
-    if (begin === value) return
-    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches
-    let frame = 0
-    const step = (t: number) => {
-      const k = reduce ? 1 : Math.min(1, (t - start) / 500)
-      const eased = 1 - Math.pow(1 - k, 5)
-      const next = Math.round(begin + (value - begin) * eased)
-      setShown(next)
-      from.current = next
-      if (k < 1) frame = requestAnimationFrame(step)
-    }
-    frame = requestAnimationFrame(step)
-    return () => cancelAnimationFrame(frame)
-  }, [value])
-  return <>{shown.toLocaleString()}</>
+type Open = (request: { title: string; description?: string; sources: Source[] }) => void
+
+/** The button every line carries: it opens the stored records the line was based on. */
+function CiteButton({ cites, title, when, open }: { cites: Cite[]; title: string; when?: string; open: Open }) {
+  if (!cites.length) {
+    return (
+      <span className="cite-btn" data-empty="" title="This line cites no stored records">
+        no source
+      </span>
+    )
+  }
+  return (
+    <button
+      type="button"
+      className="cite-btn"
+      data-cite-count={cites.length}
+      aria-label={`Open the ${cites.length === 1 ? "record" : `${cites.length} records`} behind “${title}”`}
+      onClick={(event) => {
+        event.stopPropagation()
+        open({ title, description: [when, cites.length === 1 ? "1 cited record" : `${cites.length} cited records`].filter(Boolean).join(" · "), sources: cites })
+      }}
+    >
+      <Quote size={10} strokeWidth={2.25} aria-hidden />
+      {cites.length}
+    </button>
+  )
+}
+
+function spansText(spans: Ms[]) {
+  if (!spans.length) return ""
+  if (spans.length === 1) return timeRange(spans[0].start, spans[0].end)
+  return `${clock(spans[0].start)} – ${clock(spans[spans.length - 1].end)}, in ${spans.length} parts`
+}
+
+function EpisodeRow({ episode, open }: { episode: DayEpisode; open: Open }) {
+  const inferred = episode.claims?.some((c) => c.basis === "inferred")
+  const reported = episode.claims?.some((c) => c.basis === "reported_by_source")
+  const when = spansText(episode.spans)
+  return (
+    <li className="episode" data-line="episode">
+      <span className="line-time">{clock(episode.start)}</span>
+      <div className="line-text">
+        <span className="episode-title">
+          {episode.title}
+          {inferred && <Badge>inferred</Badge>}
+          {reported && <Badge>reported by a source</Badge>}
+          {episode.confidence < 0.6 && <Badge tone="warning">unsure</Badge>}
+        </span>
+        {episode.description && episode.description !== episode.title && <span className="episode-description">{episode.description}</span>}
+        <span className="line-meta">
+          {when} · {duration(total(episode.spans))}
+        </span>
+      </div>
+      <CiteButton cites={episode.evidence.map((id) => ({ id, revision: episode.revision }))} title={episode.title} when={when} open={open} />
+    </li>
+  )
+}
+
+function TaskRow({ task, open }: { task: DayTask; open: Open }) {
+  const [expanded, setExpanded] = useState(false)
+  const when = spansText(task.spans)
+  return (
+    <li className="task" data-line="task" data-open={expanded ? "" : undefined}>
+      <div className="task-row">
+        <span className="line-time">{clock(task.start)}</span>
+        <button type="button" className="task-toggle" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+          <ChevronDown size={13} className="task-chevron" aria-hidden />
+          <span className="task-title">{task.title}</span>
+          {task.open && task.end >= Date.now() - 4 * 3600_000 && <Badge>still going</Badge>}
+        </button>
+        <span className="task-duration" title={when}>
+          {duration(total(task.spans))}
+        </span>
+        <CiteButton cites={task.cites} title={task.title} when={when} open={open} />
+      </div>
+      {expanded && (
+        <div className="task-detail">
+          {task.description && task.description !== task.title && <p className="task-description">{task.description}</p>}
+          <p className="line-meta">{when}</p>
+          {task.episodes.length > 0 ? (
+            <ol className="episodes">
+              {task.episodes.map((e) => (
+                <EpisodeRow key={e.key} episode={e} open={open} />
+              ))}
+            </ol>
+          ) : (
+            <p className="line-meta">The AI listed no episodes for this task in this day.</p>
+          )}
+        </div>
+      )}
+    </li>
+  )
+}
+
+function GoalBlock({ goal, open }: { goal: DayGoal; open: Open }) {
+  const title = goal.title ?? "No goal stated"
+  return (
+    <section className="goal" data-line="goal" data-none={goal.title ? undefined : ""}>
+      <header className="goal-head">
+        <h3 className="goal-title">{title}</h3>
+        <span className="goal-meta">
+          {duration(total(goal.spans))} · {goal.tasks.length === 1 ? "1 task" : `${goal.tasks.length} tasks`}
+        </span>
+        <CiteButton cites={goal.cites} title={title} open={open} />
+      </header>
+      <ol className="tasks">
+        {goal.tasks.map((t) => (
+          <TaskRow key={t.key} task={t} open={open} />
+        ))}
+      </ol>
+    </section>
+  )
+}
+
+function BriefText({ text }: { text: string }) {
+  const [all, setAll] = useState(false)
+  const long = text.length > 320
+  return (
+    <div className="brief-body">
+      <p className="brief-text" data-clamped={long && !all ? "" : undefined}>
+        {text}
+      </p>
+      {long && (
+        <button type="button" className="brief-more" onClick={() => setAll(!all)}>
+          {all ? "Show less" : "Show all"}
+        </button>
+      )}
+    </div>
+  )
+}
+
+function Brief({ notes, open }: { notes: WindowNote[]; open: Open }) {
+  const written = notes.filter((n) => n.status === "written" && n.summary)
+  if (!written.length) return null
+  return (
+    <section className="day-section">
+      <h3 className="day-section-title">In brief</h3>
+      <ol className="brief">
+        {written.map((n) => (
+          <li key={n.start} className="brief-line" data-line="summary">
+            <span className="line-time">{timeRange(n.start, n.end)}</span>
+            <BriefText text={n.summary ?? ""} />
+            <CiteButton cites={n.cites} title={`In brief, ${timeRange(n.start, n.end)}`} when="Summaries cite no records themselves; these are every record the entries in this stretch cite" open={open} />
+          </li>
+        ))}
+      </ol>
+    </section>
+  )
+}
+
+function NotWritten({ notes, dayKey }: { notes: WindowNote[]; dayKey: string }) {
+  const pending = notes.filter((n) => n.status === "not-written")
+  if (!pending.length) return null
+  const list = pending.map((n) => timeRange(n.start, n.end)).join(", ")
+  return (
+    <Callout
+      title={pending.length === 1 ? "Part of this day isn't written up yet" : "Parts of this day aren't written up yet"}
+      actions={
+        <Button size="sm" render={<Link to={`/timeline/${dayKey}?at=${encodeURIComponent(new Date(pending[0].start).toISOString())}`} />}>
+          See what was recorded
+        </Button>
+      }
+    >
+      {list} {pending.length === 1 ? "was" : "were"} recorded, but the AI hasn't written an account of {pending.length === 1 ? "it" : "them"}. The timeline shows the raw record.
+    </Callout>
+  )
+}
+
+function Withheld({ notes }: { notes: WindowNote[] }) {
+  const hidden = notes.filter((n) => n.status === "hidden")
+  if (!hidden.length) return null
+  return (
+    <Callout title={hidden.length === 1 ? "One written-up stretch is withheld" : "Some written-up stretches are withheld"}>
+      The AI wrote an account of {hidden.map((n) => timeRange(n.start, n.end)).join(", ")}, but it drew on data from connections this app isn't allowed to read, so the server
+      withholds the whole account rather than show part of it. The timeline still shows everything the Mac recorded.
+    </Callout>
+  )
+}
+
+function HowMade({ day }: { day: DayResponse }) {
+  if (!day.revisions.length) return null
+  return (
+    <Disclosure title="How this account was made" description="Each 4-hour stretch is written separately. Open one to see its model and the raw account.">
+      <div className="revisions">
+        {day.revisions.map((r) => {
+          const i = r.interpretation
+          return (
+            <Disclosure
+              key={r.revision_id}
+              title={timeRange(i.window.start, i.window.end)}
+              description={[
+                r.model || i.provenance?.model,
+                i.provenance?.prompt_version,
+                `${i.tasks?.length ?? 0} tasks, ${i.episodes?.length ?? 0} episodes`,
+                i.check_failures?.length ? `${i.check_failures.length} corrected by checks` : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            >
+              {r.has_agent_run && (
+                <p className="line-meta">
+                  <a href={`/revision/${r.revision_id}/run`} target="_blank" rel="noreferrer">
+                    The AI's tool calls and exact results
+                  </a>
+                </p>
+              )}
+              {!!i.check_failures?.length && (
+                <ul className="check-failures">
+                  {i.check_failures.map((f, k) => (
+                    <li key={k}>
+                      <span className="mono">{f.item}</span>: {f.reason}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <pre className="raw-json">{JSON.stringify(i, null, 2)}</pre>
+            </Disclosure>
+          )
+        })}
+      </div>
+    </Disclosure>
+  )
+}
+
+function Loading() {
+  return (
+    <div className="day-loading" aria-busy>
+      <Skeleton width="100%" height={88} />
+      {Array.from({ length: 4 }, (_, i) => (
+        <div key={i} className="day-loading-row">
+          <Skeleton width={56} />
+          <Skeleton width={`${45 + ((i * 17) % 35)}%`} />
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function TodayPage() {
-  const [rows, setRows] = useState<Row[]>([])
-  const [loaded, setLoaded] = useState(false)
-  const [arrivedToday, setArrivedToday] = useState(0)
-  const [filter, setFilter] = useState<Filter>("all")
-  const now = useNow(15_000)
+  const params = useParams()
+  const navigate = useNavigate()
+  const key = isDayKey(params.day) ? params.day : todayKey()
+  const isToday = key === todayKey()
+  const now = useNow(60_000)
+  const window = useMemo(() => {
+    const { from, to } = dayRange(key)
+    return { start: from.getTime(), end: to.getTime() }
+  }, [key])
+  const day = useLoad(`day:${key}`, () => dayApi.day(new Date(window.start), new Date(window.end)), dayCache, isToday ? 120_000 : 0)
+  const data = day.data && day.data.window && Date.parse(day.data.window.start) === window.start ? day.data : undefined
+  const acc = useMemo(() => (data ? account(data, window, now) : null), [data, window, now])
+  const sums = useMemo(() => (data ? totals(macRow(data, window, now)) : null), [data, window, now])
+  const gaps = useMemo(() => (data ? macRow(data, window, now).filter((s) => s.state === "gap").length : 0), [data, window, now])
+  const { open, sheet } = useCitations()
+  const go = (k: string) => navigate(k === todayKey() ? "/today" : `/today/${k}`)
 
-  const today = usePolled(api.today, 60_000)
-  const connections = usePolled(api.connections, 30_000)
+  useRegisterCommands([
+    { id: "day:prev", label: "Previous day", group: "Day", icon: ChevronLeft, run: () => go(shiftDay(key, -1)) },
+    ...(isToday ? [] : [{ id: "day:next", label: "Next day", group: "Day", icon: ChevronRight, run: () => go(shiftDay(key, 1)) }]),
+    ...(isToday ? [] : [{ id: "day:today", label: "Go to today", group: "Day", icon: CalendarDays, run: () => navigate("/today") }]),
+    { id: "day:timeline", label: `Open the timeline for ${dayName(key).toLowerCase() === "today" ? "today" : dayName(key)}`, group: "Day", icon: ChartNoAxesGantt, run: () => navigate(`/timeline/${key}`) },
+    ...(isToday ? [{ id: "day:live", label: "Open the live log", group: "Day", icon: Radio, keywords: ["arriving", "entries"], run: () => navigate("/today/live") }] : []),
+  ])
 
-  // Reset the live increment whenever the server's own figure refreshes.
-  useEffect(() => setArrivedToday(0), [today.data])
-
-  const stream = useEntryStream((entries, initial) => {
-    setLoaded(true)
-    if (!entries.length) return
-    const incoming = entries.map((e) => ({ ...e, fresh: !initial })).reverse()
-    setRows((current) => {
-      const seen = new Set(current.map((r) => r.id))
-      const added = incoming.filter((r) => !seen.has(r.id))
-      return [...added, ...current.map((r) => (r.fresh ? { ...r, fresh: false } : r))].slice(0, KEEP)
-    })
-    if (!initial && today.data) {
-      const start = new Date(today.data.start).getTime()
-      setArrivedToday((n) => n + entries.filter((e) => new Date(e.received_at).getTime() >= start).length)
-    }
-  })
-
-  // The stream's first event can be a bare keepalive when nothing is recorded yet.
-  useEffect(() => {
-    if (stream === "live") {
-      const timer = window.setTimeout(() => setLoaded(true), 1500)
-      return () => window.clearTimeout(timer)
-    }
-  }, [stream])
-
-  const names = useMemo(() => new Map((connections.data ?? []).map((s) => [s.connector_instance, s.name])), [connections.data])
-
-  const visible = useMemo(
-    () => rows.filter((r) => filter === "all" || (filter === "mac" ? isMac(r.envelope.connector_instance) : !isMac(r.envelope.connector_instance))),
-    [rows, filter],
-  )
-
-  // Per-minute arrivals over the last half hour, from what this page has seen.
-  const bars = useMemo(() => {
-    const buckets = new Array<number>(WINDOW_MIN).fill(0)
-    const t = Math.max(now, Date.now())
-    for (const r of rows) {
-      const age = Math.max(0, Math.floor((t - new Date(r.received_at).getTime()) / 60_000))
-      if (age >= 0 && age < WINDOW_MIN) buckets[WINDOW_MIN - 1 - age] += 1
-    }
-    return buckets
-  }, [rows, now])
-  const peak = Math.max(1, ...bars)
-  const lastTen = bars.slice(-10).reduce((a, b) => a + b, 0)
-
-  const sources = connections.data ?? []
-  const ready = sources.filter((s) => s.enabled && s.status === "ready").length
-  const settingUp = sources.filter((s) => s.enabled && s.status === "setting_up").length
-
-  const groups = useMemo(() => {
-    const out: { hour: string; rows: Row[] }[] = []
-    for (const r of visible) {
-      const d = new Date(r.received_at)
-      d.setMinutes(0, 0, 0)
-      const hour = d.toLocaleString(undefined, { hour: "numeric", ...(d.toDateString() === new Date().toDateString() ? {} : { month: "short", day: "numeric" }) })
-      const last = out[out.length - 1]
-      if (last && last.hour === hour) last.rows.push(r)
-      else out.push({ hour, rows: [r] })
-    }
-    return out
-  }, [visible])
-
-  const live = stream === "live"
+  const hasRecords = !!data && (data.lanes.some((l) => l.spans.length) || data.points.some((p) => p.kind !== "policy.gap"))
 
   return (
     <>
       <PageHeader
-        title="Today"
+        title={dayName(key)}
         actions={
-          <span className="live-pill" data-state={stream}>
-            <StatusDot tone={live ? "live" : stream === "connecting" ? "warning" : "error"} />
-            {live ? "Live" : stream === "connecting" ? "Connecting" : "Offline"}
-          </span>
+          <>
+            <DayPicker current={key} base="/today" />
+            <Button size="sm" variant="ghost" render={<Link to={`/timeline/${key}`} />}>
+              <ChartNoAxesGantt size={14} aria-hidden /> Timeline
+            </Button>
+            {isToday && (
+              <Button size="sm" variant="ghost" render={<Link to="/today/live" />}>
+                <Radio size={14} aria-hidden /> Live log
+              </Button>
+            )}
+          </>
         }
       />
-      <Page width="dashboard">
-        <PageIntro title="Today" description="Everything recorded today, the moment it arrives" />
-
-        <Card className="stat-strip">
-          <div className="strip-stat">
-            <span className="stat-label">Entries today</span>
-            <span className="stat-value">{today.data ? <Count value={today.data.entries_today + arrivedToday} /> : <Skeleton width={56} height={22} />}</span>
-            <span className="stat-hint">since midnight</span>
-          </div>
-          <div className="strip-stat">
-            <span className="stat-label">Arriving</span>
-            <span className="stat-value">
-              <Count value={lastTen} />
-            </span>
-            <div className="spark" aria-label={`${lastTen} entries in the last 10 minutes`}>
-              {bars.map((n, i) => (
-                <span key={i} style={{ height: `${Math.max(n ? 12 : 4, (n / peak) * 100)}%` }} data-on={n > 0 ? "" : undefined} />
-              ))}
-            </div>
-            <span className="stat-hint">last 10 min</span>
-          </div>
-          <div className="strip-stat">
-            <span className="stat-label">Sources today</span>
-            <span className="stat-value">{today.data ? <Count value={today.data.active_sources} /> : <Skeleton width={32} height={22} />}</span>
-            <span className="stat-hint">sent something today</span>
-          </div>
-          <div className="strip-stat">
-            <span className="stat-label">Connections</span>
-            <span className="stat-value">
-              {connections.data ? (
+      <DaysSidebar current={key} base="/today" />
+      <Page width="detail" className="day-page">
+        <header className="day-intro">
+          <h2 className="day-title">{fullDayName(key)}</h2>
+          {sums && hasRecords && (
+            <p className="day-subtitle">
+              Recorded {duration(sums.recorded + sums.away)}
+              {sums.away > 0 && <> (away for {duration(sums.away)} of it)</>}
+              {sums.gap > 0 && (
                 <>
-                  <Count value={ready} />
-                  <span className="stat-of"> / {sources.length}</span>
+                  {" "}
+                  · not recorded for {duration(sums.gap)}
+                  {gaps > 1 ? ` in ${gaps} stretches` : ""}
                 </>
-              ) : (
-                <Skeleton width={40} height={22} />
               )}
-            </span>
-            <span className="stat-hint">{settingUp ? `${settingUp} setting up` : "ready"}</span>
-          </div>
-          <div className="strip-stat">
-            <span className="stat-label">Last pull</span>
-            <span className="stat-value stat-value-text">{today.data ? ago(today.data.last_pull_at, now) : <Skeleton width={72} height={22} />}</span>
-            <span className="stat-hint">every 4 hours</span>
-          </div>
-        </Card>
-
-        <section className="section">
-          <div className="section-head">
-            <h3 className="h2">Log</h3>
-            <Segmented
-              value={filter}
-              onValueChange={(v) => setFilter(v as Filter)}
-              items={[
-                { value: "all", label: "All" },
-                { value: "mac", label: "This Mac" },
-                { value: "connections", label: "Connections" },
-              ]}
-            />
-          </div>
-
-          {!loaded ? (
-            <Card className="log">
-              {Array.from({ length: 6 }, (_, i) => (
-                <div className="log-row log-row-skeleton" key={i}>
-                  <Skeleton width={48} />
-                  <Skeleton width={72} />
-                  <Skeleton width={`${40 + ((i * 17) % 40)}%`} />
-                </div>
-              ))}
-            </Card>
-          ) : visible.length === 0 ? (
-            <Card>
-              <Empty
-                title={filter === "connections" ? "Nothing pulled yet" : "No entries yet"}
-                description={filter === "connections" ? "Entries from your connections show up here after each pull" : "Entries show up here the moment they're recorded"}
-              >
-                {filter === "connections" && (
-                  <Button render={<Link to="/connections" />} variant="default">
-                    Connect something
-                  </Button>
-                )}
-              </Empty>
-            </Card>
-          ) : (
-            <div className="log-groups">
-              {groups.map((group) => (
-                <div className="log-group" key={group.hour}>
-                  <div className="log-hour">{group.hour}</div>
-                  <Card className="log">
-                    {group.rows.map((row) => (
-                      <LogRow key={row.id} row={row} names={names} />
-                    ))}
-                  </Card>
-                </div>
-              ))}
-            </div>
+              {sums.paused > 0 && <> · paused for {duration(sums.paused)}</>}
+            </p>
           )}
-        </section>
-      </Page>
-    </>
-  )
-}
+        </header>
 
-function LogRow({ row, names }: { row: Row; names: Map<string, string> }) {
-  const line = describe(row.envelope)
-  const Icon = line.icon
-  const instance = row.envelope.connector_instance
-  const label = sourceLabel(instance, names)
-  const at = happenedAt(row.envelope)
-  return (
-    <div className="log-row" data-fresh={row.fresh ? "" : undefined}>
-      <div className="log-row-inner">
-        <time className="log-time" dateTime={at} title={new Date(at).toLocaleString()}>
-          {clock(at)}
-        </time>
-        <span className="log-source" title={instance}>
-          {instance.startsWith("source:") ? <Logo name={label} size={24} className="log-logo" /> : <Icon size={13} strokeWidth={1.75} aria-hidden />}
-          <span>{label}</span>
-        </span>
-        <span className="log-text">
-          {instance.startsWith("source:") && <Icon size={13} strokeWidth={1.75} aria-hidden className="log-kind" />}
-          <span className="log-line">{line.text}</span>
-        </span>
-        {line.detail && <span className="log-detail">{line.detail}</span>}
-      </div>
-    </div>
+        {day.error && !data ? (
+          <Callout tone="danger" title="This day couldn't be loaded">
+            {day.error.message}
+          </Callout>
+        ) : !data ? (
+          <Loading />
+        ) : (
+          <>
+            <Card className="day-coverage">
+              <CoverageBar day={data} window={window} now={now} notes={acc?.notes} onPick={(at) => navigate(`/timeline/${key}?at=${encodeURIComponent(new Date(at).toISOString())}`)} />
+            </Card>
+
+            {!hasRecords ? (
+              <Card>
+                <Empty
+                  title={isToday ? "Nothing recorded yet today" : "Nothing was recorded on this day"}
+                  description={isToday ? "The Mac app records as you work. Entries show up here once they arrive." : "The Mac app sent nothing for this day, so there's no account of it."}
+                />
+              </Card>
+            ) : (
+              acc && (
+                <>
+                  <NotWritten notes={acc.notes} dayKey={key} />
+                  <Withheld notes={acc.notes} />
+                  <Brief notes={acc.notes} open={open} />
+                  {acc.goals.length > 0 && (
+                    <section className="day-section">
+                      <h3 className="day-section-title">Goals and tasks</h3>
+                      <div className="goals">
+                        {acc.goals.map((g) => (
+                          <GoalBlock key={g.key} goal={g} open={open} />
+                        ))}
+                      </div>
+                    </section>
+                  )}
+                  {acc.loose.length > 0 && (
+                    <section className="day-section">
+                      <h3 className="day-section-title">Not part of a task</h3>
+                      <ol className="episodes episodes-loose">
+                        {acc.loose.map((e) => (
+                          <EpisodeRow key={e.key} episode={e} open={open} />
+                        ))}
+                      </ol>
+                    </section>
+                  )}
+                  {acc.goals.length === 0 && acc.loose.length === 0 && acc.notes.some((n) => n.status === "written") && (
+                    <p className="line-meta">The AI found nothing to report in the parts of this day it wrote up.</p>
+                  )}
+                  <div className="day-foot">
+                    <HowMade day={data} />
+                    <Button size="sm" variant="ghost" render={<Link to={`/search`} />}>
+                      <Search size={13} aria-hidden /> Search everything recorded
+                    </Button>
+                  </div>
+                </>
+              )
+            )}
+          </>
+        )}
+      </Page>
+      {sheet}
+    </>
   )
 }
 

@@ -375,7 +375,7 @@ pub async fn sign_in_link(
 }
 
 /// Audit prose is indivisible: hide it when any input namespace or policy changed.
-async fn authorized_run(
+pub(crate) async fn authorized_run(
     store: &Store,
     headers: &HeaderMap,
     revision: i64,
