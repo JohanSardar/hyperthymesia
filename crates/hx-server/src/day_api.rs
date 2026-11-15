@@ -162,6 +162,22 @@ async fn day(
         .map(|o| o.envelope.time.observed_at)
         .max();
     let timeline = hx_compile::compile(&observations, w);
+    // Merged devices show as the one they were merged into, by the owner's name.
+    let aliases = crate::admin_api::device_aliases(&store).await?;
+    let labels = crate::admin_api::device_labels(&store).await?;
+    let shown = |lane_key: &str| -> String {
+        let device = device_of(lane_key);
+        aliases
+            .get(device)
+            .cloned()
+            .unwrap_or_else(|| device.to_owned())
+    };
+    let label = |device: &str| -> String {
+        labels
+            .get(device)
+            .cloned()
+            .unwrap_or_else(|| device.to_owned())
+    };
     let by_id: BTreeMap<i64, &hx_compile::Observation> =
         observations.iter().map(|o| (o.id, o)).collect();
 
@@ -174,7 +190,8 @@ async fn day(
             let (connector, rest) = reason.split_once('[').unwrap_or(("", reason));
             let collector = rest.split_once(']').map_or("", |(name, _)| name);
             json!({
-                "device": device_of(&c.lane_key),
+                "device": shown(&c.lane_key),
+                "device_name": label(&shown(&c.lane_key)),
                 "connector": connector,
                 "collector": collector,
                 "state": c.state,
@@ -194,7 +211,22 @@ async fn day(
             } else {
                 lane.intervals.iter().map(|i| span(i, kind)).collect()
             };
-            json!({"device": device_of(&lane.id.key), "kind": kind, "spans": spans})
+            (shown(&lane.id.key), kind.to_owned(), spans)
+        })
+        .fold(
+            Vec::<(String, String, Vec<Value>)>::new(),
+            |mut out, (device, kind, spans)| {
+                match out.iter_mut().find(|(d, k, _)| *d == device && *k == kind) {
+                    Some(existing) => existing.2.extend(spans),
+                    None => out.push((device, kind, spans)),
+                }
+                out
+            },
+        )
+        .into_iter()
+        .map(|(device, kind, mut spans)| {
+            spans.sort_by(|a, b| a["start"].as_i64().cmp(&b["start"].as_i64()));
+            json!({"device_name": label(&device), "device": device, "kind": kind, "spans": spans})
         })
         .collect();
 
@@ -228,7 +260,7 @@ async fn day(
             "kind": point.kind,
             "label": point.label,
             "evidence": point.evidence,
-            "device": device_of(&point.lane_key),
+            "device": shown(&point.lane_key),
         });
         if let Some(o) = observation {
             let p = &o.envelope.payload;

@@ -101,6 +101,8 @@ async fn scope_migration_keeps_rows_and_every_dependent_guard() -> Result<()> {
     let mut expected = before;
     assert!(expected.remove("ocr_derived").is_some());
     assert!(after.remove("ocr_derived").is_some());
+    // Migration 0010 adds one new index for the Devices page; nothing existing changes.
+    assert!(after.remove("events_device").is_some());
     assert_eq!(after, expected);
 
     let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")

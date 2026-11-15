@@ -4,9 +4,11 @@ import { NavLink, useLocation } from "react-router"
 import { IconButton, Kbd } from "../ui"
 import { useCommands } from "./commands"
 import { allNav, navFor } from "./nav"
+import { formatCombo, useBindings } from "./keys"
 import { useSidebar } from "./sidebar-state"
 
 function PageList() {
+  const keys = useBindings()
   return (
     <div className="sidebar-group">
       <div className="sidebar-group-head">
@@ -18,7 +20,7 @@ function PageList() {
           <NavLink key={item.to} to={item.to} className="sidebar-row">
             <Icon aria-hidden size={15} strokeWidth={1.6} />
             <span className="sidebar-row-label">{item.label}</span>
-            <span className="sidebar-row-meta">⌘{item.key}</span>
+            <span className="sidebar-row-meta">{formatCombo(keys[`go:${item.to}`])}</span>
           </NavLink>
         )
       })}
@@ -74,18 +76,19 @@ function Sidebar() {
   const { setPaletteOpen } = useCommands()
   const { pathname } = useLocation()
   const current = navFor(pathname)
+  const keys = useBindings()
   return (
     <aside className="sidebar" aria-label="Sidebar" inert={!open}>
       <div className="sidebar-head">
         <span className="sidebar-title">{current?.label ?? (pathname.startsWith("/kit") ? "Component kit" : "Hyperthymesia")}</span>
-        <IconButton label="Hide sidebar" shortcut="⌘B" side="right" onClick={toggle}>
+        <IconButton label="Hide sidebar" shortcut={formatCombo(keys["sidebar:toggle"])} side="right" onClick={toggle}>
           <PanelLeft size={15} strokeWidth={1.6} aria-hidden />
         </IconButton>
       </div>
       <button type="button" className="sidebar-search" onClick={() => setPaletteOpen(true)}>
         <Search aria-hidden size={14} />
         <span>Search or jump to…</span>
-        <Kbd>⌘K</Kbd>
+        <Kbd>{formatCombo(keys.palette)}</Kbd>
       </button>
       <div className="sidebar-body">
         <div ref={setSlot} className="sidebar-slot" hidden={!filled} />

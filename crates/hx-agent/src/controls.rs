@@ -59,6 +59,9 @@ pub struct Controls {
     state: Arc<Mutex<State>>,
     /// The server's Recording switch: 0 not heard yet, 1 on, 2 off.
     server_switch: Arc<std::sync::atomic::AtomicU8>,
+    /// Whether to notify when a permission is turned off (Settings ›
+    /// Notifications). On until the server says otherwise.
+    permission_notices: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Controls {
     pub fn load(dir: &Path) -> Self {
@@ -71,6 +74,7 @@ impl Controls {
             path: Arc::new(path),
             state: Arc::new(Mutex::new(state)),
             server_switch: Arc::default(),
+            permission_notices: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         this.apply();
         this
@@ -159,6 +163,10 @@ impl Controls {
             }
             s.never_unsent = true;
         });
+    }
+    pub fn permission_notices(&self) -> bool {
+        self.permission_notices
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Returns the permissions that were on last time and are off now.
     pub fn permissions_seen(&self, now: Granted) -> Vec<&'static str> {
@@ -349,6 +357,11 @@ pub async fn sync(
             && response.status().is_success()
             && let Ok(value) = response.json::<serde_json::Value>().await
         {
+            // An older server sends no profile: keep the Mac's own choice.
+            crate::config::set_saver(value["profile"].as_str() == Some("saver"));
+            if let Some(off) = value["notify"]["permission_lost"].as_bool() {
+                controls.permission_notices.store(off, Ordering::Relaxed);
+            }
             if let Some(enabled) = value["enabled"].as_bool() {
                 recording.store(enabled, Ordering::Relaxed);
                 controls

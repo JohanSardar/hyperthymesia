@@ -1,3 +1,4 @@
+import { useSettings } from "../server/settings"
 import { ArrowRight, Check } from "lucide-react"
 import type { ReactNode } from "react"
 import { Link } from "react-router"
@@ -66,3 +67,17 @@ function StatusLabel({ source, setup }: { source: Source; setup?: SetupRun | nul
 }
 
 export { CatalogGrid, CatalogRow, kindLabel, SectionTitle, StatusLabel }
+
+/** How far back a first pull reaches; the default comes from Settings › Connections. */
+const HISTORY = [
+  { value: "0", label: "Only new entries" },
+  { value: "1", label: "The last day" },
+  { value: "3", label: "The last 3 days" },
+  { value: "7", label: "The last week" },
+  { value: "14", label: "The last 2 weeks" },
+  { value: "30", label: "The last 30 days" },
+]
+function useDefaultHistory() {
+  return String(useSettings().data?.settings.connection_history_days ?? 1)
+}
+export { HISTORY, useDefaultHistory }

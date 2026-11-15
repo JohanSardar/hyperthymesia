@@ -1,4 +1,5 @@
 import { ChevronLeft, Plus, Trash2 } from "lucide-react"
+import { ConnectionsSidebar } from "./sidebar"
 import { useMemo, useState } from "react"
 import { Link, useSearchParams } from "react-router"
 import { ApiError } from "../server/http"
@@ -25,6 +26,7 @@ import {
   toast,
 } from "../ui"
 import { useConnect } from "./detail"
+import { HISTORY, useDefaultHistory } from "./parts"
 import "./connections.css"
 
 type Kind = "mcp" | "api" | "cli" | "import"
@@ -39,13 +41,6 @@ const TITLES: Record<Kind, { title: string; description: string; noun: string }>
   cli: { title: "Add a command line tool", description: "Connect a tool already installed and signed in on this Mac", noun: "tool" },
   import: { title: "Paste a config", description: "Bring in one MCP server from an mcpServers JSON", noun: "server" },
 }
-
-const HISTORY = [
-  { value: "0", label: "Only new entries" },
-  { value: "1", label: "The last day" },
-  { value: "7", label: "The last week" },
-  { value: "30", label: "The last 30 days" },
-]
 
 function toMap(pairs: Pair[]) {
   return Object.fromEntries(pairs.filter((p) => p.name.trim()).map((p) => [p.name.trim(), p.value]))
@@ -136,7 +131,8 @@ function AddConnectionPage() {
 
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
-  const [history, setHistory] = useState("1")
+  const defaultHistory = useDefaultHistory()
+  const [history, setHistory] = useState(defaultHistory)
 
   const [transport, setTransport] = useState<"http" | "stdio">("http")
   const [url, setUrl] = useState("")
@@ -293,6 +289,7 @@ function AddConnectionPage() {
 
   return (
     <>
+      <ConnectionsSidebar />
       <PageHeader crumbs={[{ label: "Connections", to: "/connections" }, { label: meta.title }]} />
       <Page width="settings">
         <Link to="/connections" className="back-link">
@@ -345,7 +342,7 @@ function AddConnectionPage() {
                 />
               </>
             )}
-            <Row label="Start from" description="How far back the first pull reaches" control={<Select width={176} items={HISTORY} value={history} onValueChange={(v) => setHistory(v ?? "1")} aria-label="Start from" />} />
+            <Row label="Start from" description="How far back the first pull reaches" control={<Select width={176} items={HISTORY} value={history} onValueChange={(v) => setHistory(v ?? defaultHistory)} aria-label="Start from" />} />
           </Card>
         </Section>
 

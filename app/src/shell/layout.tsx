@@ -6,6 +6,8 @@ import { Toaster } from "../ui"
 import { useAppearance } from "./appearance"
 import { CommandsProvider, useCommands, useRegisterCommands, type AppCommand } from "./commands"
 import { allNav } from "./nav"
+import { comboOf, formatCombo, useBindings } from "./keys"
+import { useLook } from "./look"
 import { Palette } from "./palette"
 import { Rail } from "./rail"
 import { Sidebar } from "./sidebar"
@@ -57,6 +59,7 @@ function clampWidth(value: number) {
 function useBuiltInCommands(toggleSidebar: () => void, resetWidth: () => void) {
   const navigate = useNavigate()
   const { setTheme } = useAppearance()
+  const keys = useBindings()
   const commands = useMemo<AppCommand[]>(
     () => [
       ...allNav.map((item) => ({
@@ -64,7 +67,7 @@ function useBuiltInCommands(toggleSidebar: () => void, resetWidth: () => void) {
         label: item.label,
         group: "Go to",
         icon: item.icon,
-        shortcut: `⌘${item.key}`,
+        shortcut: formatCombo(keys[`go:${item.to}`]),
         keywords: item.keywords,
         run: () => navigate(item.to),
       })),
@@ -72,13 +75,13 @@ function useBuiltInCommands(toggleSidebar: () => void, resetWidth: () => void) {
       { id: "theme:dark", label: "Use dark theme", group: "Commands", icon: Moon, keywords: ["appearance", "night"], run: () => setTheme("dark") },
       { id: "theme:light", label: "Use light theme", group: "Commands", icon: Sun, keywords: ["appearance", "day"], run: () => setTheme("light") },
       { id: "theme:system", label: "Match the system theme", group: "Commands", icon: Monitor, keywords: ["appearance", "auto"], run: () => setTheme("system") },
-      { id: "sidebar:toggle", label: "Show or hide the sidebar", group: "Commands", icon: PanelLeft, shortcut: "⌘B", keywords: ["panel", "collapse"], run: toggleSidebar },
+      { id: "sidebar:toggle", label: "Show or hide the sidebar", group: "Commands", icon: PanelLeft, shortcut: formatCombo(keys["sidebar:toggle"]), keywords: ["panel", "collapse"], run: toggleSidebar },
       { id: "sidebar:reset", label: "Reset sidebar width", group: "Commands", icon: PanelLeft, keywords: ["panel", "size"], run: resetWidth },
-      { id: "nav:back", label: "Go back", group: "Commands", icon: ArrowLeft, shortcut: "⌘[", keywords: ["previous"], run: () => navigate(-1) },
-      { id: "nav:forward", label: "Go forward", group: "Commands", icon: ArrowRight, shortcut: "⌘]", keywords: ["next"], run: () => navigate(1) },
+      { id: "nav:back", label: "Go back", group: "Commands", icon: ArrowLeft, shortcut: formatCombo(keys["nav:back"]), keywords: ["previous"], run: () => navigate(-1) },
+      { id: "nav:forward", label: "Go forward", group: "Commands", icon: ArrowRight, shortcut: formatCombo(keys["nav:forward"]), keywords: ["next"], run: () => navigate(1) },
       { id: "app:reload", label: "Reload the app", group: "Commands", icon: RotateCw, keywords: ["refresh"], run: () => window.location.reload() },
     ],
-    [navigate, setTheme, toggleSidebar, resetWidth],
+    [navigate, setTheme, toggleSidebar, resetWidth, keys],
   )
   useRegisterCommands(commands)
 }
@@ -86,34 +89,32 @@ function useBuiltInCommands(toggleSidebar: () => void, resetWidth: () => void) {
 function useShortcuts(toggleSidebar: () => void) {
   const navigate = useNavigate()
   const { paletteOpen, setPaletteOpen } = useCommands()
+  const keys = useBindings()
   useEffect(() => {
+    const byCombo = new Map(Object.entries(keys).map(([id, combo]) => [combo, id]))
     const onKey = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.altKey) return
-      const key = event.key.toLowerCase()
-      if (key === "k" && !event.shiftKey) {
+      const combo = comboOf(event)
+      if (!combo) return
+      // The shortcut editor is recording a new combination.
+      if ((event.target as HTMLElement | null)?.closest?.("[data-recording-keys]")) return
+      const id = byCombo.get(combo)
+      if (!id) return
+      if (id === "palette") {
         event.preventDefault()
         setPaletteOpen(!paletteOpen)
         return
       }
-      if (paletteOpen || event.shiftKey) return
-      const page = allNav.find((item) => item.key === key)
-      if (page) {
-        event.preventDefault()
-        navigate(page.to)
-      } else if (key === "b") {
-        event.preventDefault()
-        toggleSidebar()
-      } else if (key === "[") {
-        event.preventDefault()
-        navigate(-1)
-      } else if (key === "]") {
-        event.preventDefault()
-        navigate(1)
-      }
+      if (paletteOpen) return
+      event.preventDefault()
+      if (id.startsWith("go:")) navigate(id.slice(3))
+      else if (id === "sidebar:toggle") toggleSidebar()
+      else if (id === "nav:back") navigate(-1)
+      else if (id === "nav:forward") navigate(1)
+      else if (id === "settings:search") navigate("/settings?search=1")
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [navigate, paletteOpen, setPaletteOpen, toggleSidebar])
+  }, [navigate, paletteOpen, setPaletteOpen, toggleSidebar, keys])
 }
 
 function Shell() {
@@ -153,6 +154,7 @@ function Shell() {
 
   useBuiltInCommands(toggle, resetWidth)
   useShortcuts(toggle)
+  useLook()
 
   const sidebar = useMemo(
     () => ({ open, toggle, width, setWidth, resetWidth, slot, setSlot, filled, setFilled }),

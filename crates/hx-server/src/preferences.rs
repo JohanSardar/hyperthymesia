@@ -32,6 +32,40 @@ pub struct Preferences {
     pub setup: Option<SetupProgress>,
     /// Monthly spending limit in US dollars; none by default.
     pub spend_limit_usd: Option<f64>,
+    /// `balanced` lets the Mac pick its pace from power and heat; `saver`
+    /// keeps it at its slowest pace all the time.
+    pub recording_profile: String,
+    /// Days to keep each type of record (see `admin_api::TYPES`); a missing
+    /// type is kept forever.
+    pub retention: std::collections::BTreeMap<String, u32>,
+    pub notifications: Notifications,
+    pub density: String,
+    pub font_size: u32,
+    /// Command ID to key combination, for commands the owner rebound.
+    pub shortcuts: std::collections::BTreeMap<String, String>,
+    /// How many days back a new connection's first pull reaches by default.
+    pub connection_history_days: u32,
+    /// The HTTPS address that reaches this server from elsewhere, if the owner
+    /// set one up (for example with Tailscale). Used in pairing links.
+    pub remote_url: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notifications {
+    pub day_ready: bool,
+    pub failed_run: bool,
+    pub failed_pull: bool,
+    pub permission_lost: bool,
+}
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            day_ready: true,
+            failed_run: true,
+            failed_pull: true,
+            permission_lost: true,
+        }
+    }
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -42,6 +76,14 @@ impl Default for Preferences {
             appearance: "dark".into(),
             setup: None,
             spend_limit_usd: None,
+            recording_profile: "balanced".into(),
+            retention: Default::default(),
+            notifications: Notifications::default(),
+            density: "comfortable".into(),
+            font_size: 14,
+            shortcuts: Default::default(),
+            connection_history_days: 1,
+            remote_url: None,
         }
     }
 }

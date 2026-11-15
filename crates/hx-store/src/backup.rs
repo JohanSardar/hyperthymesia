@@ -138,10 +138,15 @@ fn backup_blocking(source: &Path, to: &Path) -> Result<()> {
             );
         } else {
             let src = checked_path(&source, &relative)?;
-            let mut temp = tempfile::NamedTempFile::new_in(dest.parent().context("blob parent")?)?;
-            let actual = copy_hash(&src, temp.as_file_mut())?;
-            ensure!(actual == expected, "source blob hash mismatch: {relative}");
-            temp.persist_noclobber(&dest)?;
+            let temp = dest.with_file_name(format!(".copy-{}", expected.sha256));
+            let actual = clone_hash(&src, &temp)?;
+            if actual != expected {
+                fs::remove_file(&temp)?;
+                anyhow::bail!("source blob hash mismatch: {relative}");
+            }
+            // Never replace a blob that appeared meanwhile.
+            fs::hard_link(&temp, &dest)?;
+            fs::remove_file(&temp)?;
         }
         sync_dir(dest.parent().context("blob parent")?)?;
         manifest.files.insert(relative, expected);
@@ -215,12 +220,7 @@ fn restore_blocking(from: &Path, target: &Path) -> Result<()> {
         private_directory(dest.parent().context("restore file parent")?)?;
         // Set privacy at creation, not after copying a person's history. Restore
         // is also used directly from a shell whose umask may be permissive.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&dest)?;
-        let actual = copy_hash(&checked_path(&from, name)?, &mut file)?;
+        let actual = clone_hash(&checked_path(&from, name)?, &dest)?;
         ensure!(actual == *expected, "backup hash mismatch: {name}");
     }
     for name in DATABASES {
@@ -370,11 +370,26 @@ fn hash_file(path: &Path) -> Result<FileHash> {
     regular_file(path)?;
     digest(&mut File::open(path)?, &mut std::io::sink())
 }
-fn copy_hash(path: &Path, to: &mut File) -> Result<FileHash> {
+/// Copies `path` to the new file `to` and hashes the copy. On APFS the copy is
+/// a clone that shares unchanged blocks, so a backup costs little disk; the
+/// hash is read back from the copy, so a bad copy still fails the check.
+/// `to` sits in a private (0700) folder, so no one else can read it before
+/// its own mode is set.
+fn clone_hash(path: &Path, to: &Path) -> Result<FileHash> {
     regular_file(path)?;
-    let hash = digest(&mut File::open(path)?, to)?;
-    to.sync_all()?;
-    Ok(hash)
+    ensure!(!to.try_exists()?, "copy target already exists");
+    let result = fs::copy(path, to)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| {
+            fs::set_permissions(to, fs::Permissions::from_mode(0o600))?;
+            let file = OpenOptions::new().read(true).write(true).open(to)?;
+            file.sync_all()?;
+            hash_file(to)
+        });
+    if result.is_err() {
+        let _ = fs::remove_file(to);
+    }
+    result
 }
 fn digest(from: &mut impl Read, to: &mut impl Write) -> Result<FileHash> {
     let mut sha = Sha256::new();

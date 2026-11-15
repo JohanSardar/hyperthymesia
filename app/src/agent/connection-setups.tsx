@@ -8,6 +8,7 @@ import { ago, until } from "../lib/time"
 import { api, usePolled, type AgentConnection, type Pull } from "../server/connections"
 import { Button, Card, Confirm, ConfirmTrigger, buttonAttrs, Empty, IconButton, Section, Skeleton, Switch, toast } from "../ui"
 import { useLogoIds } from "../pages/connections"
+import { PlainError } from "../connections/errors"
 import "../connections/connections.css"
 import "../pages/agent.css"
 
@@ -48,7 +49,7 @@ function PullRow({ pull, sourceOn, refresh }: { pull: Pull; sourceOn: boolean; r
         <span className="pull-meta">
           {failing ? (
             <span className="pull-error">
-              <AlertTriangle size={12} aria-hidden /> {pull.last_error}
+              <AlertTriangle size={12} aria-hidden /> <PlainError text={pull.last_error!} />
             </span>
           ) : (
             <>
@@ -127,7 +128,7 @@ function AgentCard({ item, logoId, focused, refresh }: { item: AgentConnection; 
           </div>
         ) : failed ? (
           <div className="agent-failed">
-            <p>{setup?.last_error ?? source.last_error ?? "Setup didn't finish."}</p>
+            {setup?.last_error ?? source.last_error ? <PlainError text={(setup?.last_error ?? source.last_error)!} /> : <p>Setup didn't finish.</p>}
           </div>
         ) : source.status === "needs_reconnect" ? (
           <p className="agent-summary muted">It couldn't reach {source.name} with the saved sign-in. Reconnect it to let the agent finish.</p>
@@ -256,4 +257,4 @@ function ConnectionSetups() {
   )
 }
 
-export { ConnectionSetups }
+export { AgentCard, ConnectionSetups }

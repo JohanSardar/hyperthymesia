@@ -5,6 +5,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@ui-sdk/react/tooltip"
 import { Kbd } from "../ui"
 import { useAppearance } from "./appearance"
 import { useCommands } from "./commands"
+import { formatCombo, useBindings } from "./keys"
 import { primaryNav, settingsNav, type NavItem } from "./nav"
 
 function Tip({ label, shortcut }: { label: string; shortcut?: string }) {
@@ -18,6 +19,7 @@ function Tip({ label, shortcut }: { label: string; shortcut?: string }) {
 
 function RailLink({ item }: { item: NavItem }) {
   const Icon = item.icon
+  const keys = useBindings()
   return (
     <Tooltip>
       <TooltipTrigger
@@ -27,7 +29,7 @@ function RailLink({ item }: { item: NavItem }) {
           </NavLink>
         }
       />
-      <Tip label={item.label} shortcut={`⌘${item.key}`} />
+      <Tip label={item.label} shortcut={formatCombo(keys[`go:${item.to}`])} />
     </Tooltip>
   )
 }
@@ -44,6 +46,7 @@ function RailButton({ label, shortcut, onClick, children }: { label: string; sho
 function Rail() {
   const { setPaletteOpen } = useCommands()
   const { dark, setTheme } = useAppearance()
+  const keys = useBindings()
   return (
     <nav className="rail" aria-label="Pages">
       <div className="rail-group">
@@ -52,7 +55,7 @@ function Rail() {
         ))}
       </div>
       <div className="rail-group">
-        <RailButton label="Search pages and commands" shortcut="⌘K" onClick={() => setPaletteOpen(true)}>
+        <RailButton label="Search pages and commands" shortcut={formatCombo(keys.palette)} onClick={() => setPaletteOpen(true)}>
           <Command aria-hidden size={16} strokeWidth={1.6} />
         </RailButton>
         <RailButton label={dark ? "Switch to light theme" : "Switch to dark theme"} onClick={() => setTheme(dark ? "light" : "dark")}>

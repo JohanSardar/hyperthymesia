@@ -1,0 +1,70 @@
+.device-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.device-title {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.device-title .h1 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+  color: var(--muted-2);
+  font-size: var(--text-sm);
+}
+
+.device-meta .sep {
+  color: var(--muted-3);
+}
+
+.device-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.merge-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.merge-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-2-5);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.merge-option:hover {
+  background: var(--section);
+}
+
+.merge-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .device-head {
+    flex-wrap: wrap;
+  }
+}

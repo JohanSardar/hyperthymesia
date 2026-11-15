@@ -126,9 +126,17 @@ pub enum Profile {
     Balanced,
     Saver,
 }
+/// Set from the server's Recording settings: Saver keeps the slowest pace
+/// whatever the power source. Balanced leaves the choice to `select`.
+static SAVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_saver(on: bool) {
+    SAVER.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 impl Profile {
     pub fn select(power: hx_macos_sys::Power, config: &Config) -> Self {
-        if power.thermal >= config.saver_thermal_threshold {
+        if SAVER.load(std::sync::atomic::Ordering::Relaxed)
+            || power.thermal >= config.saver_thermal_threshold
+        {
             Self::Saver
         } else if power.battery {
             Self::Balanced
