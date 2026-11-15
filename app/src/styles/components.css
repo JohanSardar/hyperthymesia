@@ -1237,7 +1237,7 @@ a.list-row:hover,
 .spinner {
   display: inline-block;
   flex: none;
-  border: 1.5px solid var(--border-3);
+  border: var(--border-width-strong) solid var(--border-3);
   border-top-color: var(--fg);
   border-radius: var(--radius-full);
   animation: spin var(--duration-spin) linear infinite;

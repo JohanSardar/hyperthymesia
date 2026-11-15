@@ -330,6 +330,14 @@ function Toggles() {
             <Radio value="b" />
           </Cell>
         </RadioGroup>
+        <RadioGroup aria-label="Radio" defaultValue="d" disabled className="kit-row">
+          <Cell label="disabled">
+            <Radio value="c" />
+          </Cell>
+          <Cell label="disabled on">
+            <Radio value="d" />
+          </Cell>
+        </RadioGroup>
       </div>
       <div className="kit-row">
         <Segmented

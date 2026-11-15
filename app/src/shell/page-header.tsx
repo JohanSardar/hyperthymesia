@@ -1,5 +1,5 @@
 import { ArrowLeft, ArrowRight, PanelLeft } from "lucide-react"
-import { useEffect, useRef, type ReactNode } from "react"
+import { type ReactNode } from "react"
 import { Link, useLocation, useNavigate, useNavigationType } from "react-router"
 import { IconButton } from "../ui"
 import { useSidebar } from "./sidebar-state"
@@ -7,19 +7,18 @@ import { useSidebar } from "./sidebar-state"
 type Crumb = { label: ReactNode; to?: string }
 
 // The app runs in a window with no browser chrome, so the header carries back and forward.
+// Module state, so a header remounting on each page still sees every navigation once.
 let furthest = 0
+let lastKey = ""
 
 function useHistoryButtons() {
   const location = useLocation()
   const type = useNavigationType()
   const index: number = (window.history.state as { idx?: number } | null)?.idx ?? 0
-  const seen = useRef(location.key)
-  useEffect(() => {
-    if (seen.current === location.key) return
-    seen.current = location.key
-    if (type === "PUSH") furthest = index
-  }, [location.key, type, index])
-  furthest = Math.max(furthest, index)
+  if (location.key !== lastKey) {
+    lastKey = location.key
+    furthest = type === "PUSH" ? index : Math.max(furthest, index)
+  }
   return { canBack: index > 0, canForward: index < furthest }
 }
 
