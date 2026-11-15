@@ -2,6 +2,7 @@ import { ArrowLeft, ArrowRight, PanelLeft } from "lucide-react"
 import { type ReactNode } from "react"
 import { Link, useLocation, useNavigate, useNavigationType } from "react-router"
 import { IconButton } from "../ui"
+import { formatCombo, useBindings } from "./keys"
 import { useSidebar } from "./sidebar-state"
 
 type Crumb = { label: ReactNode; to?: string }
@@ -26,19 +27,20 @@ function PageHeader({ title, crumbs, actions }: { title?: ReactNode; crumbs?: Cr
   const { open, toggle } = useSidebar()
   const navigate = useNavigate()
   const { canBack, canForward } = useHistoryButtons()
+  const keys = useBindings()
   return (
     <header className="page-header">
       <div className="page-header-start">
         {!open && (
-          <IconButton label="Show sidebar" shortcut="⌘B" onClick={toggle}>
+          <IconButton label="Show sidebar" shortcut={formatCombo(keys["sidebar:toggle"])} onClick={toggle}>
             <PanelLeft size={15} strokeWidth={1.6} aria-hidden />
           </IconButton>
         )}
         <div className="page-header-history">
-          <IconButton label="Back" shortcut="⌘[" disabled={!canBack} onClick={() => navigate(-1)}>
+          <IconButton label="Back" shortcut={formatCombo(keys["nav:back"])} disabled={!canBack} onClick={() => navigate(-1)}>
             <ArrowLeft size={15} strokeWidth={1.6} aria-hidden />
           </IconButton>
-          <IconButton label="Forward" shortcut="⌘]" disabled={!canForward} onClick={() => navigate(1)}>
+          <IconButton label="Forward" shortcut={formatCombo(keys["nav:forward"])} disabled={!canForward} onClick={() => navigate(1)}>
             <ArrowRight size={15} strokeWidth={1.6} aria-hidden />
           </IconButton>
         </div>

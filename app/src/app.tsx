@@ -37,7 +37,9 @@ const children: RouteObject[] = [
   { path: "runs", element: <RunsPage /> },
   { path: "runs/:id", element: <RunsPage /> },
   { path: "devices", element: <DevicesPage /> },
+  { path: "devices/:device", element: <DevicesPage /> },
   { path: "settings", element: <SettingsPage /> },
+  { path: "settings/:page", element: <SettingsPage /> },
   { path: "kit", element: <Suspense><KitPage /></Suspense> },
   { path: "*", element: <Navigate to="/today" replace /> },
 ]

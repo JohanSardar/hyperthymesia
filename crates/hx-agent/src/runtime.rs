@@ -642,7 +642,12 @@ pub fn run(options: RunOptions) -> Result<()> {
                     write_permissions(granted_now);
                 }
                 if !options.dry_run {
-                    for name in controls.permissions_seen(granted_now) {
+                    let notify = controls.permission_notices();
+                    for name in controls
+                        .permissions_seen(granted_now)
+                        .into_iter()
+                        .filter(|_| notify)
+                    {
                         hx_macos_sys::notify(
                             &format!("lost-{name}-{}", ulid::Ulid::generate()),
                             &format!("{name} was turned off"),

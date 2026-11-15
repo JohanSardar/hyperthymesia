@@ -1,4 +1,5 @@
 import { ArrowRight, Check, ShieldCheck } from "lucide-react"
+import { ConnectionsSidebar } from "./sidebar"
 import { useMemo, useState } from "react"
 import { Link, useNavigate, useParams } from "react-router"
 import { ApiError } from "../server/http"
@@ -8,15 +9,8 @@ import { Button, Card, CardHeader, Dialog, DialogClose, buttonAttrs, Empty, Fiel
 import { authLabel, reach, useCatalog } from "./catalog"
 import { blurb } from "./blurbs"
 import { Logo } from "./logo"
-import { kindLabel } from "./parts"
+import { HISTORY, kindLabel, useDefaultHistory } from "./parts"
 import "./connections.css"
-
-const HISTORY = [
-  { value: "0", label: "Only new entries" },
-  { value: "1", label: "The last day" },
-  { value: "7", label: "The last week" },
-  { value: "30", label: "The last 30 days" },
-]
 
 /** Sends one connect request and takes the person to where the agent's work shows. */
 function useConnect() {
@@ -37,7 +31,8 @@ function ConnectDialog({ entry, open, onOpenChange }: { entry: CatalogEntry; ope
   const connect = useConnect()
   const [key, setKey] = useState("")
   const [variables, setVariables] = useState<Record<string, string>>({})
-  const [history, setHistory] = useState("1")
+  const defaultHistory = useDefaultHistory()
+  const [history, setHistory] = useState(defaultHistory)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -100,7 +95,7 @@ function ConnectDialog({ entry, open, onOpenChange }: { entry: CatalogEntry; ope
           </p>
         )}
         <Field label="Start from" description="How far back the first pull reaches">
-          <Select items={HISTORY} value={history} onValueChange={(v) => setHistory(v ?? "1")} width="full" aria-label="Start from" />
+          <Select items={HISTORY} value={history} onValueChange={(v) => setHistory(v ?? defaultHistory)} width="full" aria-label="Start from" />
         </Field>
         {error && <div className="form-error">{error}</div>}
         <button type="submit" hidden />
@@ -123,6 +118,7 @@ function CatalogDetailPage() {
   if (!catalog) {
     return (
       <>
+        <ConnectionsSidebar />
         <PageHeader crumbs={[{ label: "Connections", to: "/connections" }, { label: "…" }]} />
         <Page width="detail">{error ? <Empty title="Couldn't load the catalog" description={error.message} /> : <Skeleton width="100%" height={320} />}</Page>
       </>
@@ -131,6 +127,7 @@ function CatalogDetailPage() {
   if (!entry) {
     return (
       <>
+        <ConnectionsSidebar />
         <PageHeader crumbs={[{ label: "Connections", to: "/connections" }, { label: "Not found" }]} />
         <Page width="detail">
           <Empty title="That source isn't in the catalog">
@@ -158,6 +155,7 @@ function CatalogDetailPage() {
 
   return (
     <>
+      <ConnectionsSidebar />
       <PageHeader
         crumbs={[
           { label: "Connections", to: "/connections" },

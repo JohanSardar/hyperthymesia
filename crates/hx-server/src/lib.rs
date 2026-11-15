@@ -1,4 +1,5 @@
 //! Authenticated ingest, evidence API, and a local, escaped day view.
+pub mod admin_api;
 mod agent_sql;
 mod app;
 mod connection_api;
@@ -116,6 +117,7 @@ pub fn router(store: Store, policy: DisclosurePolicy) -> Router {
         )
         .merge(sources::router())
         .merge(settings_api::router())
+        .merge(admin_api::router())
         .merge(runs_api::router())
         .merge(setup_api::router())
         .merge(recording::router())

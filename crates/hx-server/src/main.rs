@@ -376,6 +376,10 @@ async fn main() -> Result<()> {
         Command::Restore { from } => return hx_store::backup::restore(from, &dir).await,
         _ => {}
     }
+    if matches!(cli.command, Command::Serve { .. }) {
+        // A restore the owner asked for in the app runs before the store opens.
+        hx_server::admin_api::apply_pending_restore(&dir).await?;
+    }
     let store = Store::open(&dir).await?;
     match cli.command {
         Command::Doctor { .. }
@@ -508,6 +512,7 @@ async fn main() -> Result<()> {
             let policy = hx_server::disclosure::DisclosurePolicy::from_env()?;
             let shutdown = shutdown_signal()?;
             let listener = tokio::net::TcpListener::bind(listen).await?;
+            let _ = hx_server::admin_api::SERVER.set((listener.local_addr()?, Utc::now()));
             hx_server::desktop::prepare_session(&store, listener.local_addr()?).await?;
             let provider = ProviderConfig::from_env();
             if matches!(provider, ProviderConfig::Stub) {
@@ -595,6 +600,13 @@ async fn main() -> Result<()> {
                         if let Err(e) = processing::schedule(&runner.store).await {
                             tracing::error!("scheduler failed: {e:#}");
                         }
+                        // Keep-for limits, at most once a week, after a backup.
+                        let cleaning = runner.store.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = hx_server::admin_api::clean_up(&cleaning, false).await {
+                                tracing::error!("clean-up failed: {e:#}");
+                            }
+                        });
                     }
                     match hx_jobs::run_one(&runner.store, &runner).await {
                         Ok(true) => {
@@ -622,6 +634,9 @@ async fn main() -> Result<()> {
                     tokio::select! {
                         _ = shutdown => {},
                         _ = interrupted_upgrade => {},
+                        _ = hx_server::admin_api::RESTART.notified() => {
+                            tracing::info!("restarting as the owner asked");
+                        },
                     }
                     // Cancel provider work before waiting for HTTP connections
                     // to drain. Dropping fx's output future kills its child.

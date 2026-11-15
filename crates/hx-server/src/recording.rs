@@ -80,6 +80,14 @@ async fn save(store: &Store, controls: &Controls) -> anyhow::Result<()> {
     tx.commit().await
 }
 
+/// When the current pause ends, if recording is paused now.
+pub(crate) async fn paused_until(store: &Store) -> anyhow::Result<Option<DateTime<Utc>>> {
+    Ok(load(store)
+        .await?
+        .paused_until
+        .filter(|until| *until > Utc::now()))
+}
+
 async fn view(store: &Store, controls: &Controls) -> ApiResult<Value> {
     let now = Utc::now();
     // Content-free markers the Mac turns into desktop notifications.
@@ -99,8 +107,16 @@ async fn view(store: &Store, controls: &Controls) -> ApiResult<Value> {
     .fetch_optional(&store.pool)
     .await?;
     let micros = |v: i64| DateTime::<Utc>::from_timestamp_micros(v);
+    let preferences = preferences::load(store).await?;
+    let notify = &preferences.notifications;
+    // A notice switched off in Settings is never sent, so the Mac never shows it.
+    let ready = ready.filter(|_| notify.day_ready);
+    let failed_pass = failed_pass.filter(|_| notify.failed_run);
+    let failed_pull = failed_pull.filter(|_| notify.failed_pull);
     Ok(json!({
-        "enabled": preferences::load(store).await?.mac_recording,
+        "enabled": preferences.mac_recording,
+        "profile": preferences.recording_profile,
+        "notify": {"permission_lost": notify.permission_lost},
         "paused_until": controls.paused_until.filter(|until| *until > now),
         "never_record": controls.never_record,
         "changed_at": controls.changed_at,

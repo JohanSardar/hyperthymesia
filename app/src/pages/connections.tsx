@@ -1,4 +1,5 @@
 import { ChevronDown, Code2, FileJson, Plus, Server, Terminal } from "lucide-react"
+import { ConnectionsSidebar } from "../connections/sidebar"
 import { useMemo, useState } from "react"
 import { Link, useNavigate } from "react-router"
 import { featured, matches, useCatalog, type FullCatalog } from "../connections/catalog"
@@ -88,6 +89,7 @@ function ConnectionsPage() {
 
   return (
     <>
+      <ConnectionsSidebar />
       <PageHeader title="Connections" actions={<AddOwnMenu />} />
       <Page width="explore">
         <div className="explore-head">

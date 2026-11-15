@@ -210,3 +210,40 @@ it with `screen_text_total`.
 canonical accounts where every term matches) and `records` (full-text matches
 in recorded screen text and other records, with a snippet), each newest first
 and capped at 100.
+
+## Devices, storage and the server
+
+All need an owner token, like Settings.
+
+`GET /v1/devices` lists each device that sent records (`device`, `name`,
+`names` merged into it, record counts, `first`/`last`, and `recording`:
+`recording`, `paused`, `off` or `quiet`). `PUT /v1/devices/NAME` with
+`{"name": "…"|null}` renames one. `POST /v1/devices/merge` with
+`{"devices": […], "into": "…"}` shows several reported names as one device
+everywhere; `POST /v1/devices/NAME/unmerge` splits one off again. Nothing
+recorded changes. `POST /v1/devices/pair` with `{"name", "reach": "local"|"remote"}`
+returns a single-use `hyperthymesia://pair` link and `expires_at`.
+
+`GET /v1/storage` (cached ten minutes; `?fresh=1` measures again) returns disk
+used per record type. Settings `retention` holds days to keep per type; a
+weekly clean-up deletes older records through the same path as a time-range
+delete, after a backup. `POST /v1/storage/clean-up` runs it now.
+
+`GET /v1/backups` lists backups beside the state folder; `POST` takes one,
+`DELETE /v1/backups/NAME` removes one, and `POST /v1/backups/NAME/restore`
+restarts a supervised server into it. The current state is renamed aside, not
+deleted. Secrets, `server.env`, the desktop session and API keys and paired
+devices (`device_tokens`) carry over from the current state.
+
+`POST /v1/erase/plan` with `{"start", "end"}` counts what a delete removes
+without changing anything. `POST /v1/erase` with the same and
+`"confirm": "delete"` takes a full backup first (refusing if it can't), then
+removes the records, their search text, files and write-ups, and every
+dependent write-up. Records overlapping the range go whole. The range is kept
+so queued records from it are refused. `GET /v1/erase/log` returns the
+deletion log, which holds counts, never content.
+
+`GET /v1/export?from=ISO&to=ISO` streams records and write-ups as JSON lines.
+`GET /v1/server`, `GET /v1/server/logs` (keys scrubbed), `POST
+/v1/server/repair` and `POST /v1/server/restart` (supervised servers only)
+back the Advanced page.

@@ -1,5 +1,6 @@
 //! Durable evidence, derived generations, credentials and content-addressed files.
 pub mod backup;
+pub mod erase;
 pub mod sqlite;
 pub use sqlite::{Store, Ts, WriteTransaction};
 
@@ -129,6 +130,21 @@ impl Store {
             validated.push(e);
         }
         let mut tx = self.begin_write().await?;
+        // Times the owner deleted stay deleted, even if a device still had
+        // records from them queued.
+        // A store still below migration 10 (as upgrade tests build) has none.
+        let has_erased: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='erased_ranges')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let erased: Vec<(Ts, Ts)> = if has_erased {
+            sqlx::query_as("SELECT start_at,end_at FROM erased_ranges")
+                .fetch_all(&mut *tx)
+                .await?
+        } else {
+            vec![]
+        };
         let now = Ts::now();
         let mut affected = std::collections::BTreeMap::new();
         let mut normalize_windows = std::collections::BTreeMap::new();
@@ -136,6 +152,14 @@ impl Store {
             std::collections::BTreeMap::<String, (DateTime<Utc>, Option<u64>)>::new();
         for e in validated {
             let start = e.time.source_start.unwrap_or(e.time.observed_at);
+            let (from, to) = (
+                Ts::from(start).0,
+                Ts::from(e.time.source_end.unwrap_or(start)).0,
+            );
+            if erased.iter().any(|(s, end)| s.0 <= to && from < end.0) {
+                ack.duplicates += 1;
+                continue;
+            }
             let sensitivity = match hx_schema::kinds::stored_class(e.kind.as_str(), e.sensitivity) {
                 Sensitivity::Normal => "normal",
                 Sensitivity::Sensitive => "sensitive",

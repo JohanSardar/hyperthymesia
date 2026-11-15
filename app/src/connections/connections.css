@@ -508,3 +508,33 @@ a.yours-row:hover {
   font-weight: var(--weight-medium);
   font-variant-numeric: tabular-nums;
 }
+
+/* An error in plain words, with the raw text one click away. */
+.plain-error {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.plain-error-details > summary {
+  width: fit-content;
+  color: var(--muted-3);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.plain-error-details > summary:hover {
+  color: var(--muted-1);
+}
+
+.plain-error-raw {
+  display: block;
+  margin-top: var(--space-1);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--secondary);
+  color: var(--muted-1);
+  font-size: var(--text-2xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

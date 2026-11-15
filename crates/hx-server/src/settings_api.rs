@@ -100,6 +100,36 @@ async fn update(
     {
         return Err(bad("invalid spending limit or setup step"));
     }
+    if !["balanced", "saver"].contains(&value.recording_profile.as_str())
+        || !["compact", "comfortable", "spacious"].contains(&value.density.as_str())
+        || !(12..=18).contains(&value.font_size)
+        || value.connection_history_days > 30
+    {
+        return Err(bad(
+            "invalid recording, appearance or connection preference",
+        ));
+    }
+    if value.retention.iter().any(|(kind, days)| {
+        !crate::admin_api::RETAINABLE.contains(&kind.as_str()) || !(1..=36500).contains(days)
+    }) {
+        return Err(bad("invalid keep-for preference"));
+    }
+    if value.shortcuts.len() > 100
+        || value.shortcuts.iter().any(|(id, keys)| {
+            id.len() > 64
+                || keys.len() > 40
+                || !keys.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+        })
+    {
+        return Err(bad("invalid shortcut"));
+    }
+    if let Some(url) = &value.remote_url
+        && url::Url::parse(url).map_or(true, |u| {
+            u.scheme() != "https" || u.host().is_none() || u.query().is_some()
+        })
+    {
+        return Err(bad("the remote address must be an https:// address"));
+    }
     let before = preferences::load(&store).await?;
     preferences::save(&store, &value).await?;
     // A raised or removed limit, or a new model, lets held runs go now.

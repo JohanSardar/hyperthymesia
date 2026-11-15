@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react"
+import { ConnectionsSidebar } from "./sidebar"
 import { Link, useSearchParams } from "react-router"
 import { AddOwnMenu } from "../pages/connections"
 import { api, usePolled } from "../server/connections"
@@ -24,6 +25,7 @@ function BrowsePage() {
 
   return (
     <>
+      <ConnectionsSidebar />
       <PageHeader crumbs={[{ label: "Connections", to: "/connections" }, { label: title }]} actions={<AddOwnMenu />} />
       <Page width="explore">
         <div className="explore-head">

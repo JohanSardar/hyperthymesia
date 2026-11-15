@@ -1,4 +1,7 @@
-import { ArrowRight } from "lucide-react"
+import { ArrowRight, ShieldAlert } from "lucide-react"
+import { AgentCard } from "../agent/connection-setups"
+import { PlainError } from "./errors"
+import { ConnectionsSidebar } from "./sidebar"
 import { useEffect, useState } from "react"
 import { Link, useParams } from "react-router"
 import { describe, happenedAt } from "../lib/entries"
@@ -6,7 +9,7 @@ import { ago, clock } from "../lib/time"
 import { useLogoIds } from "../pages/connections"
 import { api, usePolled, type Envelope } from "../server/connections"
 import { PageHeader } from "../shell"
-import { Button, Card, CardHeader, Dialog, DialogClose, buttonAttrs, Empty, Field, Page, Row, SecretInput, Skeleton, Switch, toast } from "../ui"
+import { Button, Callout, Card, CardHeader, Dialog, DialogClose, buttonAttrs, Empty, Field, Page, Row, SecretInput, Skeleton, Switch, toast } from "../ui"
 import { useCatalog } from "./catalog"
 import { Logo } from "./logo"
 import { StatusLabel } from "./parts"
@@ -79,6 +82,8 @@ function ConnectionPage() {
   const { catalog } = useCatalog()
   const logoIds = useLogoIds(catalog)
   const source = sources.data?.find((s) => s.id === id)
+  const agent = usePolled(api.agent, 5000)
+  const setup = agent.data?.connections.find((c) => c.source.id === id)
   const [items, setItems] = useState<Item[] | null>(null)
   const [before, setBefore] = useState<number | null>(null)
   const [reconnect, setReconnect] = useState(false)
@@ -100,6 +105,7 @@ function ConnectionPage() {
   if (sources.data && !source) {
     return (
       <>
+        <ConnectionsSidebar />
         <PageHeader crumbs={[{ label: "Connections", to: "/connections" }, { label: "Not found" }]} />
         <Page width="settings">
           <Empty title="That connection doesn't exist">
@@ -112,6 +118,7 @@ function ConnectionPage() {
 
   return (
     <>
+      <ConnectionsSidebar />
       <PageHeader crumbs={[{ label: "Connections", to: "/connections" }, { label: source?.name ?? "…" }]} />
       <Page width="settings">
         {!source ? (
@@ -157,12 +164,28 @@ function ConnectionPage() {
                   />
                 }
               />
-              <Row label="What the agent set up" description="What it understood, its scheduled pulls, retry and off switches" control={<Button variant="ghost" render={<Link to={`/agent?focus=${source.id}`} />}>Open <ArrowRight size={12} aria-hidden /></Button>} />
               {!source.oauth && source.status !== "needs_reconnect" && (
                 <Row label="Reconnect" description={source.has_key ? "Replace the token or recheck it" : "Recheck access and resume setup"} control={<Button onClick={() => setReconnect(true)}>Reconnect</Button>} />
               )}
-              {source.last_error && <Row label="Last error" description={<span className="pull-error">{source.last_error}</span>} />}
+              {source.last_error && <Row label="Last error" description={<PlainError text={source.last_error} />} />}
             </Card>
+
+            <section className="section">
+              <div className="section-head">
+                <div>
+                  <h3 className="h2">What the agent set up</h3>
+                  <p className="section-description">Each pull runs every few hours without AI. Switch any one off and it stops; the agent can't switch it back on.</p>
+                </div>
+                <Button variant="ghost" render={<Link to={`/agent?focus=${source.id}`} />}>
+                  All connections <ArrowRight size={12} aria-hidden />
+                </Button>
+              </div>
+              {setup ? <AgentCard item={setup} logoId={logoIds.get(source.name.toLowerCase())} focused={false} refresh={async () => { await agent.refresh(); await sources.refresh() }} /> : <Skeleton width="100%" height={120} />}
+            </section>
+
+            <Callout icon={<ShieldAlert size={14} />} title="“Keep it local” is an instruction, not a wall">
+              Words in a connection's description, like “keep it local”, tell the agent what you want; nothing enforces them. The agent runs commands on this computer, can read files and keys, and can reach the network. What it reads can reach your AI provider. Switching a connection off is the one thing it can't undo.
+            </Callout>
 
             <Card>
               <CardHeader title="Details" />

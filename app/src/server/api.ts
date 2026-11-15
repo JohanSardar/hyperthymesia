@@ -16,7 +16,21 @@ type Preferences = {
   setup?: SetupProgress | null
   /** Monthly limit in US dollars; null means none. */
   spend_limit_usd?: number | null
+  /** `balanced` lets the Mac choose its pace; `saver` keeps it slowest. */
+  recording_profile?: "balanced" | "saver"
+  /** Days to keep each record type; a missing type is kept forever. */
+  retention?: Record<string, number>
+  notifications?: Notifications
+  density?: Density
+  font_size?: number
+  /** Command ID to key combination, only for commands the owner rebound. */
+  shortcuts?: Record<string, string>
+  connection_history_days?: number
+  remote_url?: string | null
 }
+
+type Density = "compact" | "comfortable" | "spacious"
+type Notifications = { day_ready: boolean; failed_run: boolean; failed_pull: boolean; permission_lost: boolean }
 
 type ApiKey = { id: string; name: string; prefixes: string[]; scopes: string[]; revoked: boolean }
 
@@ -198,4 +212,5 @@ export type {
   SigninStatus,
   Upcoming,
 }
+export type { Density, Notifications }
 export type { ApiKey, Appearance, Catalog, CatalogModel, ModelChoice, Pass, Preferences, ProviderId, Pull, RunsResponse, SettingsResponse, Source, Today }
