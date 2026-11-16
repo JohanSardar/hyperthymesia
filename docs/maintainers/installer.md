@@ -1,6 +1,7 @@
 # Installer design and acceptance
 
-The public Pages launcher is `docs/install`. Its first two settings pin a release
+The public launcher is `docs/install`, served by GitLab Pages at
+https://hyperthymesia.eilmer.si/install (see [releases](../releases.md)). Its first two settings pin a release
 version and the SHA-256 of that release's SHA256SUMS file. This one manifest pin
 binds the lifecycle installer and all platform archives. The launcher verifies
 the manifest, then install.sh, before executing downloaded code. The lifecycle

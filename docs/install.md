@@ -14,7 +14,7 @@ SHA-256 of its checksum manifest. It verifies that manifest, then the lifecycle
 installer, before executing downloaded code:
 
 ```sh
-curl -fsSL https://johansardar.github.io/hyperthymesia/install | sh
+curl -fsSL https://hyperthymesia.eilmer.si/install | sh
 ```
 
 To forward options, replace `| sh` with, for example,
@@ -31,7 +31,7 @@ Codex still need owner validation; see [provider limitations](provider-limitatio
 
 Dry runs verify downloads and list files/service contents without executing
 downloaded binaries, initializing state or contacting service managers. Release
-archives use SHA256SUMS from the same GitHub release. The public launcher's
+archives use SHA256SUMS from the same release. The public launcher's
 separate reviewed manifest pin binds all platforms and install.sh; it is not a
 publisher signature or OS sandbox. Private fx 0.0.16 uses hashes pinned in
 the script. Your own fx is kept. A normal install runs downloaded programs as

@@ -41,7 +41,7 @@ while [ "$#" -gt 0 ]; do
         --help)
             printf '%s\n' 'Usage: install.sh [--provider codex|grok|gateway --model M --effort E --state-dir D] [--dry-run] [--start-fresh] [--uninstall] [--server-only|--app-only]' \
                 'Installs a loopback user service; upgrades are backed up and refused during interpret leases.' \
-                'HX_RELEASE_BASE: release download directory (default: GitHub latest/download).' \
+                'HX_RELEASE_BASE: release download directory (default: https://hyperthymesia.eilmer.si/releases/latest/download).' \
                 'HX_FX_RELEASE_BASE: fx download directory; pinned SHA-256 checks always apply.'
             exit 0 ;;
         *) die "unknown argument: $1" ;;
@@ -278,7 +278,7 @@ untar() {
     tar -xzf "$1" -C "$2" || die 'archive extraction failed'
 }
 
-release_base=${HX_RELEASE_BASE:-https://github.com/JohanSardar/hyperthymesia/releases/latest/download}
+release_base=${HX_RELEASE_BASE:-https://hyperthymesia.eilmer.si/releases/latest/download}
 fx_base=${HX_FX_RELEASE_BASE:-https://github.com/vercel-labs/fx/releases/download/v0.0.16}
 fetch "$release_base/SHA256SUMS" "$work/SHA256SUMS"
 if [ -n "${HX_RELEASE_SHA256:-}" ]; then

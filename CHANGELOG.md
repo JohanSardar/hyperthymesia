@@ -9,6 +9,11 @@ Versions before this first public binary release were source-only checkpoints.
 
 ### Changed
 
+- The project moved from GitHub to GitLab (https://gitlab.com/johansardar/hyperthymesia).
+  The public installer is now `curl -fsSL https://hyperthymesia.eilmer.si/install | sh`
+  and release downloads come from `https://hyperthymesia.eilmer.si/releases/`.
+  The 0.1.3 assets are byte-identical, so the launcher's manifest pin is unchanged.
+
 - Mac visual capture now saves JPEG screenshots only. Video encoding, MP4
   staging and new video persistence are removed; existing evidence is retained.
 - Capture health/menu text now describes screenshots. Temporary native objects

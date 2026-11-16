@@ -1,0 +1,98 @@
+# Linux checks from the former GitHub Actions `ci` workflow, plus the Pages site
+# that serves https://hyperthymesia.eilmer.si. GitLab's free hosted runners are
+# Linux only, so the macOS capture-agent job runs locally (`./scripts/check.sh`
+# on a Mac) until a hosted macOS runner is available.
+stages: [test, deploy]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+default:
+  interruptible: true
+
+variables:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo-home
+  RUST_IMAGE: rust:1.99.1-bookworm
+
+.rust:
+  image: $RUST_IMAGE
+  cache:
+    key: cargo-$CI_JOB_NAME
+    paths: [.cargo-home/registry, .cargo-home/git, target]
+  before_script:
+    - rustup component add clippy rustfmt
+
+installer:
+  stage: test
+  image: python:3.13-bookworm
+  timeout: 10m
+  script:
+    - sh scripts/install.test.sh
+    - python3 scripts/installer-launcher.test.py
+    - python3 scripts/readme-commands.test.py
+
+rust-linux:
+  extends: .rust
+  stage: test
+  timeout: 45m
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - git fetch --tags --quiet origin '+refs/heads/*:refs/remotes/origin/*'
+    - python3 scripts/check-store-transactions.py
+    - python3 scripts/check-tooling.py
+    - python3 scripts/scan-personal-data.py
+    - cargo fmt --all -- --check
+    - cargo clippy --locked --workspace --all-targets --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app -- -D warnings
+    - cargo check --locked --workspace --all-targets --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+    - cargo build --locked --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+    - python3 scripts/reference.test.py
+    - python3 scripts/reference.py --check
+    - cargo doc --locked --workspace --no-deps --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+    - cargo test --locked --workspace --exclude hx-macos-sys --exclude hx-agent --exclude hx-agent-app
+    - python3 scripts/quickstart.test.py
+
+mover-postgres:
+  extends: .rust
+  stage: test
+  timeout: 30m
+  services:
+    - name: postgres:17
+      alias: hx-postgres.test
+  variables:
+    POSTGRES_USER: hx
+    POSTGRES_PASSWORD: hx
+    POSTGRES_DB: hx
+    HX_MOVE_TEST_POSTGRES: postgres://hx:hx@hx-postgres.test:5432/hx
+  script:
+    - cargo test -p hx-move -- --ignored
+
+companions:
+  stage: test
+  image: oven/bun:1.3.12
+  timeout: 15m
+  script:
+    - apt-get update -qq && apt-get install -y -qq zsh python3 >/dev/null
+    - |
+      for d in companions/*/; do
+        if [ -f "$d/package.json" ]; then
+          (cd "$d" && bun install --frozen-lockfile && bun run typecheck && bun run build && bun test)
+        fi
+      done
+    - bun test companions/shell-hook
+
+pages:
+  stage: deploy
+  image: debian:bookworm-slim
+  timeout: 10m
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null
+    - sh scripts/pages-site.sh public
+  artifacts:
+    paths: [public]

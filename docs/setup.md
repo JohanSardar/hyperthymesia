@@ -15,7 +15,7 @@ in `rust-toolchain.toml`.
 
 ```sh
 set -e
-git clone https://github.com/JohanSardar/hyperthymesia.git
+git clone https://gitlab.com/johansardar/hyperthymesia.git
 cd hyperthymesia
 cargo build --locked --release -p hx-server
 server_dir="$(cd "${CARGO_TARGET_DIR:-target}/release" && pwd)"

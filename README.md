@@ -7,7 +7,7 @@ how to read it.
 ## Install
 
 ```sh
-curl -fsSL https://johansardar.github.io/hyperthymesia/install | sh
+curl -fsSL https://hyperthymesia.eilmer.si/install | sh
 ```
 
 Linux x86_64/arm64 or Apple Silicon macOS 14+. Requires curl, Python 3 and a

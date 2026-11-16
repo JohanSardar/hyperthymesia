@@ -45,3 +45,9 @@
     public launcher fail-closed until the VERSION/SHA256-only PR is green.
 15. Keep remaining large-module debt and untested real-provider/Mac permission
     flows explicit; synthetic or login-free checks do not establish them.
+16. 2026-11-12: the GitHub account was suspended, so every GitHub URL returns
+    404. The source moved to https://gitlab.com/johansardar/hyperthymesia (public)
+    and everything that downloads or links moved to `hyperthymesia.eilmer.si`,
+    a GitLab Pages custom domain. Release assets live in the project's generic
+    package registry; the Pages job copies them into the site after checking them
+    against the pinned manifest. Records of earlier GitHub runs stay as history.
